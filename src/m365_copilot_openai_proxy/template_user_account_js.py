@@ -94,27 +94,48 @@ function renderUserCountdown(){
 function tickUserCountdown(){if(_userRemainSec>0){_userRemainSec--;renderUserCountdown()}}
 function boundAccountName(a){
   if(!a)return t('status_unknown');
-  const state=a.binding_state||(a.cookie_valid?'cookie':(a.has_token?'token_only':'none'));
-  if(state==='cookie')return a.name||a.email||a.id;
-  return state==='token_only'?t('account_none_token'):t('account_none');
+  // Prefer real identity once token/RT/cookie is present. Do NOT show
+  // "none (Token)" after a successful PKCE login — that looks like failure.
+  if(a.name||a.email)return a.name||a.email;
+  if(a.has_token||a.has_refresh_token||a.cookie_valid)return a.id||t('status_unknown');
+  return t('account_none');
+}
+function accountLoginMode(a){
+  if(!a)return t('login_mode_none');
+  if(a.oauth_client_id)return t('login_mode_oauth');
+  if(a.has_refresh_token)return t('login_mode_rt');
+  if(a.cookie_valid)return t('login_mode_cookie');
+  if(a.has_token)return t('login_mode_token');
+  return t('login_mode_none');
+}
+function accountRefreshMode(a){
+  if(!a)return t('refresh_manual');
+  if(a.has_refresh_token)return t('refresh_auto_rt');
+  if(a.token_source==='cdp'&&a.cookie_valid)return t('refresh_auto');
+  if(a.token_source==='cdp')return t('refresh_unavailable');
+  return t('refresh_manual');
 }
 function renderAccountStatus(d){
   const box=document.getElementById('account-status-panel');if(!box)return;
   const a=d.account||null,st=a?(a.token_status||{}):{};
   const valid=!!st.valid;
-  // Login light: cookie session OR PKCE/RT chain (text API does not need cookies).
-  const login=!!(a&&(a.cookie_valid||a.has_refresh_token||a.has_token));
-  const refresh=!!(a&&(a.token_source==='cdp'||a.has_refresh_token));
+  // Logged-in for text API: token and/or RT is enough. Cookie is optional extras.
+  const login=!!(a&&(a.has_refresh_token||a.has_token||a.cookie_valid));
+  const refresh=!!(a&&(a.has_refresh_token||(a.token_source==='cdp'&&a.cookie_valid)));
   const name=boundAccountName(a);
   const mark=(ok)=>'<span class="status-mark '+(ok?'ok':'bad')+'"></span>';
+  const mode=accountLoginMode(a);
+  const rmode=accountRefreshMode(a);
   box.innerHTML='<h3 style="margin:0;color:var(--strong);font-size:1rem;display:none">'+t('status_panel_title')+'</h3>'
     +'<div class="status-grid">'
     +'<div class="status-line status-first"><span>'+t('status_account')+'</span><b>'+esc(name)+'</b></div>'
-    +'<div class="status-line"><span>'+t('status_login')+'</span><b>'+mark(login)+'</b></div>'
-    +'<div class="status-line"><span>'+t('status_refresh')+'</span><b>'+mark(refresh)+'</b></div>'
+    +(a&&a.email?'<div class="status-line"><span>Email</span><b style="font-size:.78rem;word-break:break-all">'+esc(a.email)+'</b></div>':'')
+    +'<div class="status-line"><span>'+t('status_login')+'</span><b>'+mark(login)+' <span style="font-size:.72rem;color:var(--muted)">'+esc(mode)+'</span></b></div>'
+    +'<div class="status-line"><span>'+t('status_refresh')+'</span><b>'+mark(refresh)+' <span style="font-size:.72rem;color:var(--muted)">'+esc(rmode)+'</span></b></div>'
     +'<div class="status-line"><span>'+t('status_valid')+'</span><b>'+mark(valid)+'</b></div>'
     +'<div class="status-line"><span>'+t('status_remaining')+'</span><b data-user-remaining>'+fmtRemaining(st.seconds_remaining)+'</b></div>'
     +'<div class="status-line"><span>'+t('status_expire')+'</span><b>'+fmtExpire(st.expires_at)+'</b></div>'
+    +'<div class="status-line"><span>Cookie</span><b>'+mark(!!(a&&a.cookie_valid))+' <span style="font-size:.72rem;color:var(--muted)">'+(a&&a.cookie_valid?t('cookie_optional_ok'):t('cookie_optional_na'))+'</span></b></div>'
     +'</div>';
 }
 
@@ -130,11 +151,23 @@ function renderAccountInfo(d){
   const consoleActions='<span class="account-console-icons" style="height:32px;display:inline-flex;align-items:center;gap:.4rem"><button type="button" class="account-icon-btn account-icon-btn-pass" title="'+t('change_password')+'" onclick="changeLoginPassword(this)" aria-label="'+t('change_password')+'">'+keyIcon+'</button><button type="button" class="account-icon-btn account-icon-btn-out" title="'+t('console_logout')+'" onclick="logoutConsole()" aria-label="'+t('console_logout')+'">'+doorIcon+'</button></span>';
   const actionBox=document.getElementById('account-console-actions');if(actionBox)actionBox.innerHTML=consoleActions;
   if(d.account){
-    const st=d.account.token_status||{};
+    const a=d.account;
+    const st=a.token_status||{};
     const valid=st.valid;
     const rem=valid?(' · '+t('remaining')+' <span data-user-remaining>'+fmtRemaining(_userRemainSec>0?_userRemainSec:st.seconds_remaining)+'</span>'):'';
-    acc+='<div class="row" style="flex-wrap:wrap;gap:.4rem;align-items:center"><span class="pill">'+t('bound_account')+': '+boundAccountName(d.account)+'</span>'
-      +'<span class="pill '+(valid?'ok':'bad')+'">'+(valid?t('token_valid'):t('token_invalid'))+rem+'</span></div>';
+    const loggedIn=!!(a.has_refresh_token||a.has_token||a.cookie_valid);
+    acc+='<div class="row" style="flex-wrap:wrap;gap:.4rem;align-items:center">'
+      +'<span class="pill '+(loggedIn?'ok':'')+'">'+t('bound_account')+': '+esc(boundAccountName(a))+'</span>'
+      +(a.email?'<span class="pill">'+esc(a.email)+'</span>':'')
+      +'<span class="pill '+(valid?'ok':'bad')+'">'+(valid?t('token_valid'):t('token_invalid'))+rem+'</span>'
+      +'<span class="pill '+(a.has_refresh_token?'ok':'')+'">'+(a.has_refresh_token?t('rt_ready'):t('rt_missing'))+'</span>'
+      +'<span class="pill">'+esc(accountLoginMode(a))+' · '+esc(accountRefreshMode(a))+'</span>'
+      +'</div>';
+    if(loggedIn&&a.has_refresh_token){
+      acc+='<div class="hint" style="margin-top:.45rem">'+t('login_ready_hint')+'</div>';
+    }else if(loggedIn&&!a.has_refresh_token){
+      acc+='<div class="hint" style="margin-top:.45rem">'+t('login_token_only_hint')+'</div>';
+    }
   }else{
     acc+='<div class="row" style="flex-wrap:wrap;gap:.4rem;align-items:center"><span class="pill">'+t('no_account')+'</span></div>';
   }

@@ -3,6 +3,20 @@ from __future__ import annotations
 _ADMIN_ACCOUNTS_JS = """let __accounts=[];
 let __selectedAccountIds=new Set();
 let __selectedAccount=localStorage.getItem('admin_sel_account')||'';
+function accountRefreshLabel(a){
+  const cv=liveCookieValid(a);
+  if(a.has_refresh_token)return t('refresh_auto_rt');
+  if(a.token_source==='cdp'&&cv)return t('refresh_auto');
+  if(a.token_source==='cdp')return t('refresh_unavailable');
+  return t('refresh_manual');
+}
+function accountLoginLabel(a){
+  if(a.oauth_client_id)return t('login_mode_oauth');
+  if(a.has_refresh_token)return t('login_mode_rt');
+  if(liveCookieValid(a))return t('login_mode_cookie');
+  if(a.has_token)return t('login_mode_token');
+  return t('login_mode_none');
+}
 function renderSelectedStatus(){
   const card=document.getElementById('status-card');
   const box=document.getElementById('status-content');
@@ -17,9 +31,13 @@ function renderSelectedStatus(){
   html+=row(t('col_account'),esc(a.name||a.id),'valid');
   if(a.email)html+=row('Email',esc(a.email),'');
   html+=row(t('col_token'),v?t('valid_short'):t('invalid_short'),v?'valid':'invalid');
+  html+=row(t('col_login_mode'),accountLoginLabel(a), (a.has_refresh_token||a.has_token)?'valid':'warn');
   const cv=liveCookieValid(a);
-  html+=row(t('col_cookie'),cv?t('cookie_valid_short'):t('cookie_invalid_short'),cv?'valid':'warn');
-  html+=row(t('col_refresh_mode'),a.token_source==='cdp'?(cv?t('refresh_auto'):t('refresh_unavailable')):t('refresh_manual'),a.token_source==='cdp'&&cv?'valid':'warn');
+  html+=row(t('col_cookie'),cv?t('cookie_valid_short'):t('cookie_optional_na'),cv?'valid':'warn');
+  const rlabel=accountRefreshLabel(a);
+  const rgood=!!a.has_refresh_token||(a.token_source==='cdp'&&cv);
+  html+=row(t('col_refresh_mode'),rlabel,rgood?'valid':'warn');
+  html+=row(t('col_rt'),a.has_refresh_token?t('rt_ready_short'):t('rt_missing_short'),a.has_refresh_token?'valid':'warn');
   html+=row(t('cookie_updated_label'),fmtTs(a.cookie_updated_at),'');
   html+=row(t('cookie_expires_label'),fmtTs(a.cookie_expires_at),'');
   if(st.error)html+=row(t('error'),esc(st.error),'invalid');
@@ -52,15 +70,16 @@ async function loadAccounts(localOnly=false){
       const rem=valid?(' '+fmtHMS(st.seconds_remaining||0)):'';
       const badge='<span style="width:134px;display:inline-flex;justify-content:center;padding:.15rem .6rem;border-radius:99px;font-size:.72rem;background:'+(valid?'rgba(63,185,112,.16)':'rgba(224,138,138,.16)')+';color:'+(valid?'#3fb970':'#e08a8a')+';border:1px solid '+(valid?'rgba(63,185,112,.4)':'rgba(224,138,138,.4)')+'">'+(valid?t('valid_short'):t('invalid_short'))+'<span data-token-rem="'+esc(a.id)+'">'+rem+'</span></span>';
       const cookieValid=liveCookieValid(a);
-      const cookieBadge='<span style="width:76px;display:inline-flex;justify-content:center;padding:.15rem .6rem;border-radius:99px;font-size:.72rem;background:'+(cookieValid?'rgba(96,242,255,.15)':'rgba(148,163,184,.12)')+';color:'+(cookieValid?'#60f2ff':'#94a3b8')+';border:1px solid '+(cookieValid?'rgba(96,242,255,.4)':'rgba(148,163,184,.25)')+'">'+(cookieValid?t('cookie_valid_short'):t('cookie_invalid_short'))+'</span>';
+      const cookieBadge='<span style="width:76px;display:inline-flex;justify-content:center;padding:.15rem .6rem;border-radius:99px;font-size:.72rem;background:'+(cookieValid?'rgba(96,242,255,.15)':'rgba(148,163,184,.12)')+';color:'+(cookieValid?'#60f2ff':'#94a3b8')+';border:1px solid '+(cookieValid?'rgba(96,242,255,.4)':'rgba(148,163,184,.25)')+'">'+(cookieValid?t('cookie_valid_short'):t('cookie_optional_short'))+'</span>';
       const cookieMeta='<div style="display:grid;grid-template-columns:76px auto;column-gap:.55rem;row-gap:2px;align-items:center;white-space:nowrap"><div>'+cookieBadge+'</div><div style="color:var(--faint);font-size:.68rem">'+t('cookie_updated_label')+': '+fmtTs(a.cookie_updated_at)+'</div><button class="cookie-refresh-btn" data-id="'+esc(a.id)+'" style="width:76px;font-size:.72rem;padding:3px 8px">'+t('btn_cookie_refresh')+'</button><div style="color:var(--faint);font-size:.68rem">'+t('cookie_expires_label')+': '+fmtTs(a.cookie_expires_at)+'</div></div>';
       const boundNames=Array.isArray(a.bound_names)?a.bound_names.filter(Boolean):[];
       const boundMain=boundNames[0]||a.name||'name';
       const boundTitle=boundNames.length?boundNames.join(String.fromCharCode(10)):boundMain;
       const boundMore=boundNames.length>1?' +'+(boundNames.length-1):'';
-      const refreshMode=a.token_source==='cdp'?(cookieValid?t('refresh_auto'):t('refresh_unavailable')):t('refresh_manual');
-      const refreshColor=a.token_source==='cdp'&&cookieValid?'#a78bfa':(a.token_source==='cdp'?'#f59e0b':'var(--faint)');
-      const refreshBadge='<span style="padding:.15rem .6rem;border-radius:99px;font-size:.72rem;background:rgba(167,139,250,.12);color:'+refreshColor+';border:1px solid rgba(167,139,250,.28)">'+refreshMode+'</span>';
+      const refreshMode=accountRefreshLabel(a);
+      const refreshGood=!!a.has_refresh_token||(a.token_source==='cdp'&&cookieValid);
+      const refreshColor=refreshGood?'#a78bfa':(a.token_source==='cdp'?'#f59e0b':'var(--faint)');
+      const refreshBadge='<span title="'+esc(accountLoginLabel(a))+'" style="padding:.15rem .6rem;border-radius:99px;font-size:.72rem;background:rgba(167,139,250,.12);color:'+refreshColor+';border:1px solid rgba(167,139,250,.28)">'+refreshMode+'</span>';
       const mkMedia=(label,ok)=>'<div style="display:flex;align-items:center;gap:.35rem;white-space:nowrap"><span style="color:var(--faint);font-size:.68rem;width:26px">'+label+'</span><span style="display:inline-flex;justify-content:center;width:44px;padding:.1rem .4rem;border-radius:99px;font-size:.68rem;background:'+(ok?'rgba(63,185,112,.16)':'rgba(148,163,184,.12)')+';color:'+(ok?'#3fb970':'#94a3b8')+';border:1px solid '+(ok?'rgba(63,185,112,.4)':'rgba(148,163,184,.25)')+'">'+(ok?t('valid_short'):t('invalid_short'))+'</span></div>';
       const mediaCell='<div style="display:flex;flex-direction:column;gap:2px">'+mkMedia(t('media_image'),!!a.has_designer_auth)+mkMedia(t('media_attach'),!!a.has_media_auth)+'</div>';
       const sel=a.id===__selectedAccount;
