@@ -14,6 +14,7 @@ from .media_proxy_events import init_media_proxy_events
 from .key_store import KeyStore
 from .login_guard import LoginRateLimiter
 from .metrics_store import init_metrics_store
+from .image_cache import ImageCache
 from .oauth_pkce import PKCESessionStore
 from .refresh_scheduler import RefreshScheduler
 from .runtime_flags import set_flags as _set_log_flags
@@ -87,6 +88,9 @@ def init_app_state(
     app.state.user_login_limiter = LoginRateLimiter()
     # In-memory PKCE state for browser OAuth login (single serve process).
     app.state.pkce_store = PKCESessionStore()
+    # Durable generated-image bytes so /v1/images url responses do not depend on
+    # a later Designer media fetch (which often 504s when designer auth is stale).
+    app.state.image_cache = ImageCache(Path(settings.token_dir) / "image-cache")
     app.state.refresh_scheduler = RefreshScheduler(
         app.state.account_store,
         profile_root=Path(settings.token_dir) / "profiles",

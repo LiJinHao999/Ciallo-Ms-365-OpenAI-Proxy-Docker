@@ -161,6 +161,28 @@ def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Req
             "account": _account_public(acc) if acc else None,
         }
 
+    @app.get("/admin/image-gen/history")
+    async def image_gen_history(request: Request) -> dict:
+        err = require_admin(request)
+        if err:
+            return err
+        limit = 40
+        try:
+            limit = int(request.query_params.get("limit") or 40)
+        except Exception:
+            limit = 40
+        cache = getattr(app.state, "image_cache", None)
+        items = cache.list_recent(limit=limit) if cache is not None else []
+        # Prefer Host / X-Forwarded-* so LAN WebUIs can open thumbnails.
+        xf_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+        xf_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+        host = xf_host or (request.headers.get("host") or "").strip()
+        scheme = xf_proto or request.url.scheme or "http"
+        base = f"{scheme}://{host}".rstrip("/") if host else str(request.base_url).rstrip("/")
+        for item in items:
+            item["url"] = f"{base}/v1/images/{item.get('id')}"
+        return {"items": items, "count": len(items)}
+
     @app.get("/admin/image-gen/status")
     async def image_gen_status(request: Request) -> dict:
         """Pool-wide image generation quota snapshot for the admin panel."""

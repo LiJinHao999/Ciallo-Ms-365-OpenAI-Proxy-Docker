@@ -97,6 +97,8 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <div style="font-size:.8rem;color:var(--faint);margin-bottom:.55rem;line-height:1.55" data-i18n="image_gen_hint">按 Microsoft 账户维护今日生图成功/失败与额度耗尽状态。请求会优先当前绑定账户，触顶后自动切换其他可用账户。额度按 Asia/Shanghai 自然日滚动。</div>
 <div id="image-gen-summary" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.55rem;margin-bottom:.75rem"></div>
 <div id="image-gen-content"><span style="color:var(--faint)" data-i18n="loading">加载中...</span></div>
+<div style="margin-top:1rem;font-size:.85rem;color:var(--muted)" data-i18n="img_history_title">最近出图缓存</div>
+<div id="image-gen-history" style="margin-top:.45rem"><span style="color:var(--faint)" data-i18n="loading">加载中...</span></div>
 </div>
 
 <div class="card view-users">

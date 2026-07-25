@@ -49,6 +49,12 @@ def register_auth_middleware(app: FastAPI, resolved_settings: Settings) -> None:
         if path == "/v1/m365-media":
             return await call_next(request)
 
+        # Cached generated images are served by unguessable ids (img_ + 32 hex).
+        # WebUIs load these as <img src> without Authorization headers, so they
+        # must be public like /v1/m365-media.
+        if path.startswith("/v1/images/") and request.method in ("GET", "HEAD", "OPTIONS"):
+            return await call_next(request)
+
         if path in ("/", "/admin", "/favicon.ico", "/healthz") or path.startswith("/admin/") or path.startswith("/user/"):
             return await call_next(request)
 

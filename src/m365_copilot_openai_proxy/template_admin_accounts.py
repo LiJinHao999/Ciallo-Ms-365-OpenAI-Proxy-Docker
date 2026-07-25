@@ -305,10 +305,33 @@ async function clearImageQuota(id,btn){
   if(btn){btn.textContent=ok?t('img_clear_ok'):t('img_clear_fail');btn.style.color=ok?'#22c55e':'#ef4444';setTimeout(()=>{btn.textContent=t('btn_clear_image_quota');btn.style.color='';btn.disabled=false},2000)}
   if(ok){loadImageGenStatus();loadAccounts()}
 }
+async function loadImageGenHistory(){
+  const box=document.getElementById('image-gen-history');
+  if(!box)return;
+  try{
+    const r=await fetch('/admin/image-gen/history?limit=24',{credentials:'include'});
+    if(!r.ok){box.innerHTML='<span style="color:var(--faint)">-</span>';return}
+    const d=await r.json();
+    const items=d.items||[];
+    if(!items.length){box.innerHTML='<span style="color:var(--faint)">'+t('img_history_empty')+'</span>';return}
+    let h='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:.65rem">';
+    items.forEach(it=>{
+      const u=it.url||('' );
+      h+='<div style="background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;overflow:hidden">'
+        +'<a href="'+esc(u)+'" target="_blank" rel="noopener"><img src="'+esc(u)+'" alt="" style="width:100%;height:110px;object-fit:cover;display:block;background:#111"></a>'
+        +'<div style="padding:.4rem .5rem;font-size:.68rem;color:var(--muted);line-height:1.35">'
+        +'<div style="color:var(--strong);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+esc(it.prompt||'')+'">'+esc((it.prompt||'').slice(0,48)||it.id)+'</div>'
+        +'<div>'+esc(it.account_email||'')+' · '+(it.kind||'generation')+'</div>'
+        +'</div></div>';
+    });
+    h+='</div>';
+    box.innerHTML=h;
+  }catch(e){box.innerHTML='<span style="color:#e08a8a">'+t('network_error')+'</span>'}
+}
 // Load image panel with accounts view.
 const _origLoadAccounts=loadAccounts;
 loadAccounts=async function(localOnly=false){
   await _origLoadAccounts(localOnly);
-  if(!localOnly)loadImageGenStatus();
+  if(!localOnly){loadImageGenStatus();loadImageGenHistory()}
 };
 """
