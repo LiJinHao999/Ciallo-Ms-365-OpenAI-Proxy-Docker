@@ -4,6 +4,7 @@ from __future__ import annotations
 from m365_copilot_openai_proxy.routes_api_images import (
     _build_image_prompt,
     _harvest_image_urls,
+    _looks_like_quota_exhausted,
 )
 
 
@@ -48,3 +49,9 @@ def test_register_images_routes_callable():
 
     assert callable(register_images_routes)
     assert callable(register_api_routes)
+
+
+def test_quota_phrase_detection_used_by_images_route():
+    assert _looks_like_quota_exhausted(
+        "Sorry, I can’t generate any more images today. Try again tomorrow."
+    )

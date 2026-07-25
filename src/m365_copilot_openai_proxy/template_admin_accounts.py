@@ -231,6 +231,84 @@ async function submitAdminOAuth(btn){
   }catch(e){err=t('network_error')}
   if(m){m.textContent=ok?t('oauth_ok'):(err||t('oauth_failed'));m.style.color=ok?'#22c55e':'#ef4444'}
   if(btn){btn.textContent=t('oauth_submit_btn');btn.disabled=false}
-  if(ok){loadAccounts();loadKeys()}
+  if(ok){loadAccounts();loadKeys();loadImageGenStatus()}
 }
+function _imgStatusLabel(a){
+  const ig=a.image_gen||{};
+  if(ig.quota_exhausted)return t('img_status_exhausted');
+  if(!a.has_token)return t('img_status_no_token');
+  if(a.token_valid===false)return t('img_status_token_bad');
+  if(ig.available)return t('img_status_available');
+  return t('img_status_no_token');
+}
+function _imgStatusClass(a){
+  const ig=a.image_gen||{};
+  if(ig.quota_exhausted)return 'invalid';
+  if(ig.available)return 'valid';
+  return 'warn';
+}
+async function loadImageGenStatus(){
+  const box=document.getElementById('image-gen-content');
+  const sum=document.getElementById('image-gen-summary');
+  if(!box)return;
+  try{
+    const r=await fetch('/admin/image-gen/status',{credentials:'include'});
+    if(r.status===401){box.innerHTML='<span style="color:var(--faint)">'+t('loading')+'</span>';return}
+    const d=await r.json();
+    const s=d.summary||{};
+    if(sum){
+      const kpi=(label,val,color)=>'<div style="padding:.55rem .7rem;border-radius:10px;background:var(--inner);border:1px solid var(--inner-border)"><div style="font-size:.72rem;color:var(--muted)">'+label+'</div><div style="font-size:1.15rem;font-weight:700;color:'+(color||'var(--strong)')+';margin-top:.15rem">'+val+'</div></div>';
+      sum.innerHTML=kpi(t('img_kpi_accounts'),s.accounts||0)
+        +kpi(t('img_kpi_available'),s.available||0,'#3fb970')
+        +kpi(t('img_kpi_exhausted'),s.exhausted||0,'#f59e0b')
+        +kpi(t('img_kpi_success'),s.success_today||0,'#60f2ff')
+        +kpi(t('img_kpi_fail'),s.fail_today||0,'#e08a8a');
+    }
+    const accounts=d.accounts||[];
+    if(!accounts.length){box.innerHTML='<span style="color:var(--faint)">'+t('img_no_accounts')+'</span>';return}
+    let h='<div class="tbl-scroll"><table class="admin-tbl"><thead><tr style="color:var(--muted);text-align:left">'
+      +'<th style="padding:.3rem">'+t('img_col_account')+'</th>'
+      +'<th style="padding:.3rem">'+t('img_col_status')+'</th>'
+      +'<th style="padding:.3rem">'+t('img_col_success')+'</th>'
+      +'<th style="padding:.3rem">'+t('img_col_fail')+'</th>'
+      +'<th style="padding:.3rem">'+t('img_col_last')+'</th>'
+      +'<th style="padding:.3rem;text-align:right">'+t('img_col_actions')+'</th>'
+      +'</tr></thead><tbody>';
+    accounts.forEach(a=>{
+      const ig=a.image_gen||{};
+      const stCls=_imgStatusClass(a);
+      const stColor=stCls==='valid'?'#3fb970':(stCls==='invalid'?'#e08a8a':'#f59e0b');
+      const badge='<span style="padding:.15rem .55rem;border-radius:99px;font-size:.72rem;background:rgba(148,163,184,.12);color:'+stColor+';border:1px solid rgba(148,163,184,.25)">'+esc(_imgStatusLabel(a))+'</span>';
+      const last=ig.last_attempt_at?fmtTs(ig.last_attempt_at):(ig.last_success_at?fmtTs(ig.last_success_at):'-');
+      const err=ig.last_error?'<div style="color:var(--faint);font-size:.68rem;max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+esc(ig.last_error)+'">'+esc(ig.last_error)+'</div>':'';
+      h+='<tr style="border-top:1px solid var(--inner-border)">'
+        +'<td style="padding:.4rem"><div>'+esc(a.name||a.id)+'</div><div style="color:var(--faint);font-size:.72rem">'+esc(a.email||'')+'</div></td>'
+        +'<td style="padding:.4rem">'+badge+err+'</td>'
+        +'<td style="padding:.4rem">'+(ig.success_count||0)+'</td>'
+        +'<td style="padding:.4rem">'+(ig.fail_count||0)+'</td>'
+        +'<td style="padding:.4rem;color:var(--faint);font-size:.75rem">'+last+'</td>'
+        +'<td style="padding:.4rem;text-align:right">'
+        +(ig.quota_exhausted?('<button onclick="clearImageQuota(\\''+a.id+'\\',this)" style="font-size:.72rem;padding:3px 8px">'+t('btn_clear_image_quota')+'</button>'):'<span style="color:var(--faint);font-size:.72rem">-</span>')
+        +'</td></tr>';
+    });
+    h+='</tbody></table></div>';
+    box.innerHTML=h;
+  }catch(e){box.innerHTML='<span style="color:#e08a8a">'+t('network_error')+'</span>'}
+}
+async function clearImageQuota(id,btn){
+  if(btn){btn.disabled=true}
+  let ok=false;
+  try{
+    const r=await fetch('/admin/accounts/'+id+'/image-quota/clear',{method:'POST',credentials:'include'});
+    ok=r.ok;
+  }catch(e){}
+  if(btn){btn.textContent=ok?t('img_clear_ok'):t('img_clear_fail');btn.style.color=ok?'#22c55e':'#ef4444';setTimeout(()=>{btn.textContent=t('btn_clear_image_quota');btn.style.color='';btn.disabled=false},2000)}
+  if(ok){loadImageGenStatus();loadAccounts()}
+}
+// Load image panel with accounts view.
+const _origLoadAccounts=loadAccounts;
+loadAccounts=async function(localOnly=false){
+  await _origLoadAccounts(localOnly);
+  if(!localOnly)loadImageGenStatus();
+};
 """

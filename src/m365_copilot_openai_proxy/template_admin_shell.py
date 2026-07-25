@@ -89,6 +89,16 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <div id="accounts-content"><span style="color:var(--faint)" data-i18n="loading">加载中...</span></div>
 </div>
 
+<div class="card view-accounts">
+<div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.75rem">
+<h2 style="margin:0" data-i18n="title_image_gen">生图额度</h2>
+<button onclick="loadImageGenStatus()" style="margin-left:auto;font-size:.8rem;padding:5px 12px" data-i18n="dash_refresh">刷新</button>
+</div>
+<div style="font-size:.8rem;color:var(--faint);margin-bottom:.55rem;line-height:1.55" data-i18n="image_gen_hint">按 Microsoft 账户维护今日生图成功/失败与额度耗尽状态。请求会优先当前绑定账户，触顶后自动切换其他可用账户。额度按 Asia/Shanghai 自然日滚动。</div>
+<div id="image-gen-summary" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.55rem;margin-bottom:.75rem"></div>
+<div id="image-gen-content"><span style="color:var(--faint)" data-i18n="loading">加载中...</span></div>
+</div>
+
 <div class="card view-users">
 <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.75rem">
 <button onclick="toggleKeyForm()" style="margin-left:auto;font-size:.8rem;padding:5px 12px" data-i18n="btn_add_key">新建用户</button>

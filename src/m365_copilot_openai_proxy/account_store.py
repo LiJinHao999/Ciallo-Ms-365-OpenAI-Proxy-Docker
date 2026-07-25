@@ -86,6 +86,16 @@ class Account:
     cdp_port: int = _CDP_PORT_BASE
     # "manual" = token pushed by user (Tampermonkey / paste); "cdp" = auto-captured.
     token_source: str = "manual"
+    # Image-generation quota bookkeeping (local proxy view of M365 daily limits).
+    # day key is YYYY-MM-DD in Asia/Shanghai so the admin panel resets with the
+    # same rough boundary users experience for "try again tomorrow".
+    image_gen_day: str = ""
+    image_gen_success_count: int = 0
+    image_gen_fail_count: int = 0
+    image_gen_quota_exhausted_until: float = 0.0
+    image_gen_last_error: str = ""
+    image_gen_last_success_at: float = 0.0
+    image_gen_last_attempt_at: float = 0.0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -183,6 +193,13 @@ class AccountStore:
                     media_seed_url=str(raw.get("media_seed_url", "") or ""),
                     cdp_port=loaded_port,
                     token_source=raw.get("token_source", "manual"),
+                    image_gen_day=str(raw.get("image_gen_day", "") or ""),
+                    image_gen_success_count=int(raw.get("image_gen_success_count", 0) or 0),
+                    image_gen_fail_count=int(raw.get("image_gen_fail_count", 0) or 0),
+                    image_gen_quota_exhausted_until=float(raw.get("image_gen_quota_exhausted_until", 0.0) or 0.0),
+                    image_gen_last_error=str(raw.get("image_gen_last_error", "") or ""),
+                    image_gen_last_success_at=float(raw.get("image_gen_last_success_at", 0.0) or 0.0),
+                    image_gen_last_attempt_at=float(raw.get("image_gen_last_attempt_at", 0.0) or 0.0),
                     created_at=float(raw.get("created_at", time.time())),
                     updated_at=float(raw.get("updated_at", time.time())),
                 )
@@ -398,6 +415,99 @@ class AccountStore:
             if acc is None:
                 return None
             acc.oauth_client_id = (client_id or "").strip()
+            acc.updated_at = time.time()
+            self._save()
+            return acc
+
+    @staticmethod
+    def _image_day_key(now: float | None = None) -> str:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        ts = time.time() if now is None else float(now)
+        return datetime.fromtimestamp(ts, tz=ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _image_day_end_ts(day_key: str | None = None) -> float:
+        """Unix ts of next Asia/Shanghai midnight after day_key (exclusive end)."""
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        key = day_key or AccountStore._image_day_key()
+        tz = ZoneInfo("Asia/Shanghai")
+        day = datetime.strptime(key, "%Y-%m-%d").replace(tzinfo=tz)
+        return (day + timedelta(days=1)).timestamp()
+
+    def _roll_image_day_locked(self, acc: Account, now: float | None = None) -> None:
+        day = self._image_day_key(now)
+        if acc.image_gen_day == day:
+            # Clear exhausted flag once the day rolls even if until-ts is stale.
+            if acc.image_gen_quota_exhausted_until and float(now or time.time()) >= acc.image_gen_quota_exhausted_until:
+                acc.image_gen_quota_exhausted_until = 0.0
+            return
+        acc.image_gen_day = day
+        acc.image_gen_success_count = 0
+        acc.image_gen_fail_count = 0
+        if acc.image_gen_quota_exhausted_until and float(now or time.time()) >= acc.image_gen_quota_exhausted_until:
+            acc.image_gen_quota_exhausted_until = 0.0
+            acc.image_gen_last_error = ""
+
+    def image_quota_blocked(self, acc_id: str, now: float | None = None) -> bool:
+        with self._lock:
+            acc = self._accounts.get(acc_id)
+            if acc is None:
+                return True
+            ts = time.time() if now is None else float(now)
+            self._roll_image_day_locked(acc, ts)
+            return bool(acc.image_gen_quota_exhausted_until and ts < acc.image_gen_quota_exhausted_until)
+
+    def record_image_gen_success(self, acc_id: str, n: int = 1) -> Account | None:
+        with self._lock:
+            acc = self._accounts.get(acc_id)
+            if acc is None:
+                return None
+            now = time.time()
+            self._roll_image_day_locked(acc, now)
+            acc.image_gen_success_count = int(acc.image_gen_success_count or 0) + max(1, int(n or 1))
+            acc.image_gen_last_success_at = now
+            acc.image_gen_last_attempt_at = now
+            acc.image_gen_last_error = ""
+            # A success proves the account is not currently day-blocked.
+            acc.image_gen_quota_exhausted_until = 0.0
+            acc.updated_at = now
+            self._save()
+            return acc
+
+    def record_image_gen_failure(
+        self,
+        acc_id: str,
+        error: str = "",
+        *,
+        quota_exhausted: bool = False,
+    ) -> Account | None:
+        with self._lock:
+            acc = self._accounts.get(acc_id)
+            if acc is None:
+                return None
+            now = time.time()
+            self._roll_image_day_locked(acc, now)
+            acc.image_gen_fail_count = int(acc.image_gen_fail_count or 0) + 1
+            acc.image_gen_last_attempt_at = now
+            acc.image_gen_last_error = (error or "")[:500]
+            if quota_exhausted:
+                acc.image_gen_quota_exhausted_until = self._image_day_end_ts(acc.image_gen_day)
+            acc.updated_at = now
+            self._save()
+            return acc
+
+    def clear_image_quota(self, acc_id: str) -> Account | None:
+        """Admin override: clear today's exhausted flag (does not reset counters)."""
+        with self._lock:
+            acc = self._accounts.get(acc_id)
+            if acc is None:
+                return None
+            acc.image_gen_quota_exhausted_until = 0.0
+            acc.image_gen_last_error = ""
             acc.updated_at = time.time()
             self._save()
             return acc

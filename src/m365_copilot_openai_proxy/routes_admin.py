@@ -161,6 +161,62 @@ def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Req
             "account": _account_public(acc) if acc else None,
         }
 
+    @app.get("/admin/image-gen/status")
+    async def image_gen_status(request: Request) -> dict:
+        """Pool-wide image generation quota snapshot for the admin panel."""
+        err = require_admin(request)
+        if err:
+            return err
+        from .account_serializers import image_gen_public
+
+        accounts = []
+        available = 0
+        exhausted = 0
+        success_today = 0
+        fail_today = 0
+        for acc in app.state.account_store.list():
+            snap = image_gen_public(acc)
+            st = acc.token_status()
+            item = {
+                "id": acc.id,
+                "name": acc.name,
+                "email": acc.email,
+                "has_token": bool(acc.token),
+                "token_valid": bool(st.get("valid")),
+                "has_refresh_token": bool(getattr(acc, "refresh_token", "")),
+                "has_designer_auth": bool(getattr(acc, "designer_auth_token", "")),
+                "has_media_auth": bool(getattr(acc, "media_auth_token", "")),
+                "image_gen": snap,
+            }
+            accounts.append(item)
+            if snap.get("available"):
+                available += 1
+            if snap.get("quota_exhausted"):
+                exhausted += 1
+            success_today += int(snap.get("success_count") or 0)
+            fail_today += int(snap.get("fail_count") or 0)
+        accounts.sort(key=lambda a: (0 if (a.get("image_gen") or {}).get("available") else 1, a.get("email") or a.get("id") or ""))
+        return {
+            "summary": {
+                "accounts": len(accounts),
+                "available": available,
+                "exhausted": exhausted,
+                "success_today": success_today,
+                "fail_today": fail_today,
+            },
+            "accounts": accounts,
+        }
+
+    @app.post("/admin/accounts/{acc_id}/image-quota/clear")
+    async def clear_account_image_quota(acc_id: str, request: Request) -> dict:
+        err = require_admin(request)
+        if err:
+            return err
+        acc = app.state.account_store.clear_image_quota(acc_id)
+        if acc is None:
+            return _json_err(404, "Account not found")
+        return {"status": "ok", "account": _account_public(acc)}
+
     @app.delete("/admin/accounts/{acc_id}")
     async def remove_account(acc_id: str, request: Request) -> dict:
         err = require_admin(request)
