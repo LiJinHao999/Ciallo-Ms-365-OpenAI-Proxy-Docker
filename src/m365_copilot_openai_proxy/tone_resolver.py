@@ -20,6 +20,13 @@ matches no tone, the caller falls back to the global default tone.
 PERSIST_MODEL_SUFFIX = ":persist"
 PERSIST_DISPLAY_SUFFIX = "-持续"
 
+# OpenAI-compatible image model aliases exposed via /v1/models and accepted by
+# /v1/images/generations. All map onto the Magic (auto) tone, which is the best
+# path into Designer / Flux image generation.
+IMAGE_MODEL_ALIASES: dict[str, str] = {
+    "gpt-image-1": "Magic",
+}
+
 
 def split_persist(model_str: str | None) -> tuple[str, bool]:
     """Split a model name into (base_without_persist_marker, is_persist)."""
@@ -47,6 +54,10 @@ def resolve_tone(
     base, is_persist = split_persist(model_str)
     if base:
         base_low = base.lower()
+        # Image-generation aliases (e.g. gpt-image-1) map to Magic / auto.
+        alias_tone = IMAGE_MODEL_ALIASES.get(base) or IMAGE_MODEL_ALIASES.get(base_low)
+        if alias_tone:
+            return alias_tone, is_persist
         for option in tone_options:
             value = str(option.get("value") or "")
             if base == value:
@@ -89,6 +100,24 @@ def build_models_list(tone_options: list[dict], created: int) -> list[dict]:
                 },
                 "capabilities": {"vision": True},
             })
+    # Image-generation aliases for OpenAI-compatible clients that expect
+    # names like gpt-image-1 when calling /v1/images/generations.
+    for alias_id in IMAGE_MODEL_ALIASES:
+        if alias_id in seen:
+            continue
+        seen.add(alias_id)
+        data.append({
+            "id": alias_id,
+            "object": "model",
+            "created": created,
+            "owned_by": "microsoft-365-copilot",
+            "architecture": {
+                "modality": "text->image",
+                "input_modalities": ["text"],
+                "output_modalities": ["image"],
+            },
+            "capabilities": {"image_generation": True, "vision": False},
+        })
     return data
 
 
