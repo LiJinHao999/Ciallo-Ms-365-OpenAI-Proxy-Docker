@@ -1,9 +1,15 @@
 services:
   ciallo-proxy-multi:
-    image: ghcr.io/murasamecyan/ciallo-ms-365-openai-proxy-docker:multi
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+    image: ciallo-ms365-proxy-multi:local
     container_name: ciallo-ms365-proxy-multi
     ports:
-      - "8000:8000"
+      # Bind all interfaces so LAN hosts can reach the proxy.
+      - "8810:8000"
     env_file:
       - .env
     volumes:

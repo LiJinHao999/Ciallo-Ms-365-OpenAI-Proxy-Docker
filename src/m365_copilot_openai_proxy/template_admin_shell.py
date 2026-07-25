@@ -61,10 +61,11 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <div class="card view-accounts accounts-main-card">
 <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.75rem">
 <button onclick="toggleAccountForm()" style="margin-left:auto;font-size:.8rem;padding:5px 12px" data-i18n="btn_add_account">添加账户</button>
+<button onclick="toggleOAuthForm()" style="font-size:.8rem;padding:5px 12px" data-i18n="btn_oauth_login">微软登录</button>
 <button onclick="loadAccounts();loadStats()" style="font-size:.8rem;padding:5px 12px" data-i18n="dash_refresh">刷新</button>
 </div>
 <div id="accounts-warn" class="hide-card" style="margin-bottom:.75rem;padding:.6rem .9rem;border-radius:10px;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.45);color:#fbbf24;font-size:.85rem;box-shadow:0 0 22px rgba(245,158,11,.12)"></div>
-<div style="font-size:.8rem;color:var(--faint);margin-bottom:.5rem" data-i18n="accounts_hint">每个账户拥有独立的 M365 Token 与 Chromium 刷新配置。刷新按需串行拉起浏览器，用完即关。</div>
+<div style="font-size:.8rem;color:var(--faint);margin-bottom:.5rem" data-i18n="accounts_hint">每个账户拥有独立的 M365 Token 与 Chromium 刷新配置。推荐用「微软登录」走 PKCE 拿 RT；Cookie/CDP 仍可用于媒体增强。</div>
 <div id="acc-form" class="flow-box" style="display:none;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;padding:.75rem;margin-bottom:.75rem;position:relative">
 <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
 <input id="af-name" style="flex:1;min-width:140px;padding:6px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:6px;color:var(--strong);font-size:.82rem;outline:none">
@@ -74,6 +75,16 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <textarea id="af-token" style="width:100%;margin-top:.5rem;min-height:64px;padding:6px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:6px;color:var(--strong);font-size:.82rem;outline:none;resize:vertical"></textarea>
 <div style="font-size:.75rem;color:var(--faint);margin-top:.5rem" data-i18n="acc_form_hint">账户名可选。Token 可留空，稍后用 CDP 刷新或单独更新。</div>
 <div id="af-msg" style="font-size:.78rem;color:#ef4444;margin-top:.4rem"></div>
+</div>
+<div id="oauth-form" class="flow-box" style="display:none;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;padding:.75rem;margin-bottom:.75rem;position:relative">
+<div style="font-size:.82rem;color:var(--muted);margin-bottom:.5rem;line-height:1.55" data-i18n="oauth_form_hint">点击开始后浏览器打开微软登录。若跳到 wrongplace，复制仍带 code= 的完整地址粘贴提交。可选绑定当前选中账户，否则新建账户。</div>
+<div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+<button onclick="startAdminOAuth(this)" style="font-size:.8rem;padding:6px 14px" data-i18n="oauth_start_btn">打开微软登录</button>
+<button onclick="submitAdminOAuth(this)" style="font-size:.8rem;padding:6px 14px" data-i18n="oauth_submit_btn">提交回调 URL</button>
+<button onclick="toggleOAuthForm(false)" style="font-size:.8rem;padding:6px 14px;background:var(--chip)" data-i18n="kf_cancel">取消</button>
+</div>
+<textarea id="oauth-callback-admin" style="width:100%;margin-top:.5rem;min-height:64px;padding:6px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:6px;color:var(--strong);font-size:.82rem;outline:none;resize:vertical" data-i18n-ph="oauth_callback_ph" placeholder="粘贴 https://login.microsoftonline.com/common/oauth2/nativeclient?code=...&amp;state=..."></textarea>
+<div id="oauth-msg-admin" style="font-size:.78rem;color:var(--muted);margin-top:.4rem"></div>
 </div>
 <div id="accounts-content"><span style="color:var(--faint)" data-i18n="loading">加载中...</span></div>
 </div>

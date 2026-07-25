@@ -102,8 +102,9 @@ function renderAccountStatus(d){
   const box=document.getElementById('account-status-panel');if(!box)return;
   const a=d.account||null,st=a?(a.token_status||{}):{};
   const valid=!!st.valid;
-  const login=!!(a&&a.cookie_valid);
-  const refresh=!!(a&&a.token_source==='cdp');
+  // Login light: cookie session OR PKCE/RT chain (text API does not need cookies).
+  const login=!!(a&&(a.cookie_valid||a.has_refresh_token||a.has_token));
+  const refresh=!!(a&&(a.token_source==='cdp'||a.has_refresh_token));
   const name=boundAccountName(a);
   const mark=(ok)=>'<span class="status-mark '+(ok?'ok':'bad')+'"></span>';
   box.innerHTML='<h3 style="margin:0;color:var(--strong);font-size:1rem;display:none">'+t('status_panel_title')+'</h3>'
@@ -223,5 +224,45 @@ async function pushToken(btn){
   try{const r=await fetch('/user/account/token',{method:'POST',headers:authHeaders(),body:JSON.stringify({token:token})});ok=r.ok}catch(e){}
   if(ok)document.getElementById('acct-token').value='';
   if(btn){btn.textContent=ok?t('push_ok'):t('token_update_failed');btn.style.color=ok?'#22c55e':'#ef4444';clearTimeout(btn._rTimer);btn._rTimer=setTimeout(async()=>{btn.textContent=t('push_token_btn');btn.style.color='';btn.disabled=false;if(ok)await loadMe()},3000)}
+}
+let _oauthState='';
+async function startOAuth(btn){
+  const msg=document.getElementById('oauth-msg');
+  if(msg){msg.textContent='';msg.style.color=''}
+  if(btn){btn.disabled=true;btn.textContent=t('oauth_starting')}
+  let ok=false,err='';
+  try{
+    const r=await fetch('/user/oauth/start',{method:'POST',headers:authHeaders()});
+    const d=await r.json().catch(()=>({}));
+    ok=r.ok&&d.url;
+    if(ok){
+      _oauthState=d.state||'';
+      window.open(d.url,'_blank','noopener');
+      if(msg){msg.textContent=t('oauth_hint');msg.style.color='var(--muted)'}
+      const ta=document.getElementById('oauth-callback');if(ta)ta.focus();
+    }else{
+      err=(d.error&&d.error.message)||t('oauth_failed');
+    }
+  }catch(e){err=t('network_error')}
+  if(btn){btn.textContent=ok?t('oauth_start_btn'):t('oauth_failed');btn.style.color=ok?'':'#ef4444';clearTimeout(btn._rTimer);btn._rTimer=setTimeout(()=>{btn.textContent=t('oauth_start_btn');btn.style.color='';btn.disabled=false},2500)}
+  if(!ok&&msg){msg.textContent=err||t('oauth_failed');msg.style.color='#ef4444'}
+}
+async function submitOAuth(btn){
+  const ta=document.getElementById('oauth-callback');
+  const msg=document.getElementById('oauth-msg');
+  const url=(ta&&ta.value||'').trim();
+  if(!url){if(msg){msg.textContent=t('oauth_ph');msg.style.color='#ef4444'}return}
+  if(btn){btn.disabled=true;btn.textContent=t('oauth_submitting')}
+  let ok=false,err='';
+  try{
+    const r=await fetch('/user/oauth/callback',{method:'POST',headers:authHeaders(),body:JSON.stringify({url:url,state:_oauthState||undefined})});
+    const d=await r.json().catch(()=>({}));
+    ok=r.ok;
+    if(!ok)err=(d.error&&d.error.message)||t('oauth_failed');
+    else if(ta)ta.value='';
+  }catch(e){err=t('network_error')}
+  if(msg){msg.textContent=ok?t('oauth_ok'):(err||t('oauth_failed'));msg.style.color=ok?'#22c55e':'#ef4444'}
+  if(btn){btn.textContent=ok?t('oauth_ok'):t('oauth_failed');btn.style.color=ok?'#22c55e':'#ef4444';clearTimeout(btn._rTimer);btn._rTimer=setTimeout(async()=>{btn.textContent=t('oauth_submit_btn');btn.style.color='';btn.disabled=false;if(ok)await loadMe()},2500)}
+  else if(ok)await loadMe();
 }
 """

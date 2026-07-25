@@ -1,42 +1,31 @@
 """HTTP refresh_token -> substrate access token exchange (no browser).
 
-This is the fast refresh path proven by the POC: the userscript captures the
-OAuth2 refresh_token from the M365 token response and pushes it to the server;
-here we exchange it for a fresh substrate access token over plain HTTP, with no
-headless Chromium involved.
+Two public-client recipes are supported (selected by account.oauth_client_id):
 
-Recipe (validated against a real account):
+1) SPA / userscript (default, client 4765445b-...):
     POST https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token
-    Content-Type: application/x-www-form-urlencoded
     Origin: https://m365.cloud.microsoft
-    client_id     = 4765445b-32c6-49b0-83e6-1d93765276ca   (the Copilot client)
+    client_id     = 4765445b-32c6-49b0-83e6-1d93765276ca
     grant_type    = refresh_token
     refresh_token = <RT>
     scope         = https://substrate.office.com/sydney/.default
 
+2) Office-web PKCE (client c0ab8ce9-...):
+    Same token endpoint, but NO Origin header, and the full Office-web scope
+    string used at login. Mixing client_ids across login/refresh breaks the chain.
+
 The response carries an access_token (aud=https://substrate.office.com/) and a
 rotated refresh_token, which we persist so the chain keeps renewing. media and
-designer tokens are a different client/flow and are NOT produced here; they are
-kept alive lazily by the CDP media capture path.
+designer tokens are a different client/flow and are NOT produced here.
 """
 from __future__ import annotations
 
 import time
 
 from .account_store import AccountStore, extract_identity
+from .oauth_pkce import client_recipe, refresh_with_client
 from .token_store import decode_jwt_payload, is_substrate_token_claims
 from .runtime_flags import elog, ulog
-
-# The Copilot SPA's public client id (same one seen in our capture logs and in
-# the MSAL refreshtoken cache key). Public client => no secret needed.
-_CLIENT_ID = "4765445b-32c6-49b0-83e6-1d93765276ca"
-# Scope MUST include /sydney/ -- a bare substrate.office.com/.default is a
-# different resource and is rejected for this client.
-_SCOPE = "https://substrate.office.com/sydney/.default"
-_TOKEN_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
-# Origin header mirrors the SPA so AAD treats the request like the real client.
-_ORIGIN = "https://m365.cloud.microsoft"
-_HTTP_TIMEOUT_SECONDS = 20
 
 
 def _tenant_for_account(account) -> str:
@@ -75,53 +64,35 @@ async def refresh_via_rt(accounts: AccountStore, account_id: str) -> bool:
         return False
 
     tenant = _tenant_for_account(account)
-    data = {
-        "client_id": _CLIENT_ID,
-        "grant_type": "refresh_token",
-        "refresh_token": rt,
-        "scope": _SCOPE,
-    }
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": _ORIGIN,
-    }
-
-    import httpx
+    client_id, scope, origin = client_recipe(getattr(account, "oauth_client_id", "") or "")
 
     try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SECONDS) as client:
-            resp = await client.post(_TOKEN_URL.format(tenant=tenant), data=data, headers=headers)
+        bundle = await refresh_with_client(
+            rt,
+            client_id=client_id,
+            scope=scope,
+            tenant=tenant,
+            origin=origin,
+        )
     except Exception as exc:
-        elog(f"RT refresh failed for {account_id}: HTTP error: {exc}")
+        # Keep logs free of token material; RuntimeError from refresh_with_client
+        # already strips secrets down to AADSTS summaries.
+        elog(f"RT refresh failed for {account_id}: {exc}")
         return False
 
-    if resp.status_code != 200:
-        # AADSTS codes here (e.g. invalid_grant when the RT chain is dead) tell
-        # us the RT is no longer usable, so the caller falls back to CDP.
-        detail = _error_detail(resp)
-        elog(f"RT refresh failed for {account_id}: HTTP {resp.status_code} {detail}")
-        return False
-
-    try:
-        payload = resp.json()
-    except Exception as exc:
-        elog(f"RT refresh failed for {account_id}: cannot parse token response: {exc}")
-        return False
-
-    access_token = payload.get("access_token")
-    if not access_token:
-        elog(f"RT refresh failed for {account_id}: no access_token in response")
-        return False
-
-    # Validate it really is a substrate token before trusting it.
-    try:
-        claims = decode_jwt_payload(access_token)
-    except Exception as exc:
-        elog(f"RT refresh failed for {account_id}: access_token not a JWT: {exc}")
-        return False
+    access_token = bundle.access_token
+    claims = bundle.claims or {}
+    # Belt-and-suspenders: refresh_with_client already validates substrate aud,
+    # but re-check so a future change can't silently write a bad token.
     if not is_substrate_token_claims(claims):
-        elog(f"RT refresh failed for {account_id}: token aud={claims.get('aud')!r} is not substrate")
-        return False
+        try:
+            claims = decode_jwt_payload(access_token)
+        except Exception as exc:
+            elog(f"RT refresh failed for {account_id}: access_token not a JWT: {exc}")
+            return False
+        if not is_substrate_token_claims(claims):
+            elog(f"RT refresh failed for {account_id}: token aud={claims.get('aud')!r} is not substrate")
+            return False
 
     # Identity guard: never overwrite an established account with a token that
     # decodes to a different identity (mirrors the CDP path's guard).
@@ -136,7 +107,7 @@ async def refresh_via_rt(accounts: AccountStore, account_id: str) -> bool:
 
     # Persist the rotated refresh_token FIRST so a crash right after can't lose
     # the new RT while the old one is already invalidated by AAD.
-    rotated = payload.get("refresh_token")
+    rotated = bundle.refresh_token
     if isinstance(rotated, str) and rotated and rotated != rt:
         accounts.set_refresh_token(account_id, rotated)
 
@@ -145,21 +116,9 @@ async def refresh_via_rt(accounts: AccountStore, account_id: str) -> bool:
     # account stays "manual" and a "cdp" account stays "cdp".
     accounts.update_token(account_id, access_token)
     seconds = max(0, int(claims.get("exp", 0)) - int(time.time()))
+    recipe = "pkce" if origin is None else "spa"
     ulog(
         f"RT refresh succeeded for {account_id}: substrate token via HTTP "
-        f"(expires in {seconds}s, rotated_rt={'yes' if rotated and rotated != rt else 'no'})"
+        f"(recipe={recipe}, expires in {seconds}s, rotated_rt={'yes' if rotated and rotated != rt else 'no'})"
     )
     return True
-
-
-def _error_detail(resp) -> str:
-    """Compact AADSTS error summary for logs (no token material)."""
-    try:
-        body = resp.json()
-        code = body.get("error", "")
-        desc = str(body.get("error_description", ""))
-        # First line of the description carries the AADSTS code + summary.
-        first = desc.splitlines()[0] if desc else ""
-        return f"{code}: {first}".strip(": ")
-    except Exception:
-        return ""

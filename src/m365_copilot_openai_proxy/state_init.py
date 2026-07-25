@@ -14,6 +14,7 @@ from .media_proxy_events import init_media_proxy_events
 from .key_store import KeyStore
 from .login_guard import LoginRateLimiter
 from .metrics_store import init_metrics_store
+from .oauth_pkce import PKCESessionStore
 from .refresh_scheduler import RefreshScheduler
 from .runtime_flags import set_flags as _set_log_flags
 from .runtime_settings import _read_runtime_settings
@@ -84,6 +85,8 @@ def init_app_state(
     # admin login lockout). Shared instance so /user/login and /user/repassword
     # count against the same window.
     app.state.user_login_limiter = LoginRateLimiter()
+    # In-memory PKCE state for browser OAuth login (single serve process).
+    app.state.pkce_store = PKCESessionStore()
     app.state.refresh_scheduler = RefreshScheduler(
         app.state.account_store,
         profile_root=Path(settings.token_dir) / "profiles",

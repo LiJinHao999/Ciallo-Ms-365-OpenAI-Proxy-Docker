@@ -162,4 +162,56 @@ async function delAccount(id){
 function toggleAccountSelected(id,on){on?__selectedAccountIds.add(id):__selectedAccountIds.delete(id)}
 function selectAllAccounts(on){__selectedAccountIds=new Set(on?__accounts.map(a=>a.id):[]);document.querySelectorAll('.acct-check').forEach(cb=>{cb.checked=!!on})}
 async function batchRefreshAccounts(){const ids=[...__selectedAccountIds];if(!ids.length)return await adminAlert(t('batch_none'));for(const id of ids){await fetch('/admin/accounts/'+id+'/refresh',{method:'POST',credentials:'include'}).catch(()=>{})}loadAccounts()}
-async function batchDeleteAccounts(){const ids=[...__selectedAccountIds];if(!ids.length)return await adminAlert(t('batch_none'));if(!await adminConfirm(t('batch_confirm_delete')))return;for(const id of ids){await fetch('/admin/accounts/'+id,{method:'DELETE',credentials:'include'}).catch(()=>{})}__selectedAccountIds.clear();loadAccounts();loadKeys()}"""
+async function batchDeleteAccounts(){const ids=[...__selectedAccountIds];if(!ids.length)return await adminAlert(t('batch_none'));if(!await adminConfirm(t('batch_confirm_delete')))return;for(const id of ids){await fetch('/admin/accounts/'+id,{method:'DELETE',credentials:'include'}).catch(()=>{})}__selectedAccountIds.clear();loadAccounts();loadKeys()}
+let _adminOAuthState='';
+function toggleOAuthForm(show){
+  const f=document.getElementById('oauth-form');if(!f)return;
+  const open=(show===undefined)?(f.style.display==='none'):show;
+  f.style.display=open?'block':'none';
+  if(open){
+    const ta=document.getElementById('oauth-callback-admin'),m=document.getElementById('oauth-msg-admin');
+    if(ta){ta.placeholder=t('oauth_callback_ph');ta.value=''}
+    if(m){m.textContent='';m.style.color='var(--muted)'}
+  }
+}
+async function startAdminOAuth(btn){
+  const m=document.getElementById('oauth-msg-admin');
+  if(btn){btn.disabled=true;btn.textContent=t('oauth_starting')}
+  let ok=false,err='';
+  try{
+    const body={};
+    if(__selectedAccount)body.account_id=__selectedAccount;
+    const r=await fetch('/admin/oauth/start',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json().catch(()=>({}));
+    ok=r.ok&&d.url;
+    if(ok){
+      _adminOAuthState=d.state||'';
+      window.open(d.url,'_blank','noopener');
+      if(m){m.textContent=t('oauth_form_hint');m.style.color='var(--muted)'}
+      const ta=document.getElementById('oauth-callback-admin');if(ta)ta.focus();
+    }else{err=(d.error&&d.error.message)||t('oauth_failed')}
+  }catch(e){err=t('network_error')}
+  if(btn){btn.textContent=t('oauth_start_btn');btn.disabled=false}
+  if(!ok&&m){m.textContent=err||t('oauth_failed');m.style.color='#ef4444'}
+}
+async function submitAdminOAuth(btn){
+  const ta=document.getElementById('oauth-callback-admin');
+  const m=document.getElementById('oauth-msg-admin');
+  const url=(ta&&ta.value||'').trim();
+  if(!url){if(m){m.textContent=t('oauth_callback_ph');m.style.color='#ef4444'}return}
+  if(btn){btn.disabled=true;btn.textContent=t('oauth_submitting')}
+  let ok=false,err='';
+  try{
+    const body={url:url,state:_adminOAuthState||undefined};
+    if(__selectedAccount)body.account_id=__selectedAccount;
+    const r=await fetch('/admin/oauth/callback',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json().catch(()=>({}));
+    ok=r.ok;
+    if(!ok)err=(d.error&&d.error.message)||t('oauth_failed');
+    else if(ta)ta.value='';
+  }catch(e){err=t('network_error')}
+  if(m){m.textContent=ok?t('oauth_ok'):(err||t('oauth_failed'));m.style.color=ok?'#22c55e':'#ef4444'}
+  if(btn){btn.textContent=t('oauth_submit_btn');btn.disabled=false}
+  if(ok){loadAccounts();loadKeys()}
+}
+"""

@@ -252,6 +252,10 @@ body[data-theme="light"] .glass-select-option.active{color:#007aff!important;bac
           <div class="call-param-row"><span>API Key:</span><code id="my-key"></code><button onclick="copyMyKey(this)" class="btn-ghost compact-action" data-i18n="copy_key">复制</button></div>
         </div>
         <div class="row" style="margin-top:.6rem"><button onclick="regenMyKey(this)" data-i18n="regen_my_key">重置 API Key</button><span id="regen-msg" class="msg"></span></div>
+        <label class="section-title" data-i18n="oauth_title">微软登录（推荐）</label>
+        <div class="hint" data-i18n="oauth_hint" style="margin-bottom:.45rem">点击后在浏览器登录微软账号。若页面跳到 wrongplace，请复制仍带 code= 的完整地址并粘贴到下方。</div>
+        <div class="row action-row"><button onclick="startOAuth(this)" data-i18n="oauth_start_btn">微软登录</button><button class="btn-ghost" onclick="submitOAuth(this)" data-i18n="oauth_submit_btn">提交回调 URL</button><span id="oauth-msg" class="msg"></span></div>
+        <textarea id="oauth-callback" data-i18n-ph="oauth_ph" placeholder="粘贴 https://login.microsoftonline.com/common/oauth2/nativeclient?code=...&amp;state=..."></textarea>
         <label class="section-title" data-i18n="manual_update_title">手动更新</label>
         <div class="row action-row"><button onclick="pushToken(this)" data-i18n="push_token_btn">更新 Token</button><span id="token-msg" class="msg"></span></div>
         <textarea id="acct-token" data-i18n-ph="push_token_ph" placeholder="粘贴 access_token 值或完整 wss:// URL。仅推送 Token 可临时使用，推送 Cookie 后才算绑定 Microsoft 账户。&#10;access_token / wss://substrate.office.com/..."></textarea>

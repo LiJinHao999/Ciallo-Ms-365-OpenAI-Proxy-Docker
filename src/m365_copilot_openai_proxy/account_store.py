@@ -67,12 +67,17 @@ class Account:
     media_auth_updated_at: float = 0.0
     designer_auth_token: str = ""
     designer_auth_updated_at: float = 0.0
-    # OAuth2 refresh_token (captured by the userscript from the token response).
-    # Lets the scheduler refresh the substrate token over plain HTTP without a
-    # headless browser. Rotated on every successful exchange. Never exposed via
-    # public serializers (only has_refresh_token bool).
+    # OAuth2 refresh_token (captured by the userscript from the token response,
+    # or obtained via browser PKCE login). Lets the scheduler refresh the
+    # substrate token over plain HTTP without a headless browser. Rotated on
+    # every successful exchange. Never exposed via public serializers (only
+    # has_refresh_token bool).
     refresh_token: str = ""
     refresh_token_updated_at: float = 0.0
+    # Public client_id that minted the current RT chain. Empty/SPA accounts use
+    # the historical userscript client; PKCE-login accounts use the Office web
+    # Copilot client. refresh_via_rt picks the matching recipe from this field.
+    oauth_client_id: str = ""
     # A specific chat conversation URL (m365.cloud.microsoft/chat/conversation/..)
     # that contains media. The refresh flow navigates here to re-trigger the
     # asyncgw/teams/designer media fetches so their Authorization headers can be
@@ -174,6 +179,7 @@ class AccountStore:
                     designer_auth_updated_at=float(raw.get("designer_auth_updated_at", 0.0) or 0.0),
                     refresh_token=str(raw.get("refresh_token", "") or ""),
                     refresh_token_updated_at=float(raw.get("refresh_token_updated_at", 0.0) or 0.0),
+                    oauth_client_id=str(raw.get("oauth_client_id", "") or ""),
                     media_seed_url=str(raw.get("media_seed_url", "") or ""),
                     cdp_port=loaded_port,
                     token_source=raw.get("token_source", "manual"),
@@ -386,6 +392,16 @@ class AccountStore:
             self._save()
             return acc
 
+    def set_oauth_client_id(self, acc_id: str, client_id: str) -> Account | None:
+        with self._lock:
+            acc = self._accounts.get(acc_id)
+            if acc is None:
+                return None
+            acc.oauth_client_id = (client_id or "").strip()
+            acc.updated_at = time.time()
+            self._save()
+            return acc
+
     def clear_credentials(self, acc_id: str) -> Account | None:
         with self._lock:
             acc = self._accounts.get(acc_id)
@@ -398,6 +414,7 @@ class AccountStore:
             acc.designer_auth_updated_at = 0.0
             acc.refresh_token = ""
             acc.refresh_token_updated_at = 0.0
+            acc.oauth_client_id = ""
             acc.cookie_valid = False
             acc.cookie_updated_at = 0.0
             acc.cookie_expires_at = 0.0
