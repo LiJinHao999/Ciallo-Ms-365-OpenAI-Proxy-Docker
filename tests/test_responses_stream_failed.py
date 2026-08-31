@@ -22,7 +22,7 @@ def test_responses_stream_emits_response_failed_envelope_on_upstream_error():
     spec."""
 
     class FailingStreamClient:
-        async def chat_stream(self, prompt, additional_context, session=None, images=None):
+        async def chat_stream(self, prompt, additional_context, session=None, images=None, **kwargs):
             raise SubstrateCopilotError("upstream broke")
             yield ""  # unreachable; marks this as an async generator
 
@@ -50,7 +50,7 @@ def test_responses_stream_emits_response_completed_on_success():
     the success terminal event."""
 
     class OkStreamClient:
-        async def chat_stream(self, prompt, additional_context, session=None, images=None):
+        async def chat_stream(self, prompt, additional_context, session=None, images=None, **kwargs):
             yield "hello"
 
     chunks = _collect(
@@ -61,3 +61,27 @@ def test_responses_stream_emits_response_completed_on_success():
     assert '"type": "response.completed"' in body
     assert '"type": "response.failed"' not in body
     assert '"type": "error"' not in body
+
+
+def test_responses_stream_emits_native_url_citation_annotations():
+    class CitingStreamClient:
+        async def chat_stream(self, prompt, additional_context, session=None, images=None, **kwargs):
+            sources_out = kwargs.get("sources_out")
+            if sources_out is not None:
+                sources_out.clear()
+                sources_out.append({
+                    "title": "Weather",
+                    "url": "https://news.weather.com.cn/a",
+                })
+            assert kwargs.get("include_sources_markdown") is False
+            yield "有雷阵雨[1]"
+
+    chunks = _collect(
+        lambda: _responses_stream("m365-copilot", CitingStreamClient(), "hi", [])
+    )
+    body = "".join(chunks)
+    assert '"type": "response.output_text.annotation.added"' in body
+    assert '"type": "url_citation"' in body
+    assert "https://news.weather.com.cn/a" in body
+    assert '"annotations":' in body
+    assert "### 参考来源" not in body

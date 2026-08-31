@@ -14,9 +14,11 @@ def test_entrypoint_creates_profile_before_chowning_it():
 
 
 def test_entrypoint_starts_chromium_without_pipeline_so_pid_is_browser():
-    launch_block = ENTRYPOINT[ENTRYPOINT.index('"$CHROME_BIN" \\'):ENTRYPOINT.index('CHROME_PID=$!')]
+    # setsid makes Chromium the process-group leader (reap crashpad/zygote as a tree).
+    launch_block = ENTRYPOINT[ENTRYPOINT.index('setsid "$CHROME_BIN" \\'):ENTRYPOINT.index('CHROME_PID=$!')]
 
     assert '| grep' not in launch_block
+    assert 'setsid "$CHROME_BIN"' in ENTRYPOINT
     assert 'CHROME_LOG="/tmp/chromium-cdp.log"' in ENTRYPOINT
     assert 'tail -n 80 "$CHROME_LOG"' in ENTRYPOINT
 
@@ -55,7 +57,7 @@ def test_entrypoint_does_not_log_missing_global_token_hints():
 
 
 def test_entrypoint_uses_container_safe_headless_mode():
-    launch_block = ENTRYPOINT[ENTRYPOINT.index('"$CHROME_BIN" \\'):ENTRYPOINT.index('CHROME_PID=$!')]
+    launch_block = ENTRYPOINT[ENTRYPOINT.index('setsid "$CHROME_BIN" \\'):ENTRYPOINT.index('CHROME_PID=$!')]
 
     assert '--headless \\' in launch_block
     assert '--headless=new' not in launch_block
@@ -64,7 +66,7 @@ def test_entrypoint_uses_container_safe_headless_mode():
 
 
 def test_entrypoint_starts_chromium_on_blank_page_until_cdp_is_ready():
-    launch_block = ENTRYPOINT[ENTRYPOINT.index('"$CHROME_BIN" \\'):ENTRYPOINT.index('CHROME_PID=$!')]
+    launch_block = ENTRYPOINT[ENTRYPOINT.index('setsid "$CHROME_BIN" \\'):ENTRYPOINT.index('CHROME_PID=$!')]
 
     assert '"about:blank" > "$CHROME_LOG" 2>&1 &' in launch_block
     assert 'm365.cloud.microsoft/chat" > "$CHROME_LOG"' not in launch_block

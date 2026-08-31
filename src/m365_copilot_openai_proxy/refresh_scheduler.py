@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -19,6 +18,7 @@ from .refresh_chromium import (
     _chromium_path,
     _cleanup_profile_locks,
     _close_chromium_gracefully,
+    _launch_chromium,
     _resolve_chromium_path,
 )
 from .refresh_cookies import (
@@ -534,7 +534,10 @@ class RefreshScheduler:
         _cleanup_profile_locks(profile_dir)
         proc = None
         try:
-            proc = subprocess.Popen([
+            # _launch_chromium puts the browser in its own process group so
+            # _close_chromium_gracefully can SIGTERM/SIGKILL the whole tree
+            # (crashpad/zygote/utility), not just the Popen parent.
+            proc = _launch_chromium([
                 _chromium_path(),
                 f"--remote-debugging-port={account.cdp_port}",
                 f"--user-data-dir={profile_dir}",
@@ -554,7 +557,7 @@ class RefreshScheduler:
                 # resolves the intended identity even when the profile/cookies
                 # carry more than one Microsoft session (see cli._m365_chat_url).
                 _refresh_launch_url(account.email),
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ])
         except Exception as exc:
             elog(f"Refresh failed for {account_id}: Chromium launch error: {exc}")
             return False

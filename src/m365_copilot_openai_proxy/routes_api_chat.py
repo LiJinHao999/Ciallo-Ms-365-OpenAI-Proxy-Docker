@@ -23,6 +23,7 @@ from .session_helpers import _persistent_session
 from .tone_resolver import build_models_list, normalized_session_model
 from .session_store import PersistentSession
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
+from .token_usage import usage_from_turn
 from .tool_call_parser import (
     _RETRY_INSTRUCTION,
     _extract_prose_write,
@@ -144,7 +145,8 @@ def register_chat_routes(
                     ),
                     media_type="text/event-stream",
                 )
-            text = media_rewriter(await client.chat(translated.prompt, translated.additional_context, session, translated.images))
+            reasoning_out: list[str] = []
+            text = media_rewriter(await client.chat(translated.prompt, translated.additional_context, session, translated.images, reasoning_out=reasoning_out))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SubstrateCopilotError as exc:
@@ -169,7 +171,8 @@ def register_chat_routes(
         if not tool_calls and request.tools and not read_only_guard and _looks_like_fake_file_claim(text):
             _log.info("  fake file claim detected, forcing corrective retry")
             try:
-                retry_text = media_rewriter(await client.chat(_RETRY_INSTRUCTION, translated.additional_context, session))
+                retry_reasoning: list[str] = []
+                retry_text = media_rewriter(await client.chat(_RETRY_INSTRUCTION, translated.additional_context, session, reasoning_out=retry_reasoning))
                 retry_calls = _extract_tool_calls(retry_text)
                 if not retry_calls:
                     tool_names = {t.function.name for t in request.tools if t.function}
@@ -177,6 +180,7 @@ def register_chat_routes(
                 if retry_calls:
                     _log.info("  retry produced %d tool_call(s)", len(retry_calls))
                     text, tool_calls = retry_text, retry_calls
+                    reasoning_out = retry_reasoning
                     call_record["retried"] = True
             except SubstrateCopilotError:
                 pass  # Keep original response if retry fails
@@ -189,9 +193,18 @@ def register_chat_routes(
         call_record["response_repr"] = repr(text[:2000])
         call_record["tool_calls_result"] = [tc["function"]["name"] for tc in tool_calls] if tool_calls else []
         append_call_log(app.state, call_record)
+        usage = usage_from_turn(
+            translated.prompt,
+            translated.additional_context,
+            text,
+            translated.images,
+            style="openai",
+        )
         if tool_calls:
             remaining = _strip_tool_call_blocks(text)
             msg = {"role": "assistant", "content": remaining or None, "tool_calls": tool_calls}
+            if reasoning_out:
+                msg["reasoning_content"] = "\n\n".join(reasoning_out)
             return JSONResponse({
                 "id": f"chatcmpl_{uuid.uuid4().hex}",
                 "object": "chat.completion",
@@ -204,9 +217,12 @@ def register_chat_routes(
                         "finish_reason": "tool_calls",
                     }
                 ],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": usage,
             })
 
+        message: dict = {"role": "assistant", "content": text}
+        if reasoning_out:
+            message["reasoning_content"] = "\n\n".join(reasoning_out)
         return JSONResponse({
             "id": f"chatcmpl_{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -215,11 +231,11 @@ def register_chat_routes(
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
+                    "message": message,
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": usage,
         })
 
 
@@ -239,9 +255,14 @@ async def _openai_stream_with_tools(
     """Buffer full stream, then emit as tool_calls if found, else normal content stream."""
     _log = logging.getLogger("copilot_proxy")
     chunks: list[str] = []
-    async for delta in client.chat_stream(prompt, additional_context, session, images):
+    reasoning_out: list[str] = []
+    async for delta in client.chat_stream(prompt, additional_context, session, images, reasoning_out=reasoning_out):
         chunks.append(delta)
     full_text = "".join(chunks)
+    # tools path must buffer the whole answer to parse tool_calls; still apply
+    # media-url rewriting so the no-tools fallback content is signed.
+    if text_transform is not None:
+        full_text = text_transform(full_text)
 
     tool_calls = _extract_tool_calls(full_text)
     if read_only_guard and tool_calls:
@@ -259,7 +280,8 @@ async def _openai_stream_with_tools(
         _log.info("  fake file claim detected, forcing corrective retry")
         try:
             retry_chunks: list[str] = []
-            async for delta in client.chat_stream(_RETRY_INSTRUCTION, additional_context, session):
+            retry_reasoning: list[str] = []
+            async for delta in client.chat_stream(_RETRY_INSTRUCTION, additional_context, session, reasoning_out=retry_reasoning):
                 retry_chunks.append(delta)
             retry_text = "".join(retry_chunks)
             if text_transform is not None:
@@ -270,6 +292,7 @@ async def _openai_stream_with_tools(
             if retry_calls:
                 _log.info("  retry produced %d tool_call(s)", len(retry_calls))
                 full_text, tool_calls = retry_text, retry_calls
+                reasoning_out = retry_reasoning
                 if call_record is not None:
                     call_record["retried"] = True
         except SubstrateCopilotError:
@@ -286,10 +309,15 @@ async def _openai_stream_with_tools(
     completion_id = f"chatcmpl_{uuid.uuid4().hex}"
     created = int(time.time())
 
+    usage = usage_from_turn(prompt, additional_context, full_text, images, style="openai")
     if tool_calls:
         remaining = _strip_tool_call_blocks(full_text)
         # Emit role chunk
         yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+        # Emit buffered chain-of-thought before the body, DeepSeek style
+        if reasoning_out:
+            reasoning_text = "\n\n".join(reasoning_out)
+            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'reasoning_content': reasoning_text}, 'finish_reason': None}]})}\n\n"
         # Emit remaining text content if any
         if remaining:
             yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'content': remaining}, 'finish_reason': None}]})}\n\n"
@@ -299,10 +327,15 @@ async def _openai_stream_with_tools(
             yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'tool_calls': delta_tc}, 'finish_reason': None}]})}\n\n"
         # Final chunk with finish_reason
         yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
+        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [], 'usage': usage})}\n\n"
         yield "data: [DONE]\n\n"
     else:
         # No tool calls found — re-stream as normal content
         yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+        if reasoning_out:
+            reasoning_text = "\n\n".join(reasoning_out)
+            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'reasoning_content': reasoning_text}, 'finish_reason': None}]})}\n\n"
         yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'content': full_text}, 'finish_reason': None}]})}\n\n"
         yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [], 'usage': usage})}\n\n"
         yield "data: [DONE]\n\n"

@@ -27,7 +27,7 @@ def _collect(gen_factory):
 # nothing is dropped.
 
 class _RepeatClient:
-    async def chat_stream(self, prompt, additional_context, session=None, images=None):
+    async def chat_stream(self, prompt, additional_context, session=None, images=None, **kwargs):
         for d in ["2a_1", " + 3d = 6\n", "2a_1", " + 7d = 10\n"]:
             yield d
 

@@ -11,6 +11,7 @@ import websockets
 
 from .session_store import PersistentSession
 from .substrate_parse import (
+    CitationTracker,
     _capture_suspicious_response_event,
     _combine_text,
     _dedupe_repeated_delta,
@@ -20,7 +21,12 @@ from .substrate_parse import (
     _is_image_loading_placeholder,
     _message_content,
     _final_fallback_remainder,
+    aligned_url_sources_for_stream,
     clean_m365_citations,
+    extract_source_attributions,
+    is_body_message,
+    is_chain_of_thought_message,
+    sources_markdown_for_stream,
 )
 from .token_store import decode_jwt_payload, is_substrate_token_claims
 
@@ -40,7 +46,11 @@ __all__ = [
     "_is_image_loading_placeholder",
     "_message_content",
     "_final_fallback_remainder",
+    "aligned_url_sources_for_stream",
     "clean_m365_citations",
+    "CitationTracker",
+    "extract_source_attributions",
+    "sources_markdown_for_stream",
 ]
 
 SIGNALR_SEP = "\x1e"
@@ -289,6 +299,10 @@ class SubstrateCopilotClient:
         additional_context: list[str],
         session: PersistentSession | None = None,
         images: list | None = None,
+        *,
+        sources_out: list[dict] | None = None,
+        include_sources_markdown: bool = True,
+        reasoning_out: list[str] | None = None,
     ) -> AsyncIterator[str]:
         text = _combine_text(prompt, additional_context)
         annotations = await self._upload_images(images)
@@ -299,6 +313,9 @@ class SubstrateCopilotClient:
                 session_id=str(uuid.uuid4()),
                 is_start_of_session=True,
                 annotations=annotations,
+                sources_out=sources_out,
+                include_sources_markdown=include_sources_markdown,
+                reasoning_out=reasoning_out,
             ):
                 yield chunk
             return
@@ -321,6 +338,9 @@ class SubstrateCopilotClient:
                 session_id=turn.client_session_id,
                 is_start_of_session=turn.is_start_of_session,
                 annotations=annotations,
+                sources_out=sources_out,
+                include_sources_markdown=include_sources_markdown,
+                reasoning_out=reasoning_out,
             ):
                 yield chunk
         finally:
@@ -333,6 +353,9 @@ class SubstrateCopilotClient:
         session_id: str,
         is_start_of_session: bool,
         annotations: list[dict] | None = None,
+        sources_out: list[dict] | None = None,
+        include_sources_markdown: bool = True,
+        reasoning_out: list[str] | None = None,
     ) -> AsyncIterator[str]:
         """Stream one turn; if the upstream returns a clean-but-empty response
         (connected, invoked, ended with no text/image), retry ONCE.
@@ -352,6 +375,9 @@ class SubstrateCopilotClient:
             session_id=session_id,
             is_start_of_session=is_start_of_session,
             annotations=annotations,
+            sources_out=sources_out,
+            include_sources_markdown=include_sources_markdown,
+            reasoning_out=reasoning_out,
         ):
             yielded_any = True
             yield chunk
@@ -364,6 +390,9 @@ class SubstrateCopilotClient:
             session_id=str(uuid.uuid4()),
             is_start_of_session=True,
             annotations=annotations,
+            sources_out=sources_out,
+            include_sources_markdown=include_sources_markdown,
+            reasoning_out=reasoning_out,
         ):
             yield chunk
 
@@ -374,6 +403,9 @@ class SubstrateCopilotClient:
         session_id: str,
         is_start_of_session: bool,
         annotations: list[dict] | None = None,
+        sources_out: list[dict] | None = None,
+        include_sources_markdown: bool = True,
+        reasoning_out: list[str] | None = None,
     ) -> AsyncIterator[str]:
         req_id = str(uuid.uuid4())
         url = self._ws_url(conv_id, session_id, req_id)
@@ -394,6 +426,30 @@ class SubstrateCopilotClient:
                 streamed_text = ""
                 yielded_images: set[str] = set()
                 yielded_any = False
+                # Source attributions usually arrive only with the final type=2
+                # payload (after streaming deltas). Collect them across the turn
+                # and append a Markdown "参考来源" block at t==3 so clients get
+                # clickable citations instead of stripped PUA cite markers.
+                collected_sources: list[dict] = []
+                seen_source_keys: set[str] = set()
+                # Shared across deltas so in-body [n] numbers stay stable and
+                # line up with the trailing sources list at t==3.
+                cite_tracker = CitationTracker()
+
+                def _note_sources(payload: object) -> None:
+                    for source in extract_source_attributions(payload):
+                        key = (
+                            (source.get("url") or "").lower()
+                            or (source.get("ref_key") or "").lower()
+                            or (source.get("ref_id") or "").lower()
+                            or source.get("title")
+                            or ""
+                        )
+                        if not key or key in seen_source_keys:
+                            continue
+                        seen_source_keys.add(key)
+                        collected_sources.append(source)
+
                 ws_iter = ws.__aiter__()
                 while True:
                     try:
@@ -417,11 +473,13 @@ class SubstrateCopilotClient:
                         if t == 6:
                             continue
                         _capture_suspicious_response_event(getattr(self, "_response_debug_sink", None), msg)
+                        _note_sources(msg)
                         if t == 1 and msg.get("target") == "update":
                             args = (msg.get("arguments") or [{}])[0]
                             delta = args.get("writeAtCursor")
                             if delta and not _is_image_loading_placeholder(delta):
-                                delta = clean_m365_citations(delta)
+                                # Resolve PUA cites → label[n] instead of stripping.
+                                delta = clean_m365_citations(delta, cite_tracker)
                                 if not delta:
                                     continue
                                 if not yielded_any and fallback_text:
@@ -433,14 +491,23 @@ class SubstrateCopilotClient:
                             msgs = args.get("messages")
                             if msgs:
                                 entries = msgs if isinstance(msgs, list) else [msgs]
+                                # Deep-thinking tones stream chain-of-thought
+                                # summaries as Progress entries; surface them as
+                                # structured reasoning, never as fallback body.
+                                if reasoning_out is not None:
+                                    for entry in entries:
+                                        if is_chain_of_thought_message(entry):
+                                            cot = str(entry.get("text") or "").strip()
+                                            if cot:
+                                                reasoning_out.append(cot)
                                 for entry in reversed(entries):
-                                    if entry.get("author") != "user":
+                                    if entry.get("author") != "user" and is_body_message(entry):
                                         fallback_text = _message_content(entry)
                                         break
                         if t == 2:
                             item_msgs = (msg.get("item") or {}).get("messages") or []
                             for entry in reversed(item_msgs):
-                                if entry.get("author") != "user":
+                                if entry.get("author") != "user" and is_body_message(entry):
                                     fallback_text = _message_content(entry)
                                     break
                         for image_url in _extract_image_urls(msg):
@@ -453,7 +520,37 @@ class SubstrateCopilotClient:
                         if t == 3:
                             remaining = _final_fallback_remainder(streamed_text, fallback_text)
                             if remaining:
-                                yield remaining
+                                # Fallback text may still carry PUA cites if it
+                                # came from _message_content without our tracker.
+                                remaining = clean_m365_citations(remaining, cite_tracker)
+                                if remaining:
+                                    yield remaining
+                                    streamed_text += remaining
+                            # Flush any held incomplete cite opener so we never
+                            # leak raw turn/search/PUA tails after the stream ends.
+                            held = cite_tracker.flush()
+                            if held:
+                                yield held
+                                streamed_text += held
+                            # Align collected attributions with in-body [n] order and hand them
+                            # to the caller (Responses / Anthropic native fields).
+                            # Completions keeps the trailing Markdown bibliography.
+                            aligned = aligned_url_sources_for_stream(
+                                collected_sources, cite_tracker
+                            )
+                            if sources_out is not None:
+                                sources_out.clear()
+                                sources_out.extend(aligned)
+                            # Append resolved sources AFTER the body. This is also
+                            # why clients may see a short pause at the end: we must
+                            # wait for the type=2 final message (where attributions
+                            # live) and the type=3 end signal before closing SSE.
+                            if include_sources_markdown:
+                                sources_md = sources_markdown_for_stream(
+                                    streamed_text, collected_sources, cite_tracker
+                                )
+                                if sources_md:
+                                    yield sources_md
                             return
         except SubstrateCopilotError:
             raise
@@ -466,8 +563,20 @@ class SubstrateCopilotClient:
         additional_context: list[str],
         session: PersistentSession | None = None,
         images: list | None = None,
+        *,
+        sources_out: list[dict] | None = None,
+        include_sources_markdown: bool = True,
+        reasoning_out: list[str] | None = None,
     ) -> str:
         chunks: list[str] = []
-        async for chunk in self.chat_stream(prompt, additional_context, session, images):
+        async for chunk in self.chat_stream(
+            prompt,
+            additional_context,
+            session,
+            images,
+            sources_out=sources_out,
+            include_sources_markdown=include_sources_markdown,
+            reasoning_out=reasoning_out,
+        ):
             chunks.append(chunk)
         return "".join(chunks)

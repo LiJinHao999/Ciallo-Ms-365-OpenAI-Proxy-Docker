@@ -5,6 +5,9 @@ FROM python:3.11-slim-bookworm
 # Chromium build that fails to bind the CDP debug port during the on-demand
 # refresh flow ("[Errno 99] Cannot assign requested address"), so it must not
 # be installed alongside full Chromium.
+# tini is PID 1 / reaper: Chromium forks crashpad/zygote children; if any escape
+# the Python process-group cleanup they would otherwise become permanent zombies
+# under `uv` as PID 1. tini reaps them.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         chromium \
@@ -12,6 +15,7 @@ RUN apt-get update && \
         fonts-wqy-zenhei \
         gosu \
         curl \
+        tini \
     && rm -rf /var/lib/apt/lists/* \
     && echo "Chromium version: $(chromium --version || echo 'unknown')"
 
@@ -70,5 +74,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -sf http://localhost:8000/healthz || exit 1
 
-# Start as root to fix volume permissions, then drop to app user via gosu in entrypoint
-ENTRYPOINT ["/entrypoint.sh"]
+# tini as real PID 1 (reaps orphans); entrypoint still runs as root first then gosu→app.
+ENTRYPOINT ["tini", "--", "/entrypoint.sh"]

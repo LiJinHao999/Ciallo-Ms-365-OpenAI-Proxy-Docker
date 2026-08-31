@@ -4,11 +4,11 @@ import asyncio
 import json
 import os
 import shutil
-import subprocess
 import time
 
 from .account_store import extract_identity
 from .refresh_browser_helpers import _identity_conflict, _is_login_url, _is_logged_out_shell
+from .refresh_chromium import _launch_chromium
 from .refresh_cookies import _SESSION_COOKIE_PERSIST_SECONDS, _cdp_cookie_params, _critical_cookie_report
 from .runtime_flags import elog, ulog
 
@@ -127,7 +127,8 @@ async def inject_cookies_one(
     cleanup_profile_locks(profile_dir)
     proc = None
     try:
-        proc = subprocess.Popen([
+        # Process-group launch so close_chromium_gracefully can reap crashpad/zygote.
+        proc = _launch_chromium([
             chromium_path(),
             f"--remote-debugging-port={account.cdp_port}",
             f"--user-data-dir={profile_dir}",
@@ -144,7 +145,7 @@ async def inject_cookies_one(
             "--disable-software-rasterizer",
             "--headless=new",
             "https://m365.cloud.microsoft/chat",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ])
     except Exception:
         return 0, len(cookies or [])
     try:

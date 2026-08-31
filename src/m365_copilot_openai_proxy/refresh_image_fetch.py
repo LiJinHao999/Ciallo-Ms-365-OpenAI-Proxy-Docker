@@ -4,13 +4,13 @@ import asyncio
 import base64
 import json
 import shutil
-import subprocess
 import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .media_proxy import designer_object_fetch_url
+from .refresh_chromium import _launch_chromium
 from .refresh_cookies import _cdp_cookie_params
 from .refresh_media import (
     UpstreamMediaNotFound,
@@ -55,7 +55,8 @@ async def fetch_image_one(
         cdp_port = account.cdp_port
         if event_sink:
             event_sink("chromium_launch", cdp_port=cdp_port, browser=chrome_bin)
-        proc = subprocess.Popen([
+        # Process-group launch so close_chromium_gracefully can reap crashpad/zygote.
+        proc = _launch_chromium([
             chrome_bin,
             f"--remote-debugging-port={cdp_port}",
             f"--user-data-dir={profile_dir}",
@@ -71,7 +72,7 @@ async def fetch_image_one(
             "--disable-software-rasterizer",
             "--headless=new",
             "about:blank",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ])
         import httpx
         import websockets
 

@@ -19,6 +19,8 @@ from .session_helpers import (
     _responses_session_key,
 )
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
+from .substrate_parse import openai_url_citations_from_sources
+from .token_usage import usage_from_turn
 from .tone_resolver import normalized_session_model
 from .translator import translate_responses_request
 
@@ -87,24 +89,53 @@ def register_responses_routes(
                 media_type="text/event-stream",
             )
 
+        collected_sources: list[dict] = []
+        reasoning_out: list[str] = []
         try:
-            text = media_rewriter(await client.chat(translated.prompt, translated.additional_context, session, translated.images))
+            text = media_rewriter(
+                await client.chat(
+                    translated.prompt,
+                    translated.additional_context,
+                    session,
+                    translated.images,
+                    sources_out=collected_sources,
+                    include_sources_markdown=False,
+                    reasoning_out=reasoning_out,
+                )
+            )
         except SubstrateCopilotError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         record_response_text(app.state, call_record, text)
         append_call_log(app.state, call_record)
+        annotations = openai_url_citations_from_sources(text, collected_sources)
+        # Deep-think chain-of-thought becomes a native reasoning output item
+        # (OpenAI Responses API shape), listed before the assistant message.
+        output: list[dict] = []
+        if reasoning_out:
+            output.append({
+                "type": "reasoning",
+                "id": f"rs_{uuid.uuid4().hex}",
+                "summary": [{"type": "summary_text", "text": "\n\n".join(reasoning_out)}],
+            })
+        output.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex}",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": annotations}],
+        })
 
         return JSONResponse({
             "id": resp_id,
             "object": "response",
             "created_at": int(time.time()),
             "model": model_alias,
-            "output": [{
-                "type": "message",
-                "id": f"msg_{uuid.uuid4().hex}",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text}],
-            }],
-            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "output": output,
+            "usage": usage_from_turn(
+                translated.prompt,
+                translated.additional_context,
+                text,
+                translated.images,
+                style="responses",
+            ),
         })

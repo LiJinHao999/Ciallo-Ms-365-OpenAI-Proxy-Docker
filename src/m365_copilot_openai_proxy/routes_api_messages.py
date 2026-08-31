@@ -15,6 +15,8 @@ from .routes_api_common import request_model_alias, resolve_request_tone
 from .routes_media_proxy import request_media_rewriter
 from .session_helpers import _messages_session_key, _persistent_session
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
+from .substrate_parse import anthropic_web_citations_from_sources
+from .token_usage import usage_from_turn
 from .tone_resolver import normalized_session_model
 from .translator import translate_anthropic_request
 
@@ -74,21 +76,49 @@ def register_messages_routes(
                 media_type="text/event-stream",
             )
 
+        collected_sources: list[dict] = []
+        reasoning_out: list[str] = []
         try:
-            text = media_rewriter(await client.chat(translated.prompt, translated.additional_context, session, translated.images))
+            text = media_rewriter(
+                await client.chat(
+                    translated.prompt,
+                    translated.additional_context,
+                    session,
+                    translated.images,
+                    sources_out=collected_sources,
+                    include_sources_markdown=False,
+                    reasoning_out=reasoning_out,
+                )
+            )
         except SubstrateCopilotError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         record_response_text(app.state, call_record, text)
         append_call_log(app.state, call_record)
+        citations = anthropic_web_citations_from_sources(text, collected_sources)
+        content_block: dict = {"type": "text", "text": text}
+        if citations:
+            content_block["citations"] = citations
+        # Deep-think chain-of-thought becomes a native Anthropic thinking block,
+        # which must precede the text block in the content array.
+        content: list[dict] = []
+        if reasoning_out:
+            content.append({"type": "thinking", "thinking": "\n\n".join(reasoning_out)})
+        content.append(content_block)
 
         return JSONResponse({
             "id": f"msg_{uuid.uuid4().hex}",
             "type": "message",
             "role": "assistant",
             "model": model_alias,
-            "content": [{"type": "text", "text": text}],
+            "content": content,
             "stop_reason": "end_turn",
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": usage_from_turn(
+                translated.prompt,
+                translated.additional_context,
+                text,
+                translated.images,
+                style="anthropic",
+            ),
         })

@@ -63,7 +63,9 @@ if [ "$STARTUP_CDP" = "true" ]; then
     CHROME_LOG="/tmp/chromium-cdp.log"
     : > "$CHROME_LOG"
     echo "Starting $CHROME_BIN headless on CDP port $CDP_PORT ..."
-    "$CHROME_BIN" \
+    # setsid: put Chromium in its own process group so a later kill can cover
+    # crashpad/zygote children (same rationale as Python _launch_chromium).
+    setsid "$CHROME_BIN" \
         --headless \
         --no-sandbox \
         --remote-debugging-address=127.0.0.1 \
@@ -83,7 +85,7 @@ if [ "$STARTUP_CDP" = "true" ]; then
         "about:blank" > "$CHROME_LOG" 2>&1 &
 
     CHROME_PID=$!
-    echo "Chromium started with PID $CHROME_PID"
+    echo "Chromium started with PID $CHROME_PID (process group leader)"
 
     # Wait for Chrome CDP to be ready
     echo "Waiting for Chromium CDP on port $CDP_PORT ..."

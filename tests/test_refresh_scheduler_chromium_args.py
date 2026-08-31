@@ -29,3 +29,15 @@ def test_refresh_scheduler_prefers_full_chromium_browser_binary():
     assert linux_block.index('shutil.which("chromium")') < linux_block.index(
         'shutil.which("chromium-browser")'
     )
+
+
+def test_chromium_launch_uses_process_group_and_group_kill():
+    # Chromium forks crashpad/zygote; killing only the Popen parent leaves zombies
+    # under container PID 1. Launch must start a new session and close must killpg.
+    assert "start_new_session" in REFRESH_CHROMIUM
+    assert "def _launch_chromium" in REFRESH_CHROMIUM
+    assert "os.killpg" in REFRESH_CHROMIUM
+    assert "def _signal_chromium_tree" in REFRESH_CHROMIUM
+    # Call sites go through the helper, not raw Popen with DEVNULL only.
+    assert "_launch_chromium([" in REFRESH_SCHEDULER
+    assert "subprocess.Popen([" not in REFRESH_SCHEDULER
