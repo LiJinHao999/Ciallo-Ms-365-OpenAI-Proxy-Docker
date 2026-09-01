@@ -1,0 +1,342 @@
+# GitHub M365 Copilot 反代 / 2API 候选核对（临时）
+
+> 调查日期：2026-08-20
+> 用途：后续技术核对，非正式选型结论。
+> 当前架构前提：一个 API Key 固定绑定一个用户自己的 M365/Consumer 账号；不需要跨账号轮询、负载均衡或故障转移。
+
+## 评估重点
+
+- 用户账号、凭据、会话和企业数据必须严格隔离。
+- 优先考察单账号自助登录、长期凭据续期、ChatHub 协议稳定性。
+- 优先补充工具调用可靠性、动态协议参数、图片生成和 usage 估算。
+- 保持现有 OpenAI Chat/Responses、Anthropic Messages、SSE、会话和图片输入能力。
+- 无标准开源许可证的项目只能黑盒测试或参考行为，不能复制代码。
+- 无下游鉴权的项目只能绑定 loopback，不能原样暴露到公网。
+
+## 候选项目
+
+| 原始优先级 | 项目 | 许可证与状态 | 对当前项目有用的部分 | 主要限制或风险 | 建议 |
+|---:|---|---|---|---|---|
+| 1 | [cramt/m365-copilot-proxy](https://github.com/cramt/m365-copilot-proxy) | MIT；67 stars；2026-08-17 仍活跃 | 自动创建 Copilot Studio agent；把工具约束放进服务端指令；fenced/shell 工具格式；Disengaged 检测；账号级节流退避 | Node/Nitro；需要 Power Platform/BAP 权限；工具轮可能缓冲；服务无下游 API Key 校验且 CORS 为通配，只能本机测试 | **正式 12 case × 3 轮已完成；保留为账号级显式实验备选，Router 继续默认** |
+| 2 | [microsoft/Agents-M365Copilot](https://github.com/microsoft/Agents-M365Copilot) | 微软官方；MIT；Python/C#/TypeScript SDK | 官方 Graph Copilot Chat API；原生流式；企业搜索及 SharePoint/OneDrive 等上下文 | Graph beta 仍是 Preview；需要 M365 Copilot 许可和 7 个委派权限；不支持个人账号；暂无模型选择、图片、工具或代码解释器 | 作为可选官方 Graph Provider 做第二个 PoC |
+| 3 | [jairbj/m365-copilot-proxy](https://github.com/jairbj/m365-copilot-proxy) | MIT；2026-08-17 创建的新项目；持续提交 | 单用户设计；从真实 Web 请求捕获 tone、variants、optionsSets；区分 Work IQ 开关；PKCE/MSAL 静默刷新 | 项目很新；主要只有 Chat Completions；工具调用整段缓冲；API Key 被忽略且仅适合 loopback | 借鉴“动态协议 profile/capture”思路，先观察稳定性 |
+| 4 | [HEXUXIU/M365-Copilot2API](https://github.com/HEXUXIU/M365-Copilot2API) | MIT；268 stars；2026-08-18 活跃 | ChatHub 事件处理；图片生成；usage 估算；断线重连；单账号健康状态；图片下载 SSRF 防护 | 当前 Issues 集中在工具调用、图片和长上下文；尚无稳定 Release；私有协议风险；下游鉴权存在“eyJ 前缀直接放行”问题，不能原样公网部署 | 忽略账号池部分，只做源码对照和隔离环境黑盒测试 |
+| 5 | [KilimcininKorOglu/M365Bridge](https://github.com/KilimcininKorOglu/M365Bridge) | 无标准 OSS LICENSE；README 标注 Research Only；38 stars | Responses/Anthropic/MCP；工具解析、schema 校验和修复；图片生成/编辑；RT + SSO Cookie 续期 | 默认保留全部权利，不能直接复制或商业整合；工具仍是提示词模拟；鉴权可选，默认配置需审计 | 仅黑盒比较协议行为，不搬代码 |
+| 6 | [sideefffect/m365_openai_proxy.py](https://github.com/sideefffect/m365_openai_proxy.py) | Apache-2.0；单文件 Python；带多项协议测试 | SignalR/ChatHub 逆向说明；token refresh race、会话连续性、限流、图片等测试思路 | 单账号、本机工具；无下游鉴权；工具调用是概率性模拟；无标准 Docker 服务架构 | 适合补协议回归测试，不适合直接部署 |
+| 7 | [kuchris/m365-copilot-openai-proxy](https://github.com/kuchris/m365-copilot-openai-proxy) | Apache-2.0；61 stars；Python/FastAPI | 小而清晰的 Substrate SignalR、token store、协议翻译基线 | 无工具、图片、Docker和真实下游鉴权；短效浏览器 token；整体能力低于当前项目 | 保留为最小参考实现 |
+| 8 | [shenping1200/m365-copilot-bridge](https://github.com/shenping1200/m365-copilot-bridge) | MIT；15 stars；2026-08-16 活跃 | PKCE、会话粘性、每账号代理、API Key 哈希和较完整的管理端鉴权 | 主要差异化能力是多账号轮询，当前架构不需要；usage 仍是占位；工具为模拟 | 只核对认证和协议实现，不列入优先试用 |
+| 9 | [lamdt1/ms-copilot365-2api](https://github.com/lamdt1/ms-copilot365-2api) | 无许可证；新项目；活跃度和使用量低 | Camoufox + noVNC 自助登录；浏览器凭据轮换；容器化登录流程 | 无许可证；浏览器镜像重；成熟度不足；现有项目已经有 PKCE/CDP/Camoufox 链路 | 只参考登录 UX，不复制代码 |
+
+## 不纳入当前选型
+
+- GitHub Copilot 2API：上游是 GitHub Copilot，不是 Microsoft 365 Copilot。只能参考协议翻译，不能替代当前 M365 Provider。
+- Bing/Consumer Video 2API：上游、接口和用途不同。
+- EdgeGPT 等旧 Bing Chat 项目：已归档或协议过时。
+- HEXUXIU 的直接 fork：不作为独立候选重复评估。
+
+## 首个实验：Copilot Studio agent 工具调用 A/B（已完成）
+
+### 为什么先做
+
+1. 不改变 API Key 到用户账号的一对一绑定关系。
+2. 不需要先改账户存储、租户隔离或会话模型。
+3. 直接针对当前最有价值的不确定项：GPT tone 下工具调用的正确率和稳定性。
+4. 可以在隔离测试账号、本机 loopback 环境完成，失败后容易清理。
+
+### 实验范围
+
+- 使用一个专用 M365 测试账号，不使用真实生产数据。
+- A 组：当前项目现有 prompt/router 工具调用。
+- B 组：cramt 的 Copilot Studio agent 服务端指令方案。
+- 两组使用相同模型/tone、工具 schema、输入和 tool result。
+- 准备约 30 个用例，覆盖：
+  - 单工具选择；
+  - 多个相似工具选择；
+  - 必填和可选参数；
+  - 枚举、数组、嵌套对象；
+  - 连续两轮 tool result；
+  - 不应调用工具的普通问答；
+  - 错误参数后的纠正；
+  - 长上下文和多个工具并存。
+
+### 记录指标
+
+- 正确选择工具的比例。
+- 参数通过 JSON/schema 校验的比例。
+- 完成完整 tool call → tool result → final answer 闭环的比例。
+- Disengaged、429、空响应、超时和错误重试次数。
+- 首字节时间、总耗时，以及工具轮是否必须整段缓冲。
+- 是否产生错误工具调用、虚构结果或普通文本冒充工具调用。
+
+### 建议验收线
+
+- B 组完整成功率至少达到 90%，且比 A 组提高至少 15 个百分点。
+- 普通问答误触发工具不超过 2%。
+- P95 总耗时相对 A 组增长不超过 20%。
+- 不新增明文密码、TOTP、refresh token 或会话正文日志。
+- Power Platform agent 的创建、更新和删除过程可审计、可清理。
+
+### 停损条件
+
+- 租户不允许所需 Power Platform/BAP 权限。
+- 必须保存用户密码或 TOTP 才能长期运行。
+- 工具成功率提升不足 10 个百分点。
+- Disengaged 或节流频率明显高于当前实现。
+- 创建的 Copilot Studio agent 无法可靠清理或会造成额外许可成本。
+
+### 2026-08-20 预备 smoke（仅作历史记录）
+
+修正版现场运行时间为 2026-08-20 04:49:52（Asia/Shanghai；报告文件名使用 UTC）。A、B 两组使用同一个绑定账号、同一个模型和 tone，共运行 5 个 smoke case。
+
+| 组别 | 完整成功 | 成功率 | 误调用 | 平均耗时 | 单 case 耗时（ms） |
+|---|---:|---:|---:|---:|---|
+| A：现有路由 | 5/5 | 100% | 0 | 9215 ms | 6214、5406、6821、8898、18735 |
+| B：Studio agent | 5/5 | 100% | 0 | 6542 ms | 5873、5716、5660、4207、11256 |
+
+这组数据只回答了“小样本下成功率是否明显提高”，不能回答 Studio 是否有稳定延迟价值。此前由“成功率未提高”扩大成“不值得集成”的结论不成立；正式实验已按下文重新执行。
+
+B 的平均耗时在本次样本中约低 29%，但样本只有 5 个 case，且固定先跑 A、后跑 B，存在顺序和上游波动偏差，不能据此认定 Studio 有稳定延迟优势。若以后专门验证延迟，应改为至少 10 个 case × 3 次，并交替使用 AB/BA 顺序。
+
+旧的 `A 4/5、B 5/5` 结果整体作废。旧 runner 在工具结果第二轮仍使用 `tool_choice=required`，并且没有让两组以等价方式复用会话；该失败来自探针偏差，不代表 Studio 优势。修正版已改为第二轮 `auto`，A 复用固定 `X-M365-Session-Id`，B 复用同一 `PersistentSession` 并启用增量翻译。
+
+脱敏报告保存在 `.probe/studio_ab/results/studio-ab-20260819T204952Z.json`，SHA-256 为 `901f4f4cad8d671e4378646ecb91483d8f325887392ae5815b12d1ce64bea5cf`。容器内原报告和 agent cache 权限均为 `0600`；报告扫描未发现 API Key、JWT、Bearer、邮箱或敏感字段。已有 Studio agent 被复用，未重复创建或删除。
+
+安全边界：普通实验在 agent cache miss 时直接失败，不会隐式 provision。只有显式 `--provision-only` 会创建或发布 Power Platform agent；该操作可能更新账号 refresh 状态，必须视为有状态操作并串行执行。
+
+### 2026-08-20 正式 HTTP AB/BA 实验
+
+正式实验让 Router 和 Studio 使用同一候选镜像、同一绑定账号、同一模型、同一工具请求和同一个 `/v1/chat/completions` HTTP 接口。共执行 12 个 case × 3 轮，即 36 个配对、72 个观测；运行前完成 2 次双向热身，正式顺序逐 case 交替 AB/BA。两组各有 18 次位于 pair 第一位、18 次位于第二位。
+
+| 组别 | 完整成功 | 成功率 | 误调用 | 中位耗时 | P95 耗时 |
+|---|---:|---:|---:|---:|---:|
+| Router | 36/36 | 100% | 0 | 8304 ms | 17725 ms |
+| Studio agent | 35/36 | 97.22% | 0 | 4642 ms | 11249 ms |
+
+正式结果：
+
+- 35 个有效配对中，Studio 27 次更快，Router 8 次更快。
+- 配对中位延迟差为 `-3636 ms`，Studio/Router 配对中位比为 `0.580441`，即 Studio 典型耗时约低 42%。
+- Studio 唯一失败是 `required_single` 类的 `C04` 第 3 轮：180074 ms 超时；Router 对应观测成功。
+- Router first/second 中位耗时为 8045/8332 ms；Studio 为 4419/4642 ms，未发现超过预设 20% 门槛的顺序效应。
+- 远端和本地独立 verifier 均通过，自动判定为 `do_not_promote`，原因是 `insufficient_reliability_gain`。
+
+因此，Studio 不应默认替换 Router，也不应进入“自动模式”的首选路径；但它的稳定中位延迟优势足以支持保留为**账号级、用户显式选择的实验备选**。边界保持不变：
+
+1. `API Key → 固定用户账号 → 该账号自己的 Studio agent`，不共享、不轮询。
+2. Router 继续作为默认模式和可靠性基线。
+3. Studio 在产生任何输出前失败时可以安全回退 Router。
+4. Studio 已产生文本或工具调用后禁止自动重放，避免重复执行工具。
+5. `tool_choice=required` 超时或漏调用时，由用户显式改用 Router 重试，不做隐式双写。
+
+正式脱敏报告：`.probe/studio_ab/results/formal-20260820T031621Z/http-ab-20260820T031621.354728Z.json`，SHA-256 为 `f6e99c800d3f953728471fccb85ef06fc74e1ee66130062710fd7d69320aba30`。报告为 schema v2，包含 72 个白名单观测字段；扫描未发现 API Key、Token、账号/agent 标识、提示词、工具参数、响应正文、headers、会话 ID 或 Cookie。远端三个临时容器和唯一工作目录已删除；生产容器 ID、镜像、挂载、健康状态和 `RestartCount=0` 前后未变。
+
+### 2026-08-20 复测：180 秒超时是否网络波动
+
+同一套 12 case × 3 轮、AB/BA 交替的正式流程复跑了一次（报告 `.probe/studio_ab/results/studio-retest-20260820T122735Z/http-ab-20260820T125436.848336Z.json`，schema v2，70 个观测、34 个有效配对）。
+
+| 组别 | 完整成功 | 中位耗时 | P95 耗时 | 误调用 |
+|---|---:|---:|---:|---:|
+| Router | 35/35 | 8710 ms | 24215 ms | 0 |
+| Studio agent | 34/35 | 4699 ms | 9363 ms | 0 |
+
+- 配对中位延迟差 `-4347 ms`，与正式实验的 `-3636 ms` 同向同量级，延迟优势可复现。
+- 顺序效应仍不显著：Router first/second 中位 8710/8327 ms，Studio 4610/4882 ms。
+- **那次 180074 ms 超时没有复现**，所以它确实是一次上游/网络波动，不是稳定缺陷。
+- 但复测又出现一次 Studio 失败，且失败形态不同：`C05` 第 3 轮 HTTP 400、`error_category=protocol`、仅 5506 ms 就返回；Router 同一 case 三轮全成功。
+- 结论修正：Studio 的失败不是单一超时原因，两次独立实验各出现 1 次失败（34/35、35/36 ≈ 97%），Router 两次都是 100%。因此“Router 默认、Studio 显式实验备选”的定位不变，不能因为超时未复现就把 Studio 提为默认。
+
+### 2026-08-21 Studio 全协议实测（OpenAI / Anthropic / Responses）
+
+> 结果边界：首轮全协议实测对应 `local/ciallo-m365:candidate-20260820-89f69b76070b`。之后补了三协议 SSE 限流语义，并将 Responses `response.failed.response.error.code` 修正为官方枚举 `rate_limit_exceeded`。2026-08-21 已用与最新工作树 102/102 个 Python 源文件 SHA-256 一致的隔离候选容器，再次完成严格流式工具闭环 smoke，所以下述结论已有最新代码的活体证明。
+
+在与工作树逐字节一致的候选镜像里实测（`local/ciallo-m365:candidate-20260820-89f69b76070b`，101/101 个 `src` 文件 sha256 相同），账号 Key 的规划模式为 `studio`，响应头 `X-M365-Tool-Calling: studio`：
+
+| 协议 | 非流式 | 流式 | 工具闭环 |
+|---|---|---|---|
+| `/v1/chat/completions` | 200，choices + usage | 200，`data: [DONE]`、usage 分片 `estimated=true` | tool_call → tool 结果续接 200 |
+| `/v1/messages` | 200，`tool_use` + usage | 200，`tool_use` 事件 + `message_stop` | `tool_result` 续接 200 |
+| `/v1/responses` | 200，`function_call` + usage | 200，`function_call` 事件 + `response.completed` | `previous_response_id` + `function_call_output` 续接 200 |
+
+其余实测项：
+
+- `/v1/images/generations`：200，`data[0].url` 是本地签名的 `/v1/m365-media?...sig=...`，没有回落 Designer 源 URL。
+- 抓包/协议 profile：`capture-toggle` → `capture-payload` → `candidate` → `apply`（`source=captured`）→ `rollback`（`source=builtin`）全程 200，可回滚。
+- `/admin/stats`：`calls_total>0`、`total_tokens>0`、`model_counts` 为字典、`estimated=true`。
+- `/admin/` 首页：`dash-model-share`、`dash-donut`+`total_tokens`、`clearUsageStats` 三个挂载点都在。
+- 调用日志脱敏：本次生成的 images 记录只留 `[generated image]`，无 `fileToken`，usage 记为 39 in / 7 out。
+
+两个曾被记成失败、复核后确认是探针自身问题的项：
+
+- `responses_stream` 400 是代理的正确行为。探针把 `tools` 清空却保留 `tool_choice=required`，代理按契约回 `Responses tool_choice=required requires at least one function tool.`；去掉 `tool_choice` 后流式 200、`response.completed`、usage 齐全。
+- `validate_full_http.py` 里 `admin.login_status=401` 是它用 API Key 当管理员密码；改用容器内 `ADMIN_PASSWORD` 后全部 200。
+
+#### 2026-08-21 最新工作树严格流式闭环复测
+
+隔离候选容器只绑定一个专用 M365 测试账号；对应 Key 已启用、`tool_planning_mode=studio`，Studio agent 已绑定且 token 有效。生产容器和生产卷未参与请求。严格探针对 Chat、Messages、Responses 各执行首轮工具调用和二轮工具结果闭环，共 6 次真实 HTTP 请求：
+
+| 协议 | 首轮 | 闭环 | Studio 路径 | 完成标志 |
+|---|---:|---:|---:|---|
+| Chat Completions | 200，1 个 tool event | 200 | 两轮均确认 | 两轮均 `[DONE]` |
+| Anthropic Messages | 200，1 个 `tool_use` | 200 | 两轮均确认 | 两轮均 `message_stop` |
+| OpenAI Responses | 200，1 个 `function_call` | 200 | 两轮均确认 | 两轮均 `response.completed`；使用 `previous_response_id` |
+
+三协议均通过 JSON Schema 参数校验，`error_category` 全为空。真实 HTTP 返回的响应头是小写 `x-m365-tool-calling`；首版严格探针把大小写不敏感的 HTTP 头转为普通 `dict` 后又按标题大小写查找，曾误判为非 Studio。已用失败回归测试复现并改为大小写无关读取，整套 probe `208 passed`。
+
+脱敏报告：`.probe/studio_ab/results/live-stream-20260821/stream-closure-20260821-164620.json`，SHA-256 为 `c1c7536802ebe78d128e6fa150e5b83ae89c66588a264927f3a9c60e6fdc43d1`；报告只有 HTTP 状态、事件计数、完成布尔值、延迟和错误类别，不含 Key、token、账号标识、提示词、参数值或响应正文。
+
+一次真实缺陷（已修）：`_safe_image_record_text` 的兜底正则写成 `r"fileToken=[^&\\s)]+"`，字符类里 `\\s` 是「反斜杠或字母 s」，遇到含 `s` 的 token 会在 `s` 处截断，把后半段留在调用日志里。已改为 `[^&\s)]`，并加了一条含 `s` 的 token 回归测试。主路径（Designer URL 整段替换成 `[generated image]`）本来就没漏，所以只影响兜底分支。
+
+另外调用日志里还有 1 条 `fileToken` 命中，来自 23:17 修复前写入的历史记录（ts 1787238236），不是当前构建产生的；容器 token 卷里的旧记录会随 100 条上限自然滚出。
+
+### 2026-08-20 M365Bridge v1.4.0 复核
+
+v1.4.0（2026-08-20 12:58Z 发布）确实有值得抄的东西。仓库仍无 LICENSE，因此只取思路、不取代码。按对本项目的价值排序：
+
+1. **流式先提交响应头 + 上游静默期保活**（"Commit stream headers before the upstream turn and keep every SSE stream alive during upstream silence"）。已按 clean-room 方式补入 `_anthropic_stream_with_tools`：先发 `message_start`/`content_block_start`/`ping`，上游静默期间每 10 秒发 `ping`，并在生成器取消时关闭待处理迭代器；相关回归测试已通过。统一 write deadline/断连测试仍是后续工作。
+2. **token 计数改用 `o200k_base` 并上报来源**。我们现在是估算 + `estimated=true`，可以升级成 `token_source` 字段；但精确计数要引入 tiktoken 依赖，值得先只加字段、把精确计数放在可选开关后面。
+3. **工具调用卫生**：拒绝重复的 tool_call id、拒绝对不上任何已声明调用的 tool_result、按 JSON Schema 校验参数、限制一轮内的 tool 轮数。我们已有 schema 过滤和 `tool_choice` 校验，缺 id 唯一性与孤立 tool_result 的拒绝。
+4. **错误分类**：把类别放 `type`、机器可读串放 `code`，并携带上游 HTTP 状态；上游 quota/限流单独上报。我们已把 `Throttled` 映射为 429，这两条是增量。
+5. **Anthropic thinking 块补 `signature` 字段**，以及 Responses 的 `custom_tool_call` 输出形态。属于客户端兼容细节。
+6. `/mcp` JSON-RPC MCP 服务端、evidence ledger、web_search 不下发客户端：功能较大，暂不排期。
+
+已核对为「我们已经有」的项：`x-api-key` 认证（`auth_middleware.py:99`）、生成图下载限定主机（`media_proxy.py:57`）、会话映射路由、按 tone 选择推理模型。
+
+## 2026-08-25 实测：cramt/m365-copilot-proxy 扫描出的两条声明
+
+两条都来自 GitHub 扫描的「可能可用」清单，各跑真实上游轮验证（探针 `.probe/ci_ab.py`、`.probe/agentless_tools.py`，账户 `acct_2eed3918214f`，容器内 `/app/.venv`）。
+
+### 声明一：`cwc_code_interpreter*` optionsSets 解锁服务端 Python —— 一半成立
+
+服务端执行确实是真的，但**不是这些 flag 开出来的**。判据用「不执行就答不出」的 oracle：探针启动时现铸的 nonce 的 SHA-256、以及两个 12 位随机数的精确乘积。
+
+| 组 | optionsSets | SHA-256 | 乘积 | 帧 |
+| --- | --- | --- | --- | --- |
+| WITH | 生产原样 | 正确 | 正确 | `GeneratedCode` |
+| WITHOUT | 抽掉全部 6 个 `code_interpreter` flag | 正确 | 正确 | `GeneratedCode` |
+
+抽掉 `cwc_code_interpreter`、`cwc_code_interpreter_amsfix`、`cwc_code_interpreter_citation_fix`、`code_interpreter_interactive_charts`、`code_interpreter_interactive_charts_inline_image`、`code_interpreter_matplotlib_patching` 之后，答案与线上帧序都没变，所以在本租户上它们不承重（`_ALLOWED_MESSAGE_TYPES` 里的 `GeneratedCode` 才是我们能收到结果的原因）。保留是因为它们与浏览器流量一致；oracle 没有覆盖图表形状的那三个，所以没有删。
+
+`tone=Claude_Sonnet` 同一 oracle **无 `GeneratedCode` 帧**，并且编了一个假摘要。当天最初据此写成「会算的 tone 不听工具契约，听契约的 tone 不会算」，**同日第二轮把这个推广否掉了**（见下面「一句话补上不带工具的那半」）：解释器是按 tone 分的，不是按家族分的，`Claude_Sonnet_Reasoning` 两个 oracle 全对且帧里有 `GeneratedCode`。成立的是窄版本：`Claude_Sonnet` 听契约但不会算。
+
+### 声明二：Claude tone agent-less 工具调用 —— 成立，且我们本来就是这条路
+
+本仓库从来不创建 Studio agent（`studio_agent_discovery.py` 只绑定用户自己建好的），`studio_agent_id` 全程是可选 kwarg，所以「省掉创建/维护开销」对我们已经实现。实测用生产形状（`translate_openai_request` 出的真契约 + `_extract_tool_calls` 解析），客户端不带 agent：
+
+| tone | 需要工具的提问 | 不需要工具的提问 |
+| --- | --- | --- |
+| Claude_Sonnet | `Read` 调用正确 | 正常回答 + `NO_TOOL_NEEDED` |
+| Claude_Sonnet_Reasoning | `Read` 调用正确 | 未测 |
+| Magic（对照） | 0 调用，回「读不了你的文件」 | 未测 |
+
+与 2026-08-18 的 tone×tool 矩阵一致，账户上虽然绑着 agent 也不需要它。**「绕过 Disengaged」这半没有验证**：两个探针的提问都是良性的，不带 agent 也不会触发 jailbreak 分类器，要证伪或证实得用会被判 Disengaged 的提问对照，本轮没做。
+
+### 2026-08-25 决定不验证「绕过 Disengaged」
+
+不做，理由按重要性排：
+
+1. **两种结果都不改代码**。我们已经在 agent-less 这条路上（不创建 agent），Studio 是用户显式选的备选。「agent-less 不被扫」成立 → 现状不变；不成立 → 现状也不变。
+2. **不是活着的问题**。生产 `call_log.json` 满 100 条里 `disengaged` / `refused this turn` / `empty response twice` / `offense` / `jailbreak` 命中数全为 0；8 条 error 全是个人版 `partialImageGenerated` 断连那一族。（`docker logs` 在重启后只剩 17 行，问不出比例，别再用它当分母。）
+3. **验证代价是拿唯一的 M365 工作账号去踩微软的 jailbreak 分类器**——要证实必须构造会被判 Disengaged 的提问，反复触发的账号级后果不可回滚，换来的信息按第 1 条又不驱动任何改动。
+
+要是哪天真出现成批 Disengaged，再验证就有意义：那时对照组是「同一提问 × 带/不带 agent」，判据用 `Disengaged` 帧本身（`_ALLOWED_MESSAGE_TYPES` 已经收它）。
+
+### 2026-08-25 缓解「会算的 tone 不听契约」：契约里加一条
+
+上面那条取舍里，只有一半能在代码层兜住，而且能兜的这半原来漏得比想象的严重：**声明了工具但没有一个能执行代码时，Claude tone 会先把编造的 64 位 hex 吐进流里，再在同一轮里自己撤回**。撤回对人有用，对按第一个 hex 块取值的客户端没用。
+
+于是给 `_DEFAULT_TOOL_SYSTEM_PROMPT` 的 Rules 加了一条：需要精确计算而列表里没有能执行代码的工具时，明说算不了，不要凭记忆给值。实测（`tone=Claude_Sonnet`，每格一轮真实上游，现铸 nonce 的 SHA-256）：
+
+| 形状 | 基线 | 加规则后 |
+| --- | --- | --- |
+| 声明了 `bash` | `tool:bash` 4/4（**本来就对，所以没写「去调工具」那半**） | `tool:bash` 1/1 |
+| 只声明 `Read`（不能执行） | 编造 64 位 hex 2/2，随后同轮撤回 | 0 编造 5/5，开口就说算不了并给出自己算的命令 |
+| 完全不带 tools | 编造且不撤回 | 这条轮次没有契约，规则进不去 —— 见下一节，已另外兜住 |
+| `2 + 2` 对照 | — | 仍 `NO_TOOL_NEEDED`，没有因为这条规则去调 shell |
+
+两个边界写进了探针和测试，别在改措辞时丢掉：**条件**（只有「没有工具能执行」时才适用，去掉条件会连 `bash` 都不调）和**位置**（规则在 Rules 末尾、Examples 之前；`.probe/compute_rule_shipped.py` 校验拼出来的提示词 sha256 等于工作树的 `default_tool_system_prompt()`，`3f67b933…` —— 措辞一改 sha 就变，改完得重测而不是沿用这张表）。规则在管理端可覆盖的那段里，管理员自定义系统提示词就自己负责这条（回归测试 `tests/test_exact_computation_rule.py` 把这个天花板也断言了）。
+
+`/user` 的「默认配置」卡片加了一句 `user_no_interpreter_hint`（中英），措辞见下一节（最初写的是「claude 系模式」，被同日的第二轮测量改成只点 `claude-sonnet-4-6`）。之所以是卡片级提示而不是 tone 下拉项的 tooltip：`/user` 的 `#tone` 一直是 `display:none`（模式跟着模型名走），tooltip 挂上去没人看得见。
+
+评估过但没做的「更底层」办法：按提问判断「需要精确计算」再把这一轮偷偷换到 `Magic` 之类会算的 tone。否决理由是它要一个自然语言分类器（每轮多花上游往返、且误判会静默换掉用户选的模型），还会打断持久会话的连续性 —— 代价和爆炸半径都远超它修的问题。
+
+### 2026-08-25 一句话补上不带工具的那半（并否掉「Claude 系不会算」）
+
+上表最后一行原来记成「代码层无解」。实际有解，而且顺手挖出一个更要紧的更正。
+
+先是解释器的归属：**它按 tone 分，不按家族分**（`.probe/reasoning_interpreter_frames.py`，同一 session 三格，nonce 现铸）。
+
+| tone | SHA-256 | 12×12 位乘积 | 帧 |
+| --- | --- | --- | --- |
+| Claude_Sonnet_Reasoning | 正确 | 正确 | `GeneratedCode` + `python` |
+| Claude_Sonnet（同 session 对照） | 错，且自称「我直接用 SHA-256 算法算」 | 未测 | 无 `GeneratedCode` |
+
+所以 `claude-sonnet-4-5`（= `Claude_Sonnet_Reasoning`）是**唯一两半都实测通过**的选项：工具契约 verified（2026-08-18 矩阵）＋ 服务端执行 verified。要指一条出路就指它，而不是指不会调工具的 Copilot 系 —— `/user` 那句提示因此重写成「`claude-sonnet-4-6` 没有服务端代码执行……要精确结果就声明一个能执行命令的工具，或改用 `claude-sonnet-4-5`」，并且改口说这类提问现在会直接答「算不了」（上线后就是这个行为，不再是给错值）。
+
+投递路径：不带工具的轮次里客户端 `system` 消息**能**到上游（落成 `System instructions:` 块），但真正上线的位置是 `substrate_parse._combine_text` 把一句话接在 prompt 之后 —— 与 `[FORMAT]` 同一格，因为**位置是提示词的一部分**。按上线位置实测（`.probe/compute_no_tools_shipped.py`，容器跑的是旧镜像，所以每格自己拼出上线文本、以空 context 发出去，旧 `_combine_text` 原样透传；探针里钉了这句话的 sha256 `9540cfb2…`）：
+
+| 格 | tone | 加句子 | 结果 |
+| --- | --- | --- | --- |
+| S1 | Claude_Sonnet_Reasoning | 否 | **答对**（这格本来是要给它坐实 `absent` 的，反而推翻了它） |
+| S2 | Claude_Sonnet | 是 | 「I cannot compute this exactly here」，无 64 位 hex |
+| S3 | Claude_Sonnet_Reasoning | 是 | 仍答对 —— 它无视这句话照样执行，等于反证了这句话不能乱发 |
+| S4 | Claude_Sonnet + 常识题 | 是 | 「Paris.」，没被带成拒答 |
+
+落地就是 `TONE_SERVER_INTERPRETER`（`Magic` / `Claude_Sonnet_Reasoning` = verified，`Claude_Sonnet` = absent，其余 unknown）＋ `_combine_text(prompt, context, tone)`：**只有** `absent` 且本轮没有工具契约时才追加。三条约束和工具那半同理，都有测试盯着：unknown 必须等于「什么都不说」（没测过不等于没有，微软的 rollout 一直在动）；带 tools 的轮次不追加（那半的规则是有条件的，一轮里两套说法会互相打脸）；`tone=None` 的个人版链路不受影响（它自己那份契约有字符预算，且从没测过这个题目）。差点上线的 bug 就是 `Claude_Sonnet_Reasoning` 我按家族猜了个 `absent` —— S1 那格把它拦下来了，测试里也钉住了。
+
+天花板：这一整套都还是提示词级的。代理无法校验任何一个声称的哈希（错的和对的形状完全一样），所以「tone 无视这句话」在下游探测不到；能做的只是别对着有解释器的 tone 撒谎。
+
+### 2026-08-25 补齐 `TONE_SERVER_INTERPRETER`：会编哈希的只有一个 tone
+
+上面这套是测量驱动的，`unknown` 一律不说话 —— 所以**没测过的 tone 就是没兜住的 tone**，map 的覆盖面等于修复的覆盖面。把剩下 11 个 tone 各跑一格 oracle 扫完（`.probe/interpreter_scan.py`，nonce 现铸，不带工具，同时录帧）：
+
+| 结果 | tone | 帧 |
+| --- | --- | --- |
+| 答对（= 有执行） | Chat、Gpt_5_5_Chat、Gpt_5_5_Reasoning、Gpt_5_4_Chat、Gpt_5_4_Reasoning、Gpt_5_3_Chat、Gpt_5_2_Chat | 有 `GeneratedCode` |
+| 答对，但没抓到帧 | Reasoning、Gpt_5_6_Reasoning | 无 |
+| 上游拒答（可用性问题，不是能力问题） | Gpt_5_3_Reasoning（`InternalError`） | — |
+| 既没算也没编：120 秒后把自己的工具调用当正文吐出来 `{"code":"import hashlib\n..."}` | Gpt_5_2_Reasoning | 无 |
+
+所以**全 16 个 tone 里，实测会编造哈希的只有 `Claude_Sonnet`**（`claude-sonnet-4-6`）。这不是抽样缺口而是问题的全部人口，那一句话覆盖的一格就是全部。判据说明：现铸 nonce 的 64 位 hex 无法凭记忆命中，所以**「答对」本身就是执行的证据**，帧只是旁证 —— `Reasoning` / `Gpt_5_6_Reasoning` 没抓到 `GeneratedCode` 仍记 verified，就是这个道理。后两格故意不进 map：拒答的那格是可用性，吐 JSON 的那格既不编也不算，写成 `absent` 只会给它加一句它不需要的话，而且两种失败都不是提示词能修的。
+
+九条 verified 进 map 不改变行为（verified 与 unknown 都不追加），值在于把「没测过」变成「测过了」，并且挡住下一次按家族猜 `absent` —— 回归测试直接断言 `absent` 列表**只有** `Claude_Sonnet`。
+
+顺带把这张取舍表填满了：`Magic` / `Reasoning` / `Gpt_5_6_Reasoning` / `Gpt_5_5_*` 会算但不听工具契约（2026-08-18 矩阵）；`claude-sonnet-4-6` 听契约但不会算；`claude-sonnet-4-5` 两半都行。
+
+### 2026-08-25 复查上线路径：router 的分类轮必须排除
+
+`_combine_text` 判「本轮有没有工具契约」看的是 context 里有没有 `tool_call`，所以把每个**空 context** 的调用点都数了一遍，一共三个（第一遍只数出两个，漏了管理端探针）：
+
+1. **router 的分类轮**（`tool_router._router_decision` → `client.chat(router_prompt, [], None)`）—— 契约在 **prompt** 里而不是 context 里，`has_tools` 看不见它。这一格必须排除：那段提示词里列着能执行的工具（可能就是 shell）、还要求「EXACTLY ONE line」，追一句「你没有代码执行能力」等于自相矛盾，会把本该 `CALL_TOOL: bash(...)` 的哈希请求变成拒答。判据用 `NO_TOOL_NEEDED`（`tool_call_parser._NO_TOOL_MARKER`）—— 它是 router 契约在 prompt 通道里的指纹，回归测试直接拿真的 `build_router_prompt()` 拼，措辞改到丢掉这个 marker 就会红。触发条件不是理论上的：`auto` 模式下 `Claude_Sonnet` 是 verified 所以不走 router，但管理端把 planning 模式钉成 `router` / `studio` 就会走。
+2. **`/v1/images/generations`**（`routes_api_images:151` 发 `Generate exactly one image...`，空 context）—— 不排除，而且这次拿真上游量了，不再只靠类比。
+3. **`/admin/model-test`**（`routes_admin_modeltest:116` 发 `Reply with one word: pong`，空 context）—— 第一遍漏掉的一格。它走 `apply_request_model`，所以 `_tone` 照样是 `Claude_Sonnet`，这句话确实会追上去；判据 `classify_probe` 只看回复非空，量了也不排除。
+
+**后两格的实测**（`tone=Claude_Sonnet`，每格 baseline / patched 各一轮真上游，patched 用现网措辞、脚本先校验 `_NO_INTERPRETER_NOTE` 的 sha256 = `9540cfb2…` 再花 token）：
+
+| 格 | baseline | patched（追了那句话） |
+| --- | --- | --- |
+| `/v1/images/generations` | 出图，1 个 `document.ashx` url，590 字符 | **仍出图**，1 个 `document.ashx` url，618 字符 |
+| `/admin/model-test` | `ok`，回 `Ping! 🏓` | `ok`，回 `Ping` |
+
+出图那格是真正值得花这轮 token 的一格：那句话是「算不出来就说算不出来」，理论上完全可能把模型劝退成只描述不画。实测没有。两格都成立的原因同一个——那句话本身带条件，只在被要求精确计算时适用。
+
+**这份枚举现在是机器校验的**：`test_the_empty_context_callers_are_the_three_that_were_audited` 扫 `src/` 里 `.chat(x, [])` / `.chat_stream(x, [])` 的形状（跨行匹配、跳过注释行），断言按文件计数正好是这三处。加第四个空 context 调用点就会红，逼着加的人回答 router 那个问题（这段 prompt 自己带不带冲突契约），而不是等线上发现。
+
+同时补了三条端到端管线测试，盯住「map 的 key 在生产轮次里真的取得到」：`claude-sonnet-4-6` → `resolve_tone` → `Claude_Sonnet`（也断言 `/user` 指的出路 `claude-sonnet-4-5` 解析得到），以及真的建一个 `SubstrateCopilotClient`、按 `apply_request_model` 的方式赋 `_tone`、截获 `_stream_turn_with_retry` 收到的 `text` 断言那句话在里面。少了这层，改个 label 或者 tone 解析回落到默认，都会让这句话在生产里静默不发，而只测 `_combine_text` 的单测一个都不会红。
+
+## 后续顺序
+
+1. Copilot Studio 账号级显式实验模式已实现，正式 A/B + 一次复测完成，三协议全链路实测通过；Router 继续默认，不自动推广 Studio。
+2. 统一三协议的 write deadline/客户端断连释放测试，并覆盖 Studio fallback 的取消路径。
+3. 下一候选：若租户具备所需权限，验证官方 Graph chatOverStream Provider。
+4. usage 从 `estimated` 升级为带 `token_source`，精确计数放可选开关。
+5. 工具调用卫生：tool_call id 唯一性、孤立 tool_result 拒绝、单轮工具轮数上限。
+6. 需要补协议测试时，再从 sideefffect 和 kuchris 提取可验证的测试思路。
+
+## 当前判断
+
+- 当前项目不需要换仓，也不需要跨用户账号调度。
+- Copilot Studio 两次独立实验各出现 1 次失败（97%），Router 两次 100%，因此不能默认替换 Router；但 180 秒超时未复现，说明那是波动而非固有缺陷。
+- Studio 的延迟优势可复现：正式配对中位快 3636 ms、复测快 4347 ms，值得保留为单人单账号的显式低延迟实验备选，且已在 OpenAI / Anthropic / Responses 三协议（流式与非流式、含工具闭环）实测通过。
+- jairbj 式动态协议 profile 已落地为 `protocol_profile.py` + 抓包捕获，可 apply/rollback；usage 与首页调用占比圆环已实测有数据。
+- 最值得长期补充的是官方 Graph Provider；缓冲流的 SSE preamble/保活已落地，统一断连和写超时仍待补齐。
+- 任何候选都不能原样公网部署；必须保留当前项目的下游鉴权、用户隔离、凭据加密和媒体 SSRF 防护。

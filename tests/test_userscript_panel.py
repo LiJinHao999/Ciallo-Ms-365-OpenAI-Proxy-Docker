@@ -7,8 +7,8 @@ SCRIPT = (Path(__file__).resolve().parents[1] / "get_token.user.js").read_text(e
 
 
 def test_userscript_version_is_bumped_for_panel_fix():
-    assert "// @version      1.0.66" in SCRIPT
-    assert "const SCRIPT_VERSION = '1.0.66';" in SCRIPT
+    assert "// @version      1.0.74" in SCRIPT
+    assert "const SCRIPT_VERSION = '1.0.74';" in SCRIPT
 
 
 def test_userscript_exports_media_seed_url_with_cookies():
@@ -136,7 +136,7 @@ def test_userscript_panel_exposes_media_auth_status_and_manual_push():
     assert "push_media_auth: '推送媒体鉴权'" in SCRIPT
     assert "id=\"m365-push-media-auth\"" in SCRIPT
     assert "pushMediaAuth" in SCRIPT
-    assert "document.getElementById('m365-push-media-auth').onclick = pushMediaAuth" in SCRIPT
+    assert "on('m365-push-media-auth', pushMediaAuth)" in SCRIPT
 
 
 def test_userscript_refreshes_latest_media_auth_even_for_duplicate_probe_entries():
@@ -179,3 +179,156 @@ def test_userscript_one_click_reports_token_and_cookie_status_separately():
     assert "const tokenLine = tr('token_push_status')" in SCRIPT
     assert "const cookieLine = tr('cookie_push_status')" in SCRIPT
     assert "alert(tokenLine + '\\n' + cookieLine" in SCRIPT
+
+
+def test_userscript_captures_consumer_chat_token_from_copilot_socket():
+    # Consumer Copilot carries its ChatAI token in the chat socket URL exactly
+    # like Substrate, so the SAME WebSocket hook captures both -- no second
+    # script, and copilot.microsoft.com is already inside the *.microsoft.com
+    # @match. The token is URL-encoded, so it must be decoded before push.
+    assert "CONSUMER_WS_RE" in SCRIPT
+    assert "copilot\\.microsoft\\.com" in SCRIPT
+    assert "accessToken=([^&]+)" in SCRIPT
+    assert "CONSUMER_IDENTITY_RE" in SCRIPT
+    assert "latestConsumerToken = decodeURIComponent" in SCRIPT
+
+
+def test_userscript_collects_consumer_copilot_cookie_domains():
+    # The consumer jar must match consumer_gate._pick_cookies: copilot/bing/live
+    # alongside the shared microsoft.com. Without these the server replays a jar
+    # that Cloudflare has never seen.
+    assert "https://copilot.microsoft.com/" in SCRIPT
+    assert "{ domain: '.copilot.microsoft.com' }" in SCRIPT
+    assert "{ domain: '.bing.com' }" in SCRIPT
+    assert "{ domain: '.live.com' }" in SCRIPT
+
+
+def test_userscript_pushes_consumer_snapshot_to_dedicated_endpoint():
+    # Distinct endpoint from /cookies: the server must not inject or refresh a
+    # consumer snapshot, so it cannot ride the M365 cookie path.
+    assert "pushUserConsumer" in SCRIPT
+    assert "'/user/account/consumer'" in SCRIPT
+    assert "access_token: latestConsumerToken" in SCRIPT
+    assert "identity_type: latestConsumerIdentity" in SCRIPT
+    assert "id=\"m365-push-consumer\"" in SCRIPT
+    assert "pushConsumer" in SCRIPT
+
+
+def test_userscript_splits_panel_into_m365_and_consumer_sections():
+    # The two Copilots need different pushes, so the panel must render them as
+    # two separate blocks instead of burying the consumer button inside the
+    # M365 "manual config" drawer.
+    assert "function m365Section()" in SCRIPT
+    assert "function consumerSection()" in SCRIPT
+    assert "section_m365:" in SCRIPT
+    assert "section_consumer:" in SCRIPT
+
+
+def test_userscript_shows_only_the_current_products_section():
+    # Credentials can only be captured on their own host, so a known product site
+    # shows just that product; the other one is collapsed into a drawer.
+    assert "const IS_CONSUMER_SITE = location.hostname === 'copilot.microsoft.com';" in SCRIPT
+    assert "const M365_SITE_HOSTS = [" in SCRIPT
+    assert "const IS_M365_SITE = M365_SITE_HOSTS.some(" in SCRIPT
+    assert "function panelBody()" in SCRIPT
+    assert "return consumerSection() + otherProductDrawer(m365Section() + captureSection());" in SCRIPT
+    assert "return m365Section() + captureSection() + otherProductDrawer(consumerSection());" in SCRIPT
+
+
+def test_userscript_shows_both_sections_on_neither_product_host():
+    # Login domains belong to no product: mid-login we cannot tell which Copilot
+    # the user is heading for, so hiding either one would strand them.
+    assert "return m365Section() + consumerSection() + captureSection();" in SCRIPT
+    for host in ("login.microsoftonline.com", "login.live.com"):
+        assert f"'{host}'" not in SCRIPT.split("const M365_SITE_HOSTS = [")[1].split("]")[0]
+
+
+def test_userscript_keeps_the_off_site_product_reachable_instead_of_dropping_it():
+    # M365's cookie push queries absolute domains (getAllCookies), so it works
+    # from any tab. Dropping the block would make a working feature unreachable.
+    assert "function otherProductDrawer(" in SCRIPT
+    assert "other_product:" in SCRIPT
+    assert "other_product_hint:" in SCRIPT
+
+
+def test_userscript_wires_every_panel_button_defensively():
+    # Sections are host-dependent now, so an unguarded getElementById().onclick
+    # would throw and abort the rest of the wiring -- including the close button,
+    # leaving a panel the user cannot dismiss.
+    assert "const on = (id, handler) => {" in SCRIPT
+    assert "if (el) el.onclick = handler;" in SCRIPT
+    for button in (
+        "m365-copy-token",
+        "m365-push-token",
+        "m365-push-cookies",
+        "m365-push-consumer",
+        "m365-one-click",
+        "m365-push-payload",
+        "m365-close-panel",
+    ):
+        assert f"on('{button}'" in SCRIPT
+        assert f"document.getElementById('{button}').onclick" not in SCRIPT
+
+
+def test_userscript_badges_which_section_is_usable_here():
+    # The off-site product stays in the DOM (collapsed), and on login hosts both
+    # render, so each block still has to label whether this page can feed it.
+    assert "function siteBadge(" in SCRIPT
+    # Each badge asks "is this host the one that can capture my token", so both
+    # test a positive predicate. Negating the sibling would be wrong: a login
+    # page is neither product, and !IS_CONSUMER_SITE would badge it "here now"
+    # for M365 even though no substrate token can ever appear there.
+    assert "siteBadge(IS_M365_SITE, 'other_site_m365')" in SCRIPT
+    assert "siteBadge(IS_CONSUMER_SITE, 'other_site_consumer')" in SCRIPT
+    assert "siteBadge(!IS_CONSUMER_SITE" not in SCRIPT
+    assert "here_now:" in SCRIPT
+
+
+def test_userscript_wrong_site_push_names_the_page_to_open():
+    # Pushing from the wrong host previously said "not captured yet", which
+    # reads as a capture bug. Name the page to open instead.
+    assert "m365_needs_site:" in SCRIPT
+    assert "consumer_needs_site:" in SCRIPT
+    # Keyed on "am I on the host that can capture this token", not on the other
+    # product: login pages are neither, and they cannot produce either token.
+    assert "alert(IS_M365_SITE ? tr('no_token_ws') : tr('m365_needs_site'))" in SCRIPT
+    assert "alert(IS_CONSUMER_SITE ? tr('no_consumer_token') : tr('consumer_needs_site'))" in SCRIPT
+    assert "alert(IS_CONSUMER_SITE ? tr('m365_needs_site')" not in SCRIPT
+
+
+def test_userscript_consumer_button_label_writes_span_not_button_text():
+    # The consumer button holds an icon plus a label span; writing
+    # btn.textContent during the push would delete the icon.
+    assert "id=\"m365-push-consumer-text\"" in SCRIPT
+    assert "const btnText = document.getElementById('m365-push-consumer-text');" in SCRIPT
+
+
+def test_userscript_treats_non_json_body_as_failure_even_on_http_200():
+    # A reverse proxy fronting the container can answer 200 with an HTML login
+    # page. Callers branch on .ok before reading .data, so parsing has to happen
+    # before .ok is decided -- otherwise the success branch prints
+    # "Token updated, remaining: undefineds" and hides the real cause.
+    assert "bad_response:" in SCRIPT
+    assert "let parseError = null;" in SCRIPT
+    assert "ok: !parseError && resp.status >= 200 && resp.status < 300," in SCRIPT
+    # the status has to reach the user, so the placeholder must be substituted
+    assert ".replace('{status}', resp.status)" in SCRIPT
+    # parsing must precede the resolve() that publishes .ok
+    parse = SCRIPT.index("let parseError = null;")
+    ok_decision = SCRIPT.index("ok: !parseError &&")
+    assert parse < ok_decision
+
+
+def test_userscript_labels_mode_capture_as_m365_only():
+    # The WebSocket wrapper runs for both products, but the outgoing-frame tap
+    # that feeds this section is installed inside the Substrate branch only --
+    # the consumer socket is never tapped. Labelling it "shared" told the user
+    # that capturing works on copilot.microsoft.com, which it does not.
+    assert "section_capture_scope:" in SCRIPT
+    assert "tr('section_capture_scope')" in SCRIPT
+    assert "section_shared" not in SCRIPT
+    # the tap must stay inside the Substrate branch for that label to hold
+    tap = SCRIPT.index("ws.send = function(data)")
+    substrate_branch = SCRIPT.index("if (match) {")
+    consumer_branch = SCRIPT.index("if (consumerMatch) {")
+    assert consumer_branch < substrate_branch < tap

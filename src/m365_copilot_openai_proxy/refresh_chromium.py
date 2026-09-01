@@ -53,6 +53,31 @@ def _resolve_chromium_path() -> str:
     )
 
 
+def chromium_proxy_args() -> list[str]:
+    """Chromium proxy flags for the configured proxy, or [] when unset.
+
+    Read from the environment rather than app.state so the CLI and the refresh
+    paths behave identically; runtime_settings.apply_proxy_env() is what puts it
+    there. The bypass list must keep the CDP host direct -- routing Chromium's
+    own loopback traffic through a proxy breaks the debugging channel.
+    """
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    if not proxy:
+        return []
+    # socks5h/socks4a are a curl/Python convention for "resolve DNS at the
+    # proxy". Chromium does not parse them and would reject the flag outright,
+    # so map them onto the schemes it knows -- its socks5:// already resolves
+    # remotely, making socks5h equivalent rather than a downgrade.
+    scheme, sep, rest = proxy.partition("://")
+    chromium_scheme = {"socks5h": "socks5", "socks4a": "socks4"}.get(scheme.lower())
+    if sep and chromium_scheme:
+        proxy = f"{chromium_scheme}://{rest}"
+    return [
+        f"--proxy-server={proxy}",
+        "--proxy-bypass-list=localhost;127.0.0.1;[::1]",
+    ]
+
+
 def _popen_kwargs_for_chromium() -> dict:
     """Kwargs so Chromium is launched in its own process group (POSIX).
 
@@ -207,13 +232,69 @@ def _pgids_for_pids(pids: list[int]) -> set[int]:
     return pgids
 
 
+def _windows_profile_pids(profile: str, profile_arg: str) -> list[int]:
+    """PIDs of Chromium processes launched with this exact --user-data-dir.
+
+    Windows has no /proc, so command lines come from CIM. Matching is on the
+    profile path and never on the image name alone: one browser launch spawns a
+    dozen helper processes that all carry the same --user-data-dir, while an
+    unrelated Edge (the user's own browsing session) carries a different one and
+    must never be touched.
+    """
+    script = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.CommandLine -like '*--user-data-dir=*' } | "
+        "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for line in completed.stdout.splitlines():
+        pid_text, _, command = line.partition("|")
+        if not command or not pid_text.strip().isdigit():
+            continue
+        if profile not in command and profile_arg not in command:
+            continue
+        pid = int(pid_text.strip())
+        if pid != os.getpid():
+            pids.append(pid)
+    return pids
+
+
+def _windows_kill(pid: int, force: bool) -> None:
+    command = ["taskkill", "/PID", str(pid)]
+    if force:
+        command.append("/F")
+    try:
+        subprocess.run(command, capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
 def _cleanup_profile_locks(profile_dir: Path) -> None:
     """Stop stale Chromium processes for this profile and remove Singleton locks.
 
     Prefer signalling whole process groups (so crashpad/zygote die with the
     browser). Fall back to per-PID kill for anything still matching the profile.
     """
-    if platform.system() != "Windows":
+    profile = str(profile_dir.resolve())
+    profile_arg = str(profile_dir)
+    if platform.system() == "Windows":
+        pids = _windows_profile_pids(profile, profile_arg)
+        for pid in pids:
+            _windows_kill(pid, force=False)
+        if pids:
+            time.sleep(0.3)
+            for pid in _windows_profile_pids(profile, profile_arg):
+                _windows_kill(pid, force=True)
+    else:
         pids = _iter_pids_matching_profile(profile_dir)
         if pids:
             for pgid in _pgids_for_pids(pids):

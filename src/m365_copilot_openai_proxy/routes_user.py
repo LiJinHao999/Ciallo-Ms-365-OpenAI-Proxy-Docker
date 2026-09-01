@@ -8,11 +8,19 @@ from fastapi import FastAPI, Request
 
 from .account_serializers import account_binding_state, user_account_public
 from .auth_helpers import _validate_password
-from .account_store import extract_identity
+from .account_store import _normalize_consumer_account_id, extract_identity
 from .config import Settings
 from .key_store import ApiKey
 from .response_helpers import _json_err
+from .routes_api_common import effective_run_permission
+from .refresh_via_rt import (
+    M365_REFRESH_CLIENT_IDS,
+    account_matches_refresh_subject,
+    normalize_m365_authority,
+    normalize_microsoft_id,
+)
 from .runtime_settings import _RUN_PERMISSIONS, normalize_media_proxy_suffixes
+from .tone_options import TOOL_PLANNING_MODES, tool_planning_mode
 from .token_store import decode_jwt_payload, is_substrate_token_claims
 from .translator import default_tool_system_prompt
 from .runtime_flags import elog
@@ -22,7 +30,7 @@ from .runtime_flags import elog
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
-def _spawn_post_push_refresh(scheduler, account_id: str) -> None:
+def _spawn_post_push_refresh(scheduler, account_id: str, *, force: bool = False) -> None:
     """After a successful cookie injection, capture a substrate token in the
     background so the account gets a real token + a positive cookie_expires_at.
 
@@ -30,6 +38,9 @@ def _spawn_post_push_refresh(scheduler, account_id: str) -> None:
     treats as "no signal" and never auto-refreshes, so the session silently dies
     once the cookie expires. Runs detached: the push response returns immediately
     and the token/expiry appear on the next admin refresh (~10-20s later).
+
+    ``force`` exists for the consumer push: ensure_fresh routes a consumer account
+    to its Camoufox gate but re-mints only when forced (see its provider guard).
     """
     try:
         loop = asyncio.get_running_loop()
@@ -38,12 +49,12 @@ def _spawn_post_push_refresh(scheduler, account_id: str) -> None:
 
     async def _run() -> None:
         try:
-            # force=False on purpose: if inject_cookies already captured a token
-            # opportunistically in the same session, the token is fresh and this
-            # becomes a cheap no-op (no second Chromium launch). It only spins up
-            # a real refresh (with nudge) when the opportunistic grab did not land
-            # a usable token.
-            await scheduler.ensure_fresh(account_id, force=False)
+            # force defaults to False on purpose: if inject_cookies already
+            # captured a token opportunistically in the same session, the token is
+            # fresh and this becomes a cheap no-op (no second Chromium launch). It
+            # only spins up a real refresh (with nudge) when the opportunistic grab
+            # did not land a usable token.
+            await scheduler.ensure_fresh(account_id, force=force)
         except Exception as exc:  # noqa: BLE001 - detached task must not raise
             elog(f"Post-push refresh failed for {account_id}: {exc}")
 
@@ -52,22 +63,23 @@ def _spawn_post_push_refresh(scheduler, account_id: str) -> None:
     task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
+def resolve_bearer_key(app: FastAPI, request: Request) -> ApiKey | None:
+    """Resolve the caller's own ApiKey from the Authorization header.
+
+    /user/* paths bypass the auth middleware, so they authenticate here by their
+    own API key instead of an admin cookie. Module-level so the session routes
+    authenticate exactly the same way.
+    """
+    auth = request.headers.get("Authorization", "")
+    m = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
+    if not m:
+        return None
+    return app.state.key_store.resolve(m.group(1).strip())
+
+
 def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options: list[dict]) -> None:
     def _resolve_user_key(request: Request) -> ApiKey | None:
-        """Resolve the caller's own ApiKey from the Authorization header.
-
-        /user/* paths bypass the auth middleware, so they authenticate here by
-        their own API key instead of an admin cookie.
-        """
-        auth = request.headers.get("Authorization", "")
-        m = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
-        if not m:
-            return None
-        return app.state.key_store.resolve(m.group(1).strip())
-
-    def _effective_run_permission(k: ApiKey | None) -> str:
-        value = ((getattr(k, "run_permission", "") if k is not None else "") or "").strip()
-        return value if value in _RUN_PERMISSIONS else getattr(app.state, "run_permission", "full")
+        return resolve_bearer_key(app, request)
 
     @app.post("/user/login")
     async def user_login(request: Request) -> dict:
@@ -135,8 +147,11 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
             "model_alias": getattr(k, "model_alias", "") or getattr(app.state, "model_alias", resolved_settings.model_alias),
             "time_zone": getattr(k, "time_zone", "") or getattr(app.state, "time_zone", "Asia/Shanghai"),
             "run_permission": getattr(k, "run_permission", ""),
-            "effective_run_permission": _effective_run_permission(k),
+            "effective_run_permission": effective_run_permission(app, k),
             "default_run_permission": getattr(app.state, "run_permission", "full"),
+            # "" => inherit; the page shows the global default next to that choice.
+            "tool_planning_mode": getattr(k, "tool_planning_mode", ""),
+            "default_tool_planning_mode": tool_planning_mode(getattr(app.state, "tool_planning_mode", "auto")),
             "ws_idle_timeout_minutes": int(getattr(k, "ws_idle_timeout_minutes", 0) or 0),
             "default_ws_idle_timeout_minutes": int(getattr(app.state, "ws_idle_timeout_minutes", 0) or 0),
             "media_proxy_suffixes": list(getattr(k, "media_proxy_suffixes", []) or []),
@@ -164,6 +179,12 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
         run_permission = str(body.get("run_permission", getattr(k, "run_permission", ""))).strip()
         if run_permission and run_permission not in _RUN_PERMISSIONS:
             return _json_err(400, "Invalid run permission")
+        # Per-user tool planning: "" => inherit the global template. A plain
+        # override, not a ceiling like run_permission -- see
+        # routes_api_common.effective_tool_planning_mode for why.
+        planning = str(body.get("tool_planning_mode", getattr(k, "tool_planning_mode", ""))).strip().lower()
+        if planning and planning not in TOOL_PLANNING_MODES:
+            return _json_err(400, "Invalid tool planning mode")
         # Per-user media suffix override: empty => inherit global; non-empty =>
         # fully replace the global suffixes for this user's signed media URLs.
         if "media_proxy_suffixes" in body:
@@ -182,8 +203,8 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
                 ws_idle_timeout_minutes = max(1, ws_idle_timeout_minutes)
         else:
             ws_idle_timeout_minutes = int(getattr(k, "ws_idle_timeout_minutes", 0) or 0)
-        app.state.key_store.update(k.id, tone=tone, model_alias=model_alias, time_zone=time_zone, run_permission=run_permission, ws_idle_timeout_minutes=ws_idle_timeout_minutes, media_proxy_suffixes=media_proxy_suffixes)
-        return {"status": "ok", "tone": tone, "model_alias": model_alias, "time_zone": time_zone, "run_permission": run_permission, "ws_idle_timeout_minutes": ws_idle_timeout_minutes, "media_proxy_suffixes": media_proxy_suffixes, "effective_run_permission": _effective_run_permission(app.state.key_store.get(k.id))}
+        app.state.key_store.update(k.id, tone=tone, model_alias=model_alias, time_zone=time_zone, run_permission=run_permission, tool_planning_mode=planning, ws_idle_timeout_minutes=ws_idle_timeout_minutes, media_proxy_suffixes=media_proxy_suffixes)
+        return {"status": "ok", "tone": tone, "model_alias": model_alias, "time_zone": time_zone, "run_permission": run_permission, "default_run_permission": getattr(app.state, "run_permission", "full"), "tool_planning_mode": planning, "default_tool_planning_mode": tool_planning_mode(getattr(app.state, "tool_planning_mode", "auto")), "ws_idle_timeout_minutes": ws_idle_timeout_minutes, "media_proxy_suffixes": media_proxy_suffixes, "effective_run_permission": effective_run_permission(app, app.state.key_store.get(k.id))}
 
     @app.post("/user/tool-prompt")
     async def user_set_tool_prompt(request: Request) -> dict:
@@ -250,8 +271,13 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
             old_acc_id = k.account_id
             app.state.key_store.update(k.id, account_id=reused.id, displaced_at=0.0)
             # Drop the caller's previous account if it is now orphaned (no keys).
-            if old_acc_id and old_acc_id != reused.id and not app.state.key_store.list_for_account(old_acc_id):
-                app.state.account_store.remove(old_acc_id)
+            if old_acc_id and old_acc_id != reused.id:
+                await app.state.refresh_scheduler.remove_account(
+                    old_acc_id,
+                    can_remove=lambda: not app.state.key_store.list_for_account(
+                        old_acc_id
+                    ),
+                )
         else:
             acc_id = k.account_id
             if not acc_id or app.state.account_store.get(acc_id) is None:
@@ -308,16 +334,36 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
             return _json_err(401, "Invalid API key", "auth_error")
         if not k.account_id or app.state.account_store.get(k.account_id) is None:
             return _json_err(400, "No bound account")
+        account = app.state.account_store.get(k.account_id)
+        if getattr(account, "provider", "m365") != "m365":
+            return _json_err(400, "Refresh tokens only apply to M365 accounts")
         body = await request.json()
-        # The OAuth2 refresh_token is an opaque string (not a JWT), so we only do
-        # sanity checks: non-empty and a plausible length. It lets the scheduler
-        # refresh the substrate token over plain HTTP (no headless browser).
         rt = str(body.get("refresh_token", "") or "").strip()
         if len(rt) < 20:
             return _json_err(400, "Refresh token is empty or too short")
         if len(rt) > 8192:
             return _json_err(400, "Refresh token is implausibly long")
-        app.state.account_store.set_refresh_token(k.account_id, rt)
+        client_id = str(body.get("client_id", "") or "").strip().lower()
+        if client_id not in M365_REFRESH_CLIENT_IDS:
+            return _json_err(400, "Refresh token was not issued to the M365 Copilot client")
+        authority = normalize_m365_authority(body.get("authority"))
+        tenant_id = normalize_microsoft_id(body.get("tenant_id"))
+        object_id = normalize_microsoft_id(body.get("object_id"))
+        if not authority or not tenant_id or not object_id:
+            return _json_err(400, "Refresh token capture binding is incomplete")
+        if not account_matches_refresh_subject(account, tenant_id, object_id):
+            return _json_err(
+                409,
+                "Refresh token subject does not match the bound M365 account",
+            )
+        app.state.account_store.set_refresh_token(
+            k.account_id,
+            rt,
+            client_id=client_id,
+            authority=authority,
+            tenant_id=tenant_id,
+            object_id=object_id,
+        )
         return {"status": "ok", "has_refresh_token": True}
 
     @app.post("/user/account/cookies")
@@ -362,12 +408,125 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
             # a token in the background so a real token + 12h expiry land now,
             # which is what arms keepalive auto-refresh (see _spawn helper).
             _spawn_post_push_refresh(app.state.refresh_scheduler, k.account_id)
-        if account_name and acc and acc.name != account_name:
+        # A signed Substrate claim is authoritative. Page scraping is only a
+        # fallback for cookie-only accounts because generic M365 controls can be
+        # mistaken for the display name.
+        if account_name and acc and not acc.email and acc.name != account_name:
             app.state.account_store.rename(k.account_id, account_name)
         result = {"status": "ok", "injected": injected, "total": total}
         if warning:
             result["warning"] = warning
         return result
+
+    @app.post("/user/account/consumer")
+    async def user_set_account_consumer(request: Request) -> dict:
+        """Ingest a consumer (personal-account) Copilot credential snapshot.
+
+        Deliberately unlike /user/account/cookies: no Chromium injection, because
+        a consumer account has no substrate token to capture. set_consumer_auth
+        flips the provider so this push and every later refresh use the dedicated
+        Camoufox path instead of the M365 Chromium path.
+        """
+        k = _resolve_user_key(request)
+        if k is None:
+            return _json_err(401, "Invalid API key", "auth_error")
+        body = await request.json()
+        cookies = body.get("cookies", [])
+        if not isinstance(cookies, list) or not cookies:
+            return _json_err(400, "No cookies provided")
+        if len(cookies) > 500:
+            return _json_err(400, "Too many cookies in one push")
+        # The ChatAI token is opaque (not a JWT we can validate), so only sanity
+        # bounds apply -- same treatment as the OAuth2 refresh_token above.
+        token = str(body.get("access_token", "") or "").strip()
+        if len(token) < 20:
+            return _json_err(400, "Consumer access token is empty or too short")
+        if len(token) > 8192:
+            return _json_err(400, "Consumer access token is implausibly long")
+        identity_type = str(body.get("identity_type", "") or "").strip()[:64]
+        email = body.get("email", "")
+        email = email if isinstance(email, str) else ""
+        consumer_account_id = body.get("consumer_account_id", "")
+        consumer_account_id = (
+            consumer_account_id if isinstance(consumer_account_id, str) else ""
+        )
+        consumer_account_id = _normalize_consumer_account_id(consumer_account_id)
+        if not consumer_account_id:
+            return _json_err(
+                400,
+                "Consumer Microsoft account identity was not captured; send a new Copilot message and push again",
+            )
+        existing_account = (
+            app.state.account_store.get(k.account_id) if k.account_id else None
+        )
+        existing_consumer_account_id = _normalize_consumer_account_id(
+            getattr(existing_account, "consumer_account_id", "")
+        )
+        if (
+            existing_account is not None
+            and getattr(existing_account, "provider", "m365") == "consumer"
+            and existing_consumer_account_id
+            and existing_consumer_account_id != consumer_account_id
+        ):
+            return _json_err(
+                409,
+                "A different Microsoft account is already bound; log out or unbind it before switching accounts",
+            )
+        username = body.get("username")
+        account_name = username.strip() if isinstance(username, str) else ""
+        if not k.account_id or app.state.account_store.get(k.account_id) is None:
+            acc = app.state.account_store.add(name=account_name or k.name or k.username or "user")
+            app.state.key_store.update(k.id, account_id=acc.id, displaced_at=0.0)
+            k = app.state.key_store.get(k.id) or k
+        acc = app.state.account_store.set_consumer_auth(
+            k.account_id,
+            cookies,
+            token,
+            identity_type,
+            email,
+            consumer_account_id,
+        )
+        if acc is None:
+            return _json_err(400, "No bound account")
+        resolved_name = account_name or acc.email
+        if resolved_name and acc.name != resolved_name:
+            app.state.account_store.rename(k.account_id, resolved_name)
+        # The pushed cf_clearance was minted against the user's own browser
+        # fingerprint, which the Firefox-impersonating consumer transport cannot
+        # reuse, so the account can be authenticated here and still die on
+        # Cloudflare's challenge at the first turn. Re-mint through Camoufox now
+        # rather than leaving it broken until keepalive notices an hour later.
+        # Queued after set_consumer_auth because the gate seeds from the stored
+        # cookies/token; every refresh_consumer failure path returns without
+        # touching them, and its snapshot guard drops the result if a newer push
+        # lands meanwhile.
+        _spawn_post_push_refresh(app.state.refresh_scheduler, k.account_id, force=True)
+        return {"status": "ok", "provider": "consumer", "cookies": len(acc.cookies)}
+
+    @app.post("/user/account/proxy")
+    async def user_set_account_proxy(request: Request) -> dict:
+        """Set the bound account's outbound proxy ("" clears it).
+
+        Per-account rather than global because the two providers are gated
+        differently by source IP: consumer Copilot rejects this host's direct
+        egress while M365 works on it. The value is validated by the same
+        normalize_proxy_url the admin setting uses.
+        """
+        k = _resolve_user_key(request)
+        if k is None:
+            return _json_err(401, "Invalid API key", "auth_error")
+        if not k.account_id:
+            return _json_err(400, "No Microsoft account is bound to this key")
+        body = await request.json()
+        proxy_url = str(body.get("proxy_url", "")).strip()
+        acc = app.state.account_store.set_proxy_url(k.account_id, proxy_url)
+        if acc is None:
+            return _json_err(
+                400,
+                "Invalid proxy URL. Use scheme://host:port with an explicit port, "
+                "e.g. socks5h://127.0.0.1:1080 (http/https/socks4/socks5 only).",
+            )
+        return {"status": "ok", "proxy_url": acc.proxy_url}
 
     @app.post("/user/regenerate-key")
     async def user_regenerate_key(request: Request) -> dict:
@@ -388,7 +547,7 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
         if k is None:
             return _json_err(401, "Invalid API key", "auth_error")
         if k.account_id and app.state.account_store.get(k.account_id) is not None:
-            app.state.account_store.clear_credentials(k.account_id)
+            await app.state.refresh_scheduler.clear_account_credentials(k.account_id)
         return {"status": "ok"}
 
     @app.post("/user/account/unbind")
@@ -402,9 +561,12 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
             return _json_err(401, "Invalid API key", "auth_error")
         acc_id = k.account_id
         if acc_id and app.state.account_store.get(acc_id) is not None:
-            app.state.account_store.clear_credentials(acc_id)
+            await app.state.refresh_scheduler.clear_account_credentials(acc_id)
         app.state.key_store.update(k.id, account_id="", displaced_at=0.0)
         removed = False
-        if acc_id and not app.state.key_store.list_for_account(acc_id):
-            removed = app.state.account_store.remove(acc_id)
+        if acc_id:
+            removed = await app.state.refresh_scheduler.remove_account(
+                acc_id,
+                can_remove=lambda: not app.state.key_store.list_for_account(acc_id),
+            )
         return {"status": "ok", "removed": removed}

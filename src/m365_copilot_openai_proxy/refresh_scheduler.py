@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .account_store import AccountStore, extract_identity
+from .account_store import (
+    AccountStore,
+    _normalize_consumer_account_id,
+    extract_identity,
+)
+from .consumer_gate import _pick_cookies
 from .media_proxy import asyncgw_object_fetch_url, designer_file_token, designer_object_fetch_url
 from .refresh_browser_helpers import (
     _identity_conflict,
@@ -20,6 +27,7 @@ from .refresh_chromium import (
     _close_chromium_gracefully,
     _launch_chromium,
     _resolve_chromium_path,
+    chromium_proxy_args,
 )
 from .refresh_cookies import (
     _SESSION_COOKIE_PERSIST_SECONDS,
@@ -40,7 +48,12 @@ from .refresh_media import (
 )
 from .refresh_image_fetch import fetch_image_one as _fetch_image_one_impl
 from .refresh_cookie_inject import inject_cookies_one as _inject_cookies_one_impl
-from .refresh_via_rt import refresh_via_rt
+from .refresh_via_rt import (
+    M365_DESIGNER_SCOPE,
+    M365_MEDIA_SCOPE,
+    mint_scoped_token,
+    refresh_via_rt,
+)
 from .runtime_flags import elog, ulog
 
 
@@ -65,6 +78,15 @@ _COOKIE_KEEPALIVE_BEFORE_SECONDS = 2 * 60 * 60
 # Min gap between self-heal cookie re-injections for one stuck account, so a
 # genuinely dead session does not relaunch Chromium every keepalive tick.
 _RECOVERY_RETRY_SECONDS = 30 * 60
+# How old a consumer credential may get before keepalive re-mints it. The ChatAI
+# token is an opaque JWE with no readable exp, so age since capture is the only
+# signal available; an hour keeps it well inside any plausible lifetime while
+# costing one ~7s browser launch per account per hour.
+_CONSUMER_KEEPALIVE_AGE_SECONDS = 60 * 60
+# Backoff after a failed consumer refresh. Failure normally means the MSA session
+# in the profile lapsed, which only an interactive sign-in fixes, so retrying
+# hard would spin a browser for nothing.
+_CONSUMER_RETRY_SECONDS = 30 * 60
 
 
 class RefreshScheduler:
@@ -88,6 +110,8 @@ class RefreshScheduler:
         # Per-account locks avoid piling up duplicate refreshes for one account
         # while still letting the global lock serialise across accounts.
         self._account_locks: dict[str, asyncio.Lock] = {}
+        self._cdp_refresh_generation: dict[str, int] = {}
+        self._cdp_refresh_result: dict[str, bool] = {}
         # Background keepalive task handle + stop flag (set on app shutdown).
         self._keepalive_task: asyncio.Task | None = None
         self._keepalive_stop: asyncio.Event | None = None
@@ -97,6 +121,12 @@ class RefreshScheduler:
         self._cookie_keepalive_before_seconds: float = _COOKIE_KEEPALIVE_BEFORE_SECONDS
         # Last self-heal (cookie re-inject) attempt per account, for backoff.
         self._recovery_attempted_at: dict[str, float] = {}
+        # Last consumer (Camoufox) refresh attempt per account, for backoff. A
+        # lapsed MSA session cannot be recovered without a human, so a failing
+        # account must not relaunch a browser on every keepalive tick.
+        self._consumer_attempted_at: dict[str, float] = {}
+        # Injected in tests; None means "build the real Camoufox gate on demand".
+        self._consumer_gate_factory = None
 
     def set_keepalive_params(self, check_interval_seconds: float | None = None, cookie_before_seconds: float | None = None) -> None:
         """Update keepalive tunables from admin runtime settings (seconds)."""
@@ -143,6 +173,185 @@ class RefreshScheduler:
             return False
         return account.cookie_expires_at - time.time() < self._cookie_keepalive_before_seconds
 
+    def _consumer_profile_dir(
+        self, account_id: str, consumer_account_id: str = ""
+    ) -> Path:
+        """Per-Microsoft-subject Camoufox profile, apart from Chromium ones.
+
+        Hashing keeps the private MSAL subject out of the filesystem while a
+        subject change naturally selects a clean profile instead of reusing the
+        previous personal account's cookies/localStorage.
+        """
+        subject = _normalize_consumer_account_id(consumer_account_id)
+        digest = hashlib.sha256(subject.encode("utf-8")).hexdigest()[:24]
+        return self._profile_root / f"{account_id}-consumer-{digest}"
+
+    def _clear_consumer_profiles(self, account_id: str) -> None:
+        """Remove current and legacy Camoufox profiles for one proxy account."""
+        from .consumer_camoufox import reset_consumer_profile
+
+        if not self._profile_root.exists():
+            return
+        prefix = f"{account_id}-consumer"
+        for candidate in self._profile_root.iterdir():
+            if candidate.name == prefix or candidate.name.startswith(f"{prefix}-"):
+                reset_consumer_profile(candidate)
+
+    async def clear_account_credentials(self, account_id: str) -> bool:
+        """Clear stored credentials and any persisted consumer browser session."""
+        async with self._account_lock(account_id):
+            account = self._accounts.get(account_id)
+            if account is None:
+                return False
+            self._clear_consumer_profiles(account_id)
+            cleared = self._accounts.clear_credentials(account_id) is not None
+            return cleared
+
+    async def remove_account(
+        self,
+        account_id: str,
+        *,
+        can_remove: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Remove an account without leaving its Microsoft session on disk."""
+        async with self._account_lock(account_id):
+            account = self._accounts.get(account_id)
+            if account is None:
+                return False
+            if can_remove is not None and not can_remove():
+                return False
+            self._clear_consumer_profiles(account_id)
+            removed = self._accounts.remove(account_id)
+            return removed
+
+    def _consumer_keepalive_due(self, account) -> bool:
+        """True if a consumer account's credential is stale enough to re-mint."""
+        if getattr(account, "provider", "m365") != "consumer":
+            return False
+        # Nothing captured yet means no MSA session to silently renew from; the
+        # first credential has to arrive from the userscript push.
+        if not getattr(account, "consumer_token", ""):
+            return False
+        if not _normalize_consumer_account_id(
+            getattr(account, "consumer_account_id", "")
+        ):
+            return False
+        last_attempt = self._consumer_attempted_at.get(account.id, 0.0)
+        if time.time() - last_attempt < _CONSUMER_RETRY_SECONDS:
+            return False
+        captured = getattr(account, "consumer_updated_at", 0.0) or 0.0
+        return time.time() - captured >= _CONSUMER_KEEPALIVE_AGE_SECONDS
+
+    def _build_consumer_gate(self, account_id: str, account=None):
+        if self._consumer_gate_factory is not None:
+            return self._consumer_gate_factory(account_id)
+        from .account_store import resolve_account_proxy
+        from .consumer_camoufox import CamoufoxConsumerGate
+
+        account = account or self._accounts.get(account_id)
+        consumer_account_id = _normalize_consumer_account_id(
+            getattr(account, "consumer_account_id", "")
+        )
+        return CamoufoxConsumerGate(
+            self._consumer_profile_dir(account_id, consumer_account_id),
+            seed_cookies=list(getattr(account, "cookies", []) or []),
+            previous_token=str(getattr(account, "consumer_token", "") or ""),
+            proxy_url=resolve_account_proxy(account),
+        )
+
+    async def refresh_consumer(self, account_id: str) -> bool:
+        """Re-mint one consumer account's credentials with an unattended browser.
+
+        Returns False (rather than raising) when the refresh cannot run or does
+        not succeed: the stored credential may well still work, so a failure here
+        is a missed opportunity, not a reason to fail the caller's request.
+        """
+        account = self._accounts.get(account_id)
+        if account is None or getattr(account, "provider", "m365") != "consumer":
+            return False
+        from .consumer_camoufox import CamoufoxUnavailable, reset_consumer_profile
+
+        ulog(f"Consumer refresh requested for {account_id}; waiting for browser slot")
+        self._consumer_attempted_at[account_id] = time.time()
+        # The global lock keeps this from running alongside a Chromium refresh --
+        # two browsers at once is what the single-browser invariant exists to
+        # avoid, and the box may not have RAM for both.
+        async with self._account_lock(account_id):
+            account = self._accounts.get(account_id)
+            if account is None or getattr(account, "provider", "m365") != "consumer":
+                return False
+            expected_account_id = _normalize_consumer_account_id(
+                getattr(account, "consumer_account_id", "")
+            )
+            if not expected_account_id:
+                elog(
+                    f"Consumer refresh skipped for {account_id}: no pinned Microsoft account id; re-push from the userscript"
+                )
+                return False
+            snapshot = (
+                account.consumer_updated_at,
+                account.consumer_token,
+                expected_account_id,
+            )
+            previous_identity_type = getattr(
+                account, "consumer_identity_type", ""
+            )
+            gate = self._build_consumer_gate(account_id, account)
+            async with self._lock:
+                ulog(f"Consumer refresh starting Camoufox for {account_id}")
+                try:
+                    auth = await gate()
+                except CamoufoxUnavailable as exc:
+                    elog(f"Consumer refresh unavailable for {account_id}: {exc}")
+                    return False
+                except Exception as exc:  # noqa: BLE001 - browser failures vary
+                    elog(f"Consumer refresh failed for {account_id}: {exc}")
+                    return False
+            token = str(auth.get("access_token") or "").strip()
+            if not token:
+                elog(f"Consumer refresh for {account_id} returned no token")
+                return False
+            if token == snapshot[1]:
+                elog(f"Consumer refresh for {account_id} returned the previous token")
+                return False
+            actual_account_id = _normalize_consumer_account_id(
+                auth.get("account_id")
+            )
+            if actual_account_id != expected_account_id:
+                reset_consumer_profile(
+                    self._consumer_profile_dir(account_id, expected_account_id)
+                )
+                elog(
+                    f"Consumer refresh rejected for {account_id}: Microsoft account mismatch or missing identity"
+                )
+                return False
+            cookies = auth.get("cookies") or []
+            cookie_list = [
+                dict(cookie) for cookie in cookies if isinstance(cookie, dict)
+            ]
+            if not _pick_cookies(cookie_list):
+                elog(
+                    f"Consumer refresh for {account_id} returned no reusable cookies"
+                )
+                return False
+            stored = self._accounts.set_consumer_auth(
+                account_id,
+                cookie_list,
+                token,
+                str(auth.get("identity_type") or "") or previous_identity_type,
+                consumer_account_id=expected_account_id,
+                expected_snapshot=snapshot,
+            )
+            if stored is None:
+                elog(
+                    f"Consumer refresh discarded for {account_id}: credentials changed while the browser was running"
+                )
+                return False
+            ulog(
+                f"Consumer refresh for {account_id}: re-minted {len(cookie_list)} cookies"
+            )
+            return True
+
     def _recovery_due(self, account) -> bool:
         """True for a cdp account stuck at cookie_valid=False that still holds
         stored cookies we can replay to self-heal.
@@ -171,12 +380,23 @@ class RefreshScheduler:
                 for account in self._accounts.list():
                     if stop.is_set():
                         break
-                    if self._keepalive_due(account):
+                    if self._consumer_keepalive_due(account):
+                        # Consumer accounts hold an opaque token we cannot check
+                        # for expiry, so keepalive re-mints on age instead. This
+                        # is what keeps the MSA session in the profile warm.
+                        ulog(f"Keepalive: re-minting consumer {account.id}")
+                        try:
+                            await self.refresh_consumer(account.id)
+                        except Exception as exc:
+                            elog(f"Keepalive consumer refresh error for {account.id}: {exc}")
+                    elif self._keepalive_due(account):
                         ulog(f"Keepalive: refreshing {account.id} (cookie near expiry)")
                         try:
                             # force=True so a still-valid-but-soon-to-expire token is
                             # refreshed now. ensure_fresh serialises via the global lock.
-                            await self.ensure_fresh(account.id, force=True)
+                            await self.ensure_fresh(
+                                account.id, force=True, allow_rt=False
+                            )
                         except Exception as exc:
                             elog(f"Keepalive refresh error for {account.id}: {exc}")
                     elif self._recovery_due(account):
@@ -189,7 +409,9 @@ class RefreshScheduler:
                         self._recovery_attempted_at[account.id] = time.time()
                         ulog(f"Keepalive: self-heal refreshing {account.id} (cookie invalid)")
                         try:
-                            ok = await self.ensure_fresh(account.id, force=True)
+                            ok = await self.ensure_fresh(
+                                account.id, force=True, allow_rt=False
+                            )
                             ulog(f"Keepalive self-heal for {account.id}: {'recovered' if ok else 'still failing'}")
                         except Exception as exc:
                             elog(f"Keepalive self-heal error for {account.id}: {exc}")
@@ -264,11 +486,11 @@ class RefreshScheduler:
     async def ensure_media_fresh(self, account_id: str, url: str) -> None:
         """Lazily refresh the media/designer auth token before a media fetch.
 
-        media/designer tokens are NOT produced by the RT/HTTP substrate refresh
-        (different client + flow); they only surface as live request headers when
-        the SPA re-fetches media. So keep them alive on demand: when a media
-        request arrives and the relevant token is missing/stale AND the account
-        has a media_seed_url + stored cookies, re-run the proven cookie
+        Preferred path: the media and designer tokens are the same client as the
+        substrate token with a different audience, so a stored refresh token can
+        mint them over plain HTTP (mint_scoped_token). Fallback, for accounts that
+        only have a browser session: media/designer tokens only surface as live
+        request headers when the SPA re-fetches media, so re-run the proven cookie
         re-injection (which navigates the seed conversation and captures the auth
         headers at the end). Best-effort: any failure just leaves the fetch to
         fall back to the Chromium image path as before.
@@ -276,18 +498,20 @@ class RefreshScheduler:
         account = self._accounts.get(account_id)
         if account is None:
             return
-        seed_url = (getattr(account, "media_seed_url", "") or "").strip()
-        if not seed_url:
-            return
-        stored_cookies = list(getattr(account, "cookies", []) or [])
-        if not stored_cookies:
-            return
         is_designer = _is_designer_media_url(url)
         if is_designer:
             stale = self._media_token_stale(account.designer_auth_token, account.designer_auth_updated_at)
         else:
             stale = self._media_token_stale(account.media_auth_token, account.media_auth_updated_at)
         if not stale:
+            return
+        if await self._try_mint_media_token(account_id, is_designer=is_designer):
+            return
+        seed_url = (getattr(account, "media_seed_url", "") or "").strip()
+        if not seed_url:
+            return
+        stored_cookies = list(getattr(account, "cookies", []) or [])
+        if not stored_cookies:
             return
         ulog(
             f"Lazy media keepalive for {account_id}: "
@@ -300,7 +524,33 @@ class RefreshScheduler:
                 except Exception as exc:
                     elog(f"Lazy media keepalive failed for {account_id}: {exc}")
 
-    async def _try_rt_refresh(self, account_id: str) -> bool:
+    async def _try_mint_media_token(self, account_id: str, *, is_designer: bool) -> bool:
+        """Mint one media/designer token from the stored RT. No browser involved.
+
+        Returns False (quietly, for a missing RT) so the caller falls back to the
+        cookie/CDP capture that browser-session accounts still depend on.
+        """
+        account = self._accounts.get(account_id)
+        if account is None or not (getattr(account, "refresh_token", "") or "").strip():
+            return False
+        kind = "designer" if is_designer else "media"
+        async with self._account_lock(account_id):
+            token, error = await mint_scoped_token(
+                self._accounts,
+                account_id,
+                M365_DESIGNER_SCOPE if is_designer else M365_MEDIA_SCOPE,
+            )
+            if error:
+                elog(f"Minting {kind} token for {account_id} from the stored RT failed: {error}")
+                return False
+            if is_designer:
+                self._accounts.set_designer_auth_token(account_id, token)
+            else:
+                self._accounts.set_media_auth_token(account_id, token)
+        ulog(f"Lazy media keepalive for {account_id}: minted a {kind} token from the stored RT")
+        return True
+
+    async def _try_rt_refresh(self, account_id: str, *, force: bool = False) -> bool:
         """Attempt the fast HTTP refresh_token exchange (no browser).
 
         Serialised per-account (not through the global Chromium lock, since this
@@ -312,10 +562,76 @@ class RefreshScheduler:
         account = self._accounts.get(account_id)
         if account is None or not (getattr(account, "refresh_token", "") or "").strip():
             return False
+        refresh_token_snapshot = account.refresh_token
+        access_token_snapshot = account.token
+        if float(getattr(account, "refresh_token_retry_after", 0.0) or 0.0) > time.time():
+            return False
         async with self._account_lock(account_id):
+            current = self._accounts.get(account_id)
+            if current is None:
+                return False
+            # A concurrent refresh or userscript push already changed the
+            # credential snapshot while we waited. Reuse its fresh result rather
+            # than exchanging the old RT a second time.
+            if (
+                current.refresh_token != refresh_token_snapshot
+                or current.token != access_token_snapshot
+            ):
+                return bool(current.token) and not self._needs_refresh(current.token)
+            if float(
+                getattr(current, "refresh_token_retry_after", 0.0) or 0.0
+            ) > time.time():
+                return False
+            if not force and not self._needs_refresh(current.token):
+                return True
             return await refresh_via_rt(self._accounts, account_id)
 
-    async def ensure_fresh(self, account_id: str, force: bool = False) -> bool:
+    @staticmethod
+    def _cdp_refresh_state(account) -> tuple[str, bool, float, float]:
+        return (
+            account.token,
+            bool(account.cookie_valid),
+            float(account.cookie_updated_at),
+            float(account.cookie_expires_at),
+        )
+
+    async def _run_cdp_refresh(
+        self,
+        account_id: str,
+        *,
+        force: bool,
+        expected_state: tuple[str, bool, float, float],
+    ) -> bool:
+        """Run one CDP fallback and coalesce concurrent waiters."""
+        attempt_generation = self._cdp_refresh_generation.get(account_id, 0)
+        async with self._account_lock(account_id):
+            current = self._accounts.get(account_id)
+            if current is None:
+                return False
+            if self._cdp_refresh_generation.get(account_id, 0) != attempt_generation:
+                if (
+                    current.token != expected_state[0]
+                    and bool(current.token)
+                    and not self._needs_refresh(current.token)
+                ):
+                    return True
+                return self._cdp_refresh_result.get(account_id, False)
+            if self._cdp_refresh_state(current) != expected_state:
+                return bool(current.token) and not self._needs_refresh(current.token)
+            if not force and not self._needs_refresh(current.token):
+                return True
+            result = False
+            try:
+                async with self._lock:
+                    result = await self._refresh_one(account_id)
+                return result
+            finally:
+                self._cdp_refresh_generation[account_id] = attempt_generation + 1
+                self._cdp_refresh_result[account_id] = result
+
+    async def ensure_fresh(
+        self, account_id: str, force: bool = False, *, allow_rt: bool = True
+    ) -> bool:
         """Ensure the account's token is valid, refreshing on demand if needed.
 
         Returns True if the token is usable afterwards, False otherwise. Safe to
@@ -325,12 +641,32 @@ class RefreshScheduler:
         if account is None:
             elog(f"Refresh skipped: account {account_id} not found")
             return False
+        # Consumer (personal-account) Copilot has no substrate token and no
+        # refresh_token grant, so every path below -- RT exchange, cookie replay,
+        # CDP capture -- is meaningless for it. Guarding here rather than in the
+        # keepalive predicates covers the admin "Refresh" button too, since this
+        # is the single entry point all of them share.
+        if getattr(account, "provider", "m365") != "m365":
+            # A forced refresh (admin button / keepalive) re-mints through the
+            # unattended browser gate. The passive /v1 path deliberately does not:
+            # the stored token is opaque, so we have no reason to believe it is
+            # dead, and a ~7s browser launch in front of a live request would be
+            # a guaranteed cost against a speculative benefit. Expiry surfaces
+            # upstream as ClearanceRequired, which is where recovery belongs.
+            if force and await self.refresh_consumer(account_id):
+                return True
+            return bool(getattr(account, "consumer_token", ""))
+        cdp_refresh_state = self._cdp_refresh_state(account)
         # Fast path: if the account carries an OAuth2 refresh_token, try the
         # plain-HTTP substrate exchange first (no headless Chromium, no Copilot
         # quota spend). Only runs when a refresh is actually due (or forced).
         # On success we're done; on failure we fall through to the CDP path.
-        if (getattr(account, "refresh_token", "") or "").strip() and (force or self._needs_refresh(account.token)):
-            if await self._try_rt_refresh(account_id):
+        if (
+            allow_rt
+            and (getattr(account, "refresh_token", "") or "").strip()
+            and (force or self._needs_refresh(account.token))
+        ):
+            if await self._try_rt_refresh(account_id, force=force):
                 return True
         if account.token_source != "cdp":
             # Manual accounts have no auto-refresh profile of their own. On the
@@ -347,20 +683,19 @@ class RefreshScheduler:
                     return False
                 return bool(account.token)
             ulog(f"Forced refresh on manual account {account_id}: attempting CDP capture from its profile")
-            async with self._account_lock(account_id):
-                async with self._lock:
-                    return await self._refresh_one(account_id)
+            return await self._run_cdp_refresh(
+                account_id,
+                force=force,
+                expected_state=cdp_refresh_state,
+            )
         if not force and not self._needs_refresh(account.token):
             return True
 
-        # Coalesce concurrent refreshes for the same account.
-        async with self._account_lock(account_id):
-            account = self._accounts.get(account_id) or account
-            if not force and not self._needs_refresh(account.token):
-                return True
-            # Global serialisation: only one Chromium alive at a time.
-            async with self._lock:
-                return await self._refresh_one(account_id)
+        return await self._run_cdp_refresh(
+            account_id,
+            force=force,
+            expected_state=cdp_refresh_state,
+        )
 
     async def inject_cookies(self, account_id: str, cookies: list[dict], *, allow_nudge: bool = False) -> tuple[int, int]:
         # allow_nudge=True drives a full token capture (substrate + media/designer
@@ -391,10 +726,12 @@ class RefreshScheduler:
         # from the URL that STILL carries the fileToken (so it can be lifted into the
         # header), then request the stripped URL. The Chromium fallback receives the
         # unstripped URL and strips it internally for the same reason.
-        # Lazy media keepalive: media/designer auth tokens are not produced by the
-        # RT/HTTP substrate refresh, so top them up on demand right before we need
-        # them (only fires when stale + a media_seed_url + cookies exist). Runs
-        # before auth-header computation so a freshly captured token is used.
+        # Lazy media keepalive: the substrate refresh does not carry these two
+        # audiences, so top them up on demand right before we need them. Only
+        # fires when stale, and prefers the RT scope hop (plain HTTP, needs
+        # nothing but a stored refresh token); the seed-URL capture that does
+        # need cookies is only the fallback. Runs before auth-header computation
+        # so a freshly minted token is used.
         await self.ensure_media_fresh(account_id, fetch_url)
         account = self._accounts.get(account_id) or account
         auth_headers, auth_source = _auth_headers_for_account(account, fetch_url)
@@ -541,6 +878,7 @@ class RefreshScheduler:
                 _chromium_path(),
                 f"--remote-debugging-port={account.cdp_port}",
                 f"--user-data-dir={profile_dir}",
+                *chromium_proxy_args(),
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--no-sandbox",

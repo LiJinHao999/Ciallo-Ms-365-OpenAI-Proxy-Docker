@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
+from datetime import datetime
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import websockets
 
@@ -14,6 +17,7 @@ from .substrate_parse import (
     CitationTracker,
     _capture_suspicious_response_event,
     _combine_text,
+    _cumulative_catchup,
     _dedupe_repeated_delta,
     _dedupe_signature,
     _extract_image_urls,
@@ -21,6 +25,7 @@ from .substrate_parse import (
     _is_image_loading_placeholder,
     _message_content,
     _final_fallback_remainder,
+    _split_snapshot_lead,
     aligned_url_sources_for_stream,
     clean_m365_citations,
     extract_source_attributions,
@@ -37,8 +42,10 @@ __all__ = [
     "SIGNALR_SEP",
     "SubstrateCopilotClient",
     "SubstrateCopilotError",
+    "SubstrateThrottled",
     "_capture_suspicious_response_event",
     "_combine_text",
+    "_cumulative_catchup",
     "_dedupe_repeated_delta",
     "_dedupe_signature",
     "_extract_image_urls",
@@ -46,7 +53,7 @@ __all__ = [
     "_is_image_loading_placeholder",
     "_message_content",
     "_final_fallback_remainder",
-    "aligned_url_sources_for_stream",
+    "_split_snapshot_lead",
     "clean_m365_citations",
     "CitationTracker",
     "extract_source_attributions",
@@ -55,6 +62,7 @@ __all__ = [
 
 SIGNALR_SEP = "\x1e"
 _WS_BASE = "wss://substrate.office.com/m365Copilot/Chathub"
+_log = logging.getLogger(__name__)
 
 # Chat-only WebSocket timeouts (do NOT affect cookie/CDP refresh in refresh_scheduler).
 # _WS_OPEN_TIMEOUT: cap the TCP+TLS+HTTP-upgrade handshake.
@@ -71,11 +79,19 @@ _WS_OPEN_TIMEOUT = 15.0
 _WS_IDLE_TIMEOUT = 300.0
 _SESSION_LOCK_TIMEOUT = 300.0
 
+# Images per turn a caller may hand us. The count is caller-controlled and every
+# image costs a serial upload (a remote one costs a download of up to 20 MiB plus
+# ~1.37x that as base64 in memory), so an uncapped list turns one request into an
+# arbitrarily long fetch-and-buffer loop. 10 matches the multi-image-in-turn
+# ceiling the reference implementation uses.
+_MAX_IMAGES_PER_TURN = 10
+
 _VARIANTS = (
     "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,"
     "feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,"
     "EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,"
     "feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,"
+    "turnOffWorkTabUpsellFromClient,"
     "feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,"
     "IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,"
     "feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,"
@@ -100,6 +116,12 @@ _VARIANTS = (
 # Chat payload optionsSets. Kept in sync with observed M365 web traffic and
 # cross-checked against public protocol notes (HEXUXIU/M365-Copilot2API).
 # See docs/protocol-options-diff.md for the full A/B matrix and rationale.
+# The six code_interpreter entries below do NOT gate server-side execution on this
+# tenant: A/B'd 2026-08-25 with one real turn per cell (.probe/ci_ab.py), stripping
+# all six left tone=Magic still answering the SHA-256 of a freshly minted nonce and
+# an exact 12x12-digit product, still with GeneratedCode frames on the wire. They
+# are kept because they mirror browser traffic, not because they buy the
+# interpreter; the chart-shaped ones were not exercised by that oracle.
 _OPTIONS_SETS = [
     "search_result_progress_messages_with_search_queries",
     "update_textdoc_response_after_streaming",
@@ -112,7 +134,10 @@ _OPTIONS_SETS = [
     "gptvnorm2048",
     "cwc_code_interpreter_citation_fix",
     "code_interpreter_interactive_charts",
-    "cwc_code_interpreter_interactive_charts_inline_image",
+    # Bare `code_interpreter_` prefix, like its two siblings above/below: the
+    # `cwc_`-prefixed spelling this line used to carry appears in no browser
+    # capture or upstream reference, i.e. it was a silently ignored no-op.
+    "code_interpreter_interactive_charts_inline_image",
     "code_interpreter_matplotlib_patching",
     "cwc_fileupload_odb",
     "update_memory_plugin",
@@ -136,6 +161,26 @@ _OPTIONS_SETS = [
     "precise_mode",
 ]
 
+
+def _tz_offset_hours(time_zone: str) -> int:
+    """Hours east of UTC for ``time_zone``, right now.
+
+    Sent next to the zone name in every turn's ``locationInfo``. It used to be a
+    hardcoded 9 while the name beside it was configurable, so an account on the
+    default Asia/Shanghai told the model its local clock was an hour ahead of the
+    zone it had just named.
+
+    ponytail: whole hours, truncated, so a half-hour zone (Asia/Kolkata) loses
+    the :30 -- the browser field is an integer and no capture shows a fractional
+    value. An unknown zone name falls back to +8, matching the default zone.
+    """
+    try:
+        offset = datetime.now(ZoneInfo(time_zone)).utcoffset()
+    except (ZoneInfoNotFoundError, ValueError, KeyError, OSError):
+        return 8
+    return int(offset.total_seconds() // 3600) if offset else 0
+
+
 _ALLOWED_MESSAGE_TYPES = [
     "Chat", "Suggestion", "InternalSearchQuery", "Disengaged",
     "InternalLoaderMessage", "Progress", "GeneratedCode", "RenderCardRequest",
@@ -148,13 +193,46 @@ _ALLOWED_MESSAGE_TYPES = [
     "SwitchRespondingEndpoint",
 ]
 
+# M365 refuses a turn it will not answer -- a `tone` the account may not use
+# among the causes -- by sending ONE canned line as the whole answer, with no
+# streamed deltas. Passed through, that reads as a normal reply, so a mode the
+# account cannot use looks like it "works" while every answer is this sentence.
+#
+# Raw-frame capture of such a turn (2026-08-02, tone Claude_Fable) showed the
+# completion frame also marks it structurally, which is what the code keys off
+# first: `item.turnState == "Failed"` and `item.result.value == "InternalError"`
+# (a successful turn: "Completed"/"Success"), and the refusal message carries
+# `contentOrigin: "BotConnection"` rather than "DeepLeo". The same sentence is
+# substrate's generic error text -- `POST /m365Copilot/GetUserSettings {}`
+# answers with it under `result.value == "InvalidRequest"` -- so it says
+# "request rejected", not "the model declined".
+# ponytail: the text match is kept as a second signal for builds that send the
+# line on a turn marked Completed. Ceiling: a reworded line AND a Completed turn
+# would restore the silent pass-through; nothing short of both.
+_M365_REFUSAL_TEXTS = frozenset({
+    "Sorry, I wasn't able to respond to that. Is there something else I can help with?",
+})
+
+# Stable markers in the two tone-failure error texts. scan_tones.py imports these
+# to tell "M365 knows this mode but will not serve it" from "M365 does not know
+# this value at all", so the wording below can be reworded without silently
+# breaking that classification.
+_REFUSED_TURN_MARKER = "refused this turn"
+_EMPTY_TURN_MARKER = "empty response twice"
+
 
 class SubstrateCopilotError(RuntimeError):
     pass
 
 
+class SubstrateThrottled(SubstrateCopilotError):
+    """M365 accepted the turn shape but temporarily refused it as throttled."""
+
+    upstream_result = "Throttled"
+
+
 class SubstrateCopilotClient:
-    def __init__(self, access_token: str, time_zone: str = "Asia/Shanghai", tone: str = "Magic", extra_tool_prompt: str = "", idle_timeout: float | None = None):
+    def __init__(self, access_token: str, time_zone: str = "Asia/Shanghai", tone: str = "Magic", extra_tool_prompt: str = "", idle_timeout: float | None = None, studio_agent_id: str = ""):
         if not access_token:
             raise SubstrateCopilotError(
                 "M365_ACCESS_TOKEN is missing. Start the debug Edge window and let startup token capture complete, "
@@ -166,6 +244,7 @@ class SubstrateCopilotClient:
         self._idle_timeout = float(idle_timeout) if idle_timeout else _WS_IDLE_TIMEOUT
         self._tone = tone or "Magic"
         self._extra_tool_prompt = extra_tool_prompt or ""
+        self._studio_agent_id = str(studio_agent_id or "")
         self._response_debug_sink = None
         try:
             claims = decode_jwt_payload(access_token)
@@ -185,15 +264,21 @@ class SubstrateCopilotClient:
 
     def _ws_url(self, conv_id: str, session_id: str, req_id: str) -> str:
         token = quote(self._token, safe="")
+        studio_agent_id = str(getattr(self, "_studio_agent_id", "") or "").strip()
+        agent_surface = (
+            f"&gptId={quote(studio_agent_id, safe='')}&agent=Agent"
+            if studio_agent_id
+            else "&agent=web"
+        )
         return (
             f"{_WS_BASE}/{self._oid}@{self._tid}"
             f"?ClientRequestId={req_id}"
             f"&X-SessionId={session_id}"
             f"&ConversationId={conv_id}"
             f"&access_token={token}"
-            f"&variants={_VARIANTS}"
+            f"&variants={getattr(self, '_variants', _VARIANTS)}"
             f"&source=officeweb&product=Office&agentHost=Bizchat.FullScreen"
-            f"&licenseType=Starter&agent=web&scenario=OfficeWebIncludedCopilot"
+            f"&licenseType=Starter{agent_surface}&scenario=OfficeWebIncludedCopilot"
         )
 
     def _chat_invoke(
@@ -229,7 +314,7 @@ class SubstrateCopilotClient:
                 "source": "officeweb",
                 "clientCorrelationId": req_id,
                 "sessionId": session_id,
-                "optionsSets": _OPTIONS_SETS,
+                "optionsSets": list(getattr(self, "_options_sets", _OPTIONS_SETS)),
                 "streamingMode": "ConciseWithPadding",
                 "spokenTextMode": "None",
                 "options": {},
@@ -237,6 +322,7 @@ class SubstrateCopilotClient:
                 "allowedMessageTypes": _ALLOWED_MESSAGE_TYPES,
                 "sliceIds": [],
                 "threadLevelGptId": {},
+                "productThreadType": "Office",
                 "traceId": req_id,
                 "isStartOfSession": is_start_of_session,
                 "clientInfo": {
@@ -254,7 +340,10 @@ class SubstrateCopilotClient:
                     "text": tool_reminder + text,
                     "entityAnnotationTypes": ["People", "File", "Event", "Email", "TeamsMessage"],
                     "requestId": req_id,
-                    "locationInfo": {"timeZoneOffset": 9, "timeZone": self._time_zone},
+                    "locationInfo": {
+                        "timeZoneOffset": _tz_offset_hours(self._time_zone),
+                        "timeZone": self._time_zone,
+                    },
                     "locale": "en-us",
                     "messageType": "Chat",
                     "experienceType": "Default",
@@ -271,6 +360,23 @@ class SubstrateCopilotClient:
             "target": "chat",
             "type": 4,
         }
+        studio_agent_id = getattr(self, "_studio_agent_id", "")
+        if studio_agent_id:
+            argument = payload["arguments"][0]
+            argument["threadLevelGptId"] = {
+                "id": studio_agent_id,
+                "source": "MOS3",
+            }
+            argument["gpts"] = [{
+                "id": studio_agent_id,
+                "source": "MOS3",
+                "version": "1.0.0",
+                "clientOverrides": {
+                    "capabilities": [],
+                    "deepResearchModels@odata.type": "Collection(String)",
+                },
+            }]
+            argument.pop("plugins", None)
         return json.dumps(payload, ensure_ascii=False) + SIGNALR_SEP
 
     async def _upload_images(self, images: list | None) -> list[dict]:
@@ -282,6 +388,16 @@ class SubstrateCopilotClient:
         skipped so the turn can still proceed as text-only."""
         if not images:
             return []
+        if len(images) > _MAX_IMAGES_PER_TURN:
+            # Never silently: the turn proceeds without the dropped images, so the
+            # log line is the only way to tell "the model ignored image 11" apart
+            # from "the model answered badly".
+            _log.warning(
+                "turn carries %d images; uploading the first %d and dropping the rest",
+                len(images),
+                _MAX_IMAGES_PER_TURN,
+            )
+            images = images[:_MAX_IMAGES_PER_TURN]
         from .substrate_upload import upload_image
         upload_conv_id = str(uuid.uuid4())
         annotations: list[dict] = []
@@ -304,7 +420,7 @@ class SubstrateCopilotClient:
         include_sources_markdown: bool = True,
         reasoning_out: list[str] | None = None,
     ) -> AsyncIterator[str]:
-        text = _combine_text(prompt, additional_context)
+        text = _combine_text(prompt, additional_context, self._tone)
         annotations = await self._upload_images(images)
         if session is None:
             async for chunk in self._stream_turn_with_retry(
@@ -332,17 +448,60 @@ class SubstrateCopilotClient:
             ) from exc
         try:
             turn = session.reserve_turn()
-            async for chunk in self._stream_turn_with_retry(
-                text=text,
-                conv_id=turn.conversation_id,
-                session_id=turn.client_session_id,
-                is_start_of_session=turn.is_start_of_session,
-                annotations=annotations,
-                sources_out=sources_out,
-                include_sources_markdown=include_sources_markdown,
-                reasoning_out=reasoning_out,
-            ):
-                yield chunk
+            streamed_any = False
+            try:
+                async for chunk in self._stream_turn_with_retry(
+                    text=text,
+                    conv_id=turn.conversation_id,
+                    session_id=turn.client_session_id,
+                    is_start_of_session=turn.is_start_of_session,
+                    annotations=annotations,
+                    sources_out=sources_out,
+                    include_sources_markdown=include_sources_markdown,
+                    reasoning_out=reasoning_out,
+                ):
+                    streamed_any = True
+                    yield chunk
+            except SubstrateCopilotError as exc:
+                # A reused persistent conversation can rot: after some turns the
+                # upstream starts refusing every CONTINUATION (turnState=Failed /
+                # canned refusal) while the same tone still answers in a brand-new
+                # conversation. When that happens before anything is streamed,
+                # abandon the poisoned conversation and retry ONCE as a fresh
+                # start-of-session turn -- and keep the reset, so following turns run
+                # on the new conversation too instead of the user having to open a
+                # new chat. The retry re-posts only the incremental turn, so it loses
+                # prior context (the same tradeoff the empty-response retry already
+                # accepts), but returns an answer instead of a dead thread.
+                #
+                # Scope, narrow on purpose:
+                #  - continuation turns only: a start-of-session turn refusing is a
+                #    genuine tone/account outage, and a second fresh conversation
+                #    would refuse identically.
+                #  - refusals only (_REFUSED_TURN_MARKER): an empty turn is already
+                #    retried on a throwaway conversation inside _stream_turn_with_retry.
+                #  - nothing streamed yet: once bytes are on the wire a retry would
+                #    duplicate content, so the partial answer is kept and the error
+                #    propagates.
+                if (
+                    streamed_any
+                    or turn.is_start_of_session
+                    or _REFUSED_TURN_MARKER not in str(exc)
+                ):
+                    raise
+                session.reset_conversation()
+                healed = session.reserve_turn()
+                async for chunk in self._stream_turn_with_retry(
+                    text=text,
+                    conv_id=healed.conversation_id,
+                    session_id=healed.client_session_id,
+                    is_start_of_session=healed.is_start_of_session,
+                    annotations=annotations,
+                    sources_out=sources_out,
+                    include_sources_markdown=include_sources_markdown,
+                    reasoning_out=reasoning_out,
+                ):
+                    yield chunk
         finally:
             session.lock.release()
 
@@ -358,7 +517,7 @@ class SubstrateCopilotClient:
         reasoning_out: list[str] | None = None,
     ) -> AsyncIterator[str]:
         """Stream one turn; if the upstream returns a clean-but-empty response
-        (connected, invoked, ended with no text/image), retry ONCE.
+        (connected, invoked, ended with no text/image), retry ONCE, then fail.
 
         The retry always runs on a brand-new throwaway conversation (fresh
         conv_id/session_id, is_start_of_session=True) so a persistent session's
@@ -367,6 +526,13 @@ class SubstrateCopilotClient:
         when the first attempt yielded nothing at all; any real error raises
         SubstrateCopilotError and propagates without retrying. All yields from
         _chat_stream_for_turn are non-empty, so tracking yielded_any is exact.
+
+        Two empty attempts raise rather than returning "": an empty answer reads
+        as a working-but-mute model in every client. Measured cause (2026-08-02):
+        a `tone` M365 does not recognise makes substrate drop the invoke outright
+        -- the turn ends with no update and no completion frame at all, unlike a
+        tone it knows but will not serve, which fails loudly enough for
+        _chat_stream_for_turn to catch.
         """
         yielded_any = False
         async for chunk in self._chat_stream_for_turn(
@@ -384,6 +550,7 @@ class SubstrateCopilotClient:
         if yielded_any:
             return
         # Empty upstream response: retry once on a fresh throwaway conversation.
+        retried_any = False
         async for chunk in self._chat_stream_for_turn(
             text=text,
             conv_id=str(uuid.uuid4()),
@@ -394,7 +561,14 @@ class SubstrateCopilotClient:
             include_sources_markdown=include_sources_markdown,
             reasoning_out=reasoning_out,
         ):
+            retried_any = True
             yield chunk
+        if not retried_any:
+            raise SubstrateCopilotError(
+                f"M365 Copilot returned an {_EMPTY_TURN_MARKER} (conversation mode "
+                f"'{self._tone}'). A mode M365 does not recognise always does this: "
+                f"check the mode list against a scan_tones.py run."
+            )
 
     async def _chat_stream_for_turn(
         self,
@@ -424,16 +598,13 @@ class SubstrateCopilotClient:
                 await ws.send(self._chat_invoke(text, conv_id, session_id, req_id, is_start_of_session, annotations))
                 fallback_text = ""
                 streamed_text = ""
+                # Run that a cumulative snapshot delivered ahead of the deltas, kept
+                # so deltas replaying it are not shown to the reader a second time.
+                snapshot_lead = ""
                 yielded_images: set[str] = set()
                 yielded_any = False
-                # Source attributions usually arrive only with the final type=2
-                # payload (after streaming deltas). Collect them across the turn
-                # and append a Markdown "参考来源" block at t==3 so clients get
-                # clickable citations instead of stripped PUA cite markers.
                 collected_sources: list[dict] = []
                 seen_source_keys: set[str] = set()
-                # Shared across deltas so in-body [n] numbers stay stable and
-                # line up with the trailing sources list at t==3.
                 cite_tracker = CitationTracker()
 
                 def _note_sources(payload: object) -> None:
@@ -450,6 +621,9 @@ class SubstrateCopilotClient:
                         seen_source_keys.add(key)
                         collected_sources.append(source)
 
+                # Non-empty once the completion frame says the turn failed; holds the
+                # upstream's own verdict string so the error names it.
+                turn_failure = ""
                 ws_iter = ws.__aiter__()
                 while True:
                     try:
@@ -478,22 +652,36 @@ class SubstrateCopilotClient:
                             args = (msg.get("arguments") or [{}])[0]
                             delta = args.get("writeAtCursor")
                             if delta and not _is_image_loading_placeholder(delta):
-                                # Resolve PUA cites → label[n] instead of stripping.
                                 delta = clean_m365_citations(delta, cite_tracker)
                                 if not delta:
                                     continue
+                                # A snapshot that landed before any delta holds the
+                                # opening of the answer -- the deltas do not always
+                                # rewind to it. Deliver it now that a real delta
+                                # proves the turn is streaming (emitting it earlier
+                                # would defeat the refusal check below), and record
+                                # it so the delta it overlaps is not sent twice.
                                 if not yielded_any and fallback_text:
                                     yield fallback_text
                                     streamed_text += fallback_text
+                                    snapshot_lead = fallback_text
+                                    yielded_any = True
+                                # A snapshot may already have delivered the run this
+                                # delta is about to replay; emit only what is new.
+                                if snapshot_lead:
+                                    split = _split_snapshot_lead(snapshot_lead, delta)
+                                    if split is not None:
+                                        snapshot_lead, delta = split
+                                        if not delta:
+                                            continue
+                                    else:
+                                        snapshot_lead = ""
                                 yielded_any = True
                                 yield delta
                                 streamed_text += delta
                             msgs = args.get("messages")
                             if msgs:
                                 entries = msgs if isinstance(msgs, list) else [msgs]
-                                # Deep-thinking tones stream chain-of-thought
-                                # summaries as Progress entries; surface them as
-                                # structured reasoning, never as fallback body.
                                 if reasoning_out is not None:
                                     for entry in entries:
                                         if is_chain_of_thought_message(entry):
@@ -504,12 +692,29 @@ class SubstrateCopilotClient:
                                     if entry.get("author") != "user" and is_body_message(entry):
                                         fallback_text = _message_content(entry)
                                         break
+                                # The snapshot is cumulative. When it runs ahead of
+                                # the deltas it holds the only copy of the skipped
+                                # run, so deliver that run NOW to keep the answer in
+                                # order -- the final frame would append it last.
+                                catchup = _cumulative_catchup(streamed_text, fallback_text)
+                                if catchup:
+                                    yield catchup
+                                    streamed_text += catchup
+                                    snapshot_lead += catchup
+                                    yielded_any = True
                         if t == 2:
-                            item_msgs = (msg.get("item") or {}).get("messages") or []
+                            item = msg.get("item") or {}
+                            item_msgs = item.get("messages") or []
                             for entry in reversed(item_msgs):
                                 if entry.get("author") != "user" and is_body_message(entry):
                                     fallback_text = _message_content(entry)
                                     break
+                            # The completion frame states the verdict for the whole
+                            # turn; a rejected tone lands here as Failed/InternalError.
+                            result = item.get("result") or {}
+                            result_value = str(result.get("value") or "")
+                            if item.get("turnState") == "Failed" or (result_value and result_value != "Success"):
+                                turn_failure = result_value or "Failed"
                         for image_url in _extract_image_urls(msg):
                             if image_url not in yielded_images:
                                 markdown = ("\n\n" if streamed_text else "") + _image_markdown(image_url)
@@ -519,32 +724,35 @@ class SubstrateCopilotClient:
                                 yielded_any = True
                         if t == 3:
                             remaining = _final_fallback_remainder(streamed_text, fallback_text)
+                            # Nothing streamed and the turn was marked failed (or its
+                            # whole answer is the canned refusal) => report it as an
+                            # upstream failure instead of returning it as the reply.
+                            if not yielded_any and (turn_failure or remaining.strip() in _M365_REFUSAL_TEXTS):
+                                detail = f" (upstream result: {turn_failure})" if turn_failure else ""
+                                message = (
+                                    f"M365 Copilot {_REFUSED_TURN_MARKER} instead of answering "
+                                    f"(conversation mode '{self._tone}'){detail}. If every request "
+                                    f"in this mode does this, the mode is not available for this "
+                                    f"account -- switch to another mode."
+                                )
+                                if (turn_failure or "").strip().casefold() == "throttled":
+                                    raise SubstrateThrottled(message)
+                                raise SubstrateCopilotError(message)
                             if remaining:
-                                # Fallback text may still carry PUA cites if it
-                                # came from _message_content without our tracker.
                                 remaining = clean_m365_citations(remaining, cite_tracker)
                                 if remaining:
                                     yield remaining
                                     streamed_text += remaining
-                            # Flush any held incomplete cite opener so we never
-                            # leak raw turn/search/PUA tails after the stream ends.
                             held = cite_tracker.flush()
                             if held:
                                 yield held
                                 streamed_text += held
-                            # Align collected attributions with in-body [n] order and hand them
-                            # to the caller (Responses / Anthropic native fields).
-                            # Completions keeps the trailing Markdown bibliography.
                             aligned = aligned_url_sources_for_stream(
                                 collected_sources, cite_tracker
                             )
                             if sources_out is not None:
                                 sources_out.clear()
                                 sources_out.extend(aligned)
-                            # Append resolved sources AFTER the body. This is also
-                            # why clients may see a short pause at the end: we must
-                            # wait for the type=2 final message (where attributions
-                            # live) and the type=3 end signal before closing SSE.
                             if include_sources_markdown:
                                 sources_md = sources_markdown_for_stream(
                                     streamed_text, collected_sources, cite_tracker
@@ -563,20 +771,8 @@ class SubstrateCopilotClient:
         additional_context: list[str],
         session: PersistentSession | None = None,
         images: list | None = None,
-        *,
-        sources_out: list[dict] | None = None,
-        include_sources_markdown: bool = True,
-        reasoning_out: list[str] | None = None,
     ) -> str:
         chunks: list[str] = []
-        async for chunk in self.chat_stream(
-            prompt,
-            additional_context,
-            session,
-            images,
-            sources_out=sources_out,
-            include_sources_markdown=include_sources_markdown,
-            reasoning_out=reasoning_out,
-        ):
+        async for chunk in self.chat_stream(prompt, additional_context, session, images):
             chunks.append(chunk)
         return "".join(chunks)

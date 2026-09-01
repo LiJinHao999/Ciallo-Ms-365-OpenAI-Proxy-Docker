@@ -10,6 +10,7 @@ from .account_serializers import account_public
 from .auth_helpers import _validate_password, _validate_username
 from .key_store import ApiKey
 from .response_helpers import _json_err
+from .routes_api_common import effective_run_permission
 from .runtime_settings import _RUN_PERMISSIONS
 from .token_store import decode_jwt_payload, is_substrate_token_claims
 
@@ -18,10 +19,6 @@ def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Req
     def _account_public(acc, bound_keys: list[ApiKey] | None = None) -> dict:
         keys = bound_keys if bound_keys is not None else app.state.key_store.list_for_account(acc.id)
         return account_public(acc, keys)
-
-    def _effective_run_permission(k: ApiKey | None) -> str:
-        value = ((getattr(k, "run_permission", "") if k is not None else "") or "").strip()
-        return value if value in _RUN_PERMISSIONS else getattr(app.state, "run_permission", "full")
 
     def _key_public(k: ApiKey) -> dict:
         """Serialize an API key for the admin UI (raw key shown so admin can copy)."""
@@ -32,13 +29,19 @@ def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Req
             "name": k.name,
             "account_id": k.account_id,
             "account_name": acc.name if acc is not None else "",
+            "account_provider": getattr(acc, "provider", "m365") if acc is not None else "",
             "account_source": acc.token_source if acc is not None else "",
             "enabled": k.enabled,
             "tone": k.tone,
             "tool_prompt": k.tool_prompt,
             "system_prompt": k.system_prompt,
             "run_permission": getattr(k, "run_permission", ""),
-            "effective_run_permission": _effective_run_permission(k),
+            "effective_run_permission": effective_run_permission(app, k),
+            # 0 => inherit the global ceiling, negative => this key is unlimited.
+            # Admin-only: exposing it on the user page would let a user lift their
+            # own ceiling, which defeats the point of having one.
+            "rate_limit_rpm": int(getattr(k, "rate_limit_rpm", 0) or 0),
+            "default_rate_limit_rpm": int(dict(getattr(app.state, "runtime_settings", {}) or {}).get("rate_limit_rpm", 0) or 0),
             "username": k.username,
             "password": k.password,
             "has_password": bool(k.password_hash),
@@ -118,16 +121,46 @@ def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Req
             return _json_err(404, "Account not found")
         return {"status": "ok", "account": _account_public(acc)}
 
+    @app.post("/admin/accounts/{acc_id}/studio-agent")
+    async def bind_account_studio_agent(acc_id: str, request: Request) -> dict:
+        err = require_admin(request)
+        if err:
+            return err
+        try:
+            body = await request.json()
+        except ValueError:
+            return _json_err(400, "JSON object required")
+        if not isinstance(body, dict):
+            return _json_err(400, "JSON object required")
+        if "agent_id" not in body:
+            return _json_err(400, "agent_id is required")
+        agent_id = body["agent_id"]
+        if not isinstance(agent_id, str):
+            return _json_err(400, "agent_id must be a string")
+        try:
+            acc = app.state.account_store.set_studio_agent_id(acc_id, agent_id)
+        except ValueError as exc:
+            return _json_err(400, str(exc))
+        if acc is None:
+            return _json_err(404, "Account not found")
+        return {"status": "ok", "account": _account_public(acc)}
+
     @app.post("/admin/accounts/{acc_id}/refresh")
     async def refresh_account(acc_id: str, request: Request) -> dict:
         err = require_admin(request)
         if err: return err
-        if app.state.account_store.get(acc_id) is None:
+        acc = app.state.account_store.get(acc_id)
+        if acc is None:
             return _json_err(404, "Account not found")
         try:
-            ok = await app.state.refresh_scheduler.ensure_fresh(acc_id, force=True)
+            if getattr(acc, "provider", "m365") == "consumer":
+                ok = await app.state.refresh_scheduler.refresh_consumer(acc_id)
+            else:
+                ok = await app.state.refresh_scheduler.ensure_fresh(acc_id, force=True)
         except Exception as exc:
             return _json_err(502, f"Refresh failed: {exc}")
+        if not ok and getattr(acc, "provider", "m365") == "consumer":
+            return _json_err(502, "Consumer refresh failed; check the server log")
         acc = app.state.account_store.get(acc_id)
         return {"status": "ok", "refreshed": ok, "account": _account_public(acc) if acc else None}
 
@@ -138,6 +171,23 @@ def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Req
         acc = app.state.account_store.get(acc_id)
         if acc is None:
             return _json_err(404, "Account not found")
+        if getattr(acc, "provider", "m365") == "consumer":
+            try:
+                ok = await app.state.refresh_scheduler.refresh_consumer(acc_id)
+            except Exception as exc:
+                return _json_err(502, f"Consumer refresh failed: {exc}")
+            if not ok:
+                return _json_err(502, "Consumer refresh failed; check the server log")
+            acc = app.state.account_store.get(acc_id)
+            total = len(list(getattr(acc, "cookies", []) or [])) if acc else 0
+            return {
+                "status": "ok",
+                "provider": "consumer",
+                "injected": total,
+                "total": total,
+                "cookie_valid": bool(acc.cookie_valid) if acc else False,
+                "account": _account_public(acc) if acc else None,
+            }
         # Re-inject the LAST pushed cookies. ensure_fresh() no-ops for manual
         # accounts (it only drives the CDP token-refresh path), so the cookie
         # button must replay the stored cookie set through inject_cookies to
@@ -243,7 +293,7 @@ def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Req
     async def remove_account(acc_id: str, request: Request) -> dict:
         err = require_admin(request)
         if err: return err
-        if not app.state.account_store.remove(acc_id):
+        if not await app.state.refresh_scheduler.remove_account(acc_id):
             return _json_err(404, "Account not found")
         app.state.key_store.detach_account(acc_id)  # unbind keys that pointed here
         return {"status": "ok"}
@@ -329,6 +379,13 @@ def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Req
             if rp and rp not in _RUN_PERMISSIONS:
                 return _json_err(400, "Invalid run permission")
             fields["run_permission"] = rp
+        if "rate_limit_rpm" in body:
+            # 0 => inherit global, negative => unlimited for this key. Both are
+            # meaningful, so the value is passed through rather than clamped.
+            try:
+                fields["rate_limit_rpm"] = int(body["rate_limit_rpm"] or 0)
+            except (TypeError, ValueError):
+                return _json_err(400, "rate_limit_rpm must be an integer")
         if "username" in body:
             uname = str(body["username"]).strip()
             if uname:

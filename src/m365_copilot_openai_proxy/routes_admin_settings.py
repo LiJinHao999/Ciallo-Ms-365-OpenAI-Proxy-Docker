@@ -14,11 +14,16 @@ from .runtime_settings import (
     _RUNTIME_SETTINGS_DEFAULTS,
     _RUN_PERMISSIONS,
     _write_runtime_settings,
+    apply_proxy_env,
+    normalize_consumer_mode_options,
     normalize_media_proxy_suffixes,
+    normalize_proxy_url,
     normalize_tone_options,
 )
 from .runtime_flags import set_flags as _set_log_flags
 from .token_store import write_system_prompt, write_tone, write_tool_prompt
+from .tone_options import effective_tool_calling
+from .tool_router import TOOL_PLANNING_MODES
 from .translator import default_tool_system_prompt
 
 
@@ -37,7 +42,22 @@ def register_admin_settings_routes(
     async def get_tone(request: Request) -> dict:
         err = require_admin(request)
         if err: return err
-        return {"tone": getattr(app.state, 'current_tone', 'Magic'), "options": _current_tone_options()}
+        # Annotate rather than store: whether a tone honours the injected
+        # tool-calling contract is a measured property of the tone (see
+        # tone_options.TONE_TOOL_CALLING), not an admin-editable setting, so the
+        # picker can warn without the value ever reaching the saved options.
+        # EFFECTIVE, like /v1/models: under the default "auto" the measured-broken
+        # tones are the routed ones, so reporting the bare measurement marked a
+        # tone unusable for tools while it was demonstrably producing them.
+        planning_mode = getattr(app.state, "tool_planning_mode", "auto")
+        options = [
+            {
+                **option,
+                "tool_calling": effective_tool_calling(option.get("value"), planning_mode),
+            }
+            for option in _current_tone_options()
+        ]
+        return {"tone": getattr(app.state, 'current_tone', 'Magic'), "options": options}
 
     @app.post("/admin/tone")
     async def set_tone(request: Request) -> dict:
@@ -69,6 +89,15 @@ def register_admin_settings_routes(
                 return max(minimum, int(body.get(name, current[name])))
             except (TypeError, ValueError):
                 return int(current[name])
+        try:
+            consumer_mode_options = normalize_consumer_mode_options(
+                body.get(
+                    "consumer_mode_options",
+                    current.get("consumer_mode_options"),
+                )
+            )
+        except ValueError as exc:
+            return _json_err(400, str(exc), "validation_error")
         data = {
             "time_zone": str(body.get("time_zone", current["time_zone"])).strip() or _RUNTIME_SETTINGS_DEFAULTS["time_zone"],
             "model_alias": str(body.get("model_alias", current["model_alias"])).strip() or _RUNTIME_SETTINGS_DEFAULTS["model_alias"],
@@ -78,22 +107,41 @@ def register_admin_settings_routes(
             "ws_idle_timeout_minutes": int_setting("ws_idle_timeout_minutes", 1),
             "keepalive_check_minutes": int_setting("keepalive_check_minutes", 1),
             "cookie_keepalive_before_hours": int_setting("cookie_keepalive_before_hours", 1),
+            # 0 parks the reclaim loop / disables one of its two passes.
+            "auto_cleanup_minutes": int_setting("auto_cleanup_minutes", 0),
+            "session_idle_hours": int_setting("session_idle_hours", 0),
+            "cloud_cleanup_idle_hours": int_setting("cloud_cleanup_idle_hours", 0),
+            # 0 lifts the per-account turn ceiling entirely.
+            "account_concurrency": int_setting("account_concurrency", 0),
             "cdp_port": int_setting("cdp_port", 1),
             "account_cdp_port_base": int_setting("account_cdp_port_base", 1),
+            # 0 is a valid value here (disables limiting), hence minimum 0.
+            "rate_limit_rpm": int_setting("rate_limit_rpm", 0),
+            "rate_limit_burst": int_setting("rate_limit_burst", 1),
+            "proxy_url": normalize_proxy_url(body.get("proxy_url", current.get("proxy_url", ""))),
             "log_level": str(body.get("log_level", current["log_level"])).strip().upper() or _RUNTIME_SETTINGS_DEFAULTS["log_level"],
             "call_log_limit": int_setting("call_log_limit", 1),
             "run_permission": str(body.get("run_permission", current["run_permission"])).strip() or _RUNTIME_SETTINGS_DEFAULTS["run_permission"],
+            "tool_planning_mode": str(body.get("tool_planning_mode", current.get("tool_planning_mode", ""))).strip().lower() or _RUNTIME_SETTINGS_DEFAULTS["tool_planning_mode"],
             "user_log_verbose": bool(body.get("user_log_verbose", current.get("user_log_verbose", True))),
             "user_log_errors": bool(body.get("user_log_errors", current.get("user_log_errors", True))),
             "suppress_access_log": bool(body.get("suppress_access_log", current.get("suppress_access_log", True))),
             "media_proxy_suffixes": normalize_media_proxy_suffixes(body.get("media_proxy_suffixes", current.get("media_proxy_suffixes"))) or list(_DEFAULT_MEDIA_PROXY_SUFFIXES),
             "media_proxy_ttl_seconds": int_setting("media_proxy_ttl_seconds", 60),
             "tone_options": normalize_tone_options(body.get("tone_options", current.get("tone_options"))),
+            "consumer_mode_options": consumer_mode_options,
         }
         if data["log_level"] not in _LOG_LEVELS:
             return _json_err(400, "Invalid log level")
         if data["run_permission"] not in _RUN_PERMISSIONS:
             return _json_err(400, "Invalid run permission")
+        if data["tool_planning_mode"] not in TOOL_PLANNING_MODES:
+            return _json_err(400, "Invalid tool planning mode. Expected auto, native, router or studio")
+        # Reject rather than silently blank a typo'd proxy: a saved-but-ignored
+        # proxy looks identical to a working one in the UI while every upstream
+        # call still goes direct.
+        if str(body.get("proxy_url", "")).strip() and not data["proxy_url"]:
+            return _json_err(400, "Invalid proxy URL. Expected scheme://host:port with scheme one of http, https, socks5, socks5h, socks4, socks4a")
         app.state.runtime_settings = data
         app.state.time_zone = data["time_zone"]
         app.state.model_alias = data["model_alias"]
@@ -103,17 +151,34 @@ def register_admin_settings_routes(
         app.state.ws_idle_timeout_minutes = data["ws_idle_timeout_minutes"]
         app.state.keepalive_check_minutes = data["keepalive_check_minutes"]
         app.state.cookie_keepalive_before_hours = data["cookie_keepalive_before_hours"]
+        # The reclaim loop re-reads these every tick, so no restart is needed.
+        app.state.auto_cleanup_minutes = data["auto_cleanup_minutes"]
+        app.state.session_idle_hours = data["session_idle_hours"]
+        app.state.cloud_cleanup_idle_hours = data["cloud_cleanup_idle_hours"]
+        # Read per turn by the gate, so this applies from the next request on.
+        app.state.account_concurrency = data["account_concurrency"]
         scheduler = getattr(app.state, "refresh_scheduler", None)
         if scheduler is not None:
             scheduler.set_keepalive_params(
                 check_interval_seconds=data["keepalive_check_minutes"] * 60,
                 cookie_before_seconds=data["cookie_keepalive_before_hours"] * 3600,
             )
+        # Clients are built per request, so the next upstream call picks this up
+        # with no restart. A Chromium already running keeps its old proxy until
+        # the next refresh launch.
+        apply_proxy_env(data["proxy_url"])
         app.state.cdp_port = data["cdp_port"]
         app.state.account_cdp_port_base = data["account_cdp_port_base"]
         app.state.account_store.set_cdp_port_base(app.state.account_cdp_port_base)
         app.state.log_level = data["log_level"]
+        # Read per turn by effective_run_permission, so both of these apply from the
+        # next request on. run_permission used to be set at boot only, so a saved
+        # "read_only" kept executing writes until a restart -- a security setting
+        # that silently does not apply is worse than one that visibly failed.
+        app.state.run_permission = data["run_permission"]
+        app.state.tool_planning_mode = data["tool_planning_mode"]
         app.state.tone_options = data["tone_options"]
+        app.state.consumer_mode_options = data["consumer_mode_options"]
         app.state.user_log_verbose = data["user_log_verbose"]
         app.state.user_log_errors = data["user_log_errors"]
         app.state.suppress_access_log = data["suppress_access_log"]

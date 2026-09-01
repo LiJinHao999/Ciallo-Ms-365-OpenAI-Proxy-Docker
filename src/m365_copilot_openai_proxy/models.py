@@ -62,6 +62,10 @@ class OpenAIChatRequest(BaseModel):
     user: str | None = None
     tools: list[ToolDefinition] | None = None
     tool_choice: str | dict[str, Any] | None = None
+    # False asks for at most one tool call per turn. Anthropic spells the same
+    # thing as tool_choice.disable_parallel_tool_use; normalize_tool_choice()
+    # folds both into one flag.
+    parallel_tool_calls: bool | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
     n: int | None = None
@@ -74,8 +78,27 @@ class OpenAIChatRequest(BaseModel):
 class AnthropicMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    role: Literal["user", "assistant"]
+    # "system" is not part of the official Anthropic schema (system belongs in the
+    # top-level `system` field), but OpenAI->Anthropic bridging clients routinely
+    # place system prompts inside messages[]. Accept it here and let
+    # translate_anthropic_request fold it into the system context.
+    role: Literal["user", "assistant", "system"]
     content: str | list[ContentPart]
+
+
+class AnthropicToolDefinition(BaseModel):
+    """A tool as the Anthropic Messages API declares it.
+
+    Anthropic keeps name/description/schema flat on the tool object, where
+    OpenAI nests them under ``function``. ``input_schema`` is the JSON Schema for
+    the arguments (OpenAI calls the same thing ``parameters``).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    description: str | None = None
+    input_schema: dict[str, Any] | None = None
 
 
 class AnthropicMessagesRequest(BaseModel):
@@ -87,6 +110,8 @@ class AnthropicMessagesRequest(BaseModel):
     stream: bool = False
     max_tokens: int | None = None
     temperature: float | None = None
+    tools: list[AnthropicToolDefinition] | None = None
+    tool_choice: dict[str, Any] | None = None
 
 
 class CopilotMessage(BaseModel):
@@ -113,6 +138,13 @@ class OpenAIResponsesRequest(BaseModel):
     stream: bool = False
     previous_response_id: str | None = None
     user: str | None = None
+    # Responses function tools are flat (`name`/`parameters` live directly on
+    # the item), unlike Chat Completions where they are nested below `function`.
+    # Keep non-function entries as raw mappings so the route can reject OpenAI
+    # hosted tools explicitly instead of silently dropping them.
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
 
 
 class ImageData(BaseModel):

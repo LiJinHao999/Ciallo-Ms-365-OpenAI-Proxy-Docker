@@ -14,4 +14,20 @@ media_proxy_secret
 setup.json
 *.rt.json
 poc_refresh_token_exchange.py
+# Protocol probes: throwaway scripts + the browser profile they sign in with
+.probe/
 get_rt.console.js
+# Temporary authenticated proxy pool exports (contain live credentials)
+proxies_*.txt
+# Scratch notes holding live API keys / endpoints for manual probing
+/api.txt
+
+# Local Python environment and tool caches
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+
+# Local coding-agent state; plans/specs stay local and are not pushed
+/.claude/worktrees/
+/.superpowers/
+/docs/superpowers/

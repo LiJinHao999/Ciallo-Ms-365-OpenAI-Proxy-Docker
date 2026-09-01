@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .template_assets import _GLASS_SELECT_CSS, _NO_SPIN_CSS
+from .template_assets import _DONUT_SPIN_CSS, _FIELD_TIP_CSS, _GLASS_SELECT_CSS, _NO_SPIN_CSS, _STILL_DECOR_CSS
 
 _ADMIN_CSS = """:root{--cyan:#60f2ff;--violet:#8c6bff;--pink:#ff5edb;--gold:#ffd76f;--muted:#9aa7d1;--line:rgba(108,137,255,.24);
 --bg:radial-gradient(circle at 18% 12%,rgba(96,242,255,.16),transparent 26%),radial-gradient(circle at 84% 10%,rgba(140,107,255,.2),transparent 24%),radial-gradient(circle at 50% 92%,rgba(255,94,219,.14),transparent 26%),linear-gradient(135deg,#040612 0%,#090d1f 45%,#03050d 100%);
@@ -33,6 +33,9 @@ details[open] summary:after{display:none}
 .card:has(details[open])::after{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;background:linear-gradient(90deg,transparent,rgba(96,242,255,.85),rgba(255,94,219,.58),transparent);background-size:240% 100%;animation:flowBorder 2.4s linear infinite;-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}
 .flow-box{scrollbar-gutter:stable}
 .flow-box::after{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;background:linear-gradient(90deg,transparent,rgba(96,242,255,.85),rgba(255,94,219,.58),transparent);background-size:240% 100%;animation:flowBorder 2.4s linear infinite;-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}
+.donut-legend-scroll{height:120px;max-height:120px;min-width:0;max-width:calc(100% - 128px);overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;scrollbar-width:none;-ms-overflow-style:none}
+.donut-legend-items{width:100%;margin-block:auto}
+.donut-legend-scroll::-webkit-scrollbar{display:none}
 @keyframes flowBorder{to{background-position:220% 0}}
 .card h2{font-size:1.1rem;margin-bottom:1rem;color:var(--text)}
 .status-row{display:flex;justify-content:space-between;align-items:center;padding:.5rem 0;border-bottom:1px solid var(--line)}
@@ -58,19 +61,57 @@ button[style*="background:var(--chip)"]{color:var(--strong)!important;border:1px
 .tbl-tools{display:flex;gap:.4rem;justify-content:flex-end;margin-bottom:.5rem;flex-wrap:wrap;position:sticky;top:0;z-index:4;background:var(--card);padding:.1rem 0}
 .view-users{height:800px;display:none;position:relative;padding-bottom:64px}
 body[data-view="users"] .view-users{display:block}
-.view-users .tbl-scroll{max-height:605px}
-body[data-view="users"] .view-users,body[data-view="accounts"] .view-accounts,body[data-view="settings"] .view-settings,body[data-view="debug"] .view-debug{position:relative;top:auto}
-.view-home,.view-users,.view-accounts,.view-settings,.view-debug{margin-top:0;margin-bottom:10px}
+.view-users .tbl-scroll{max-height:605px;scrollbar-gutter:auto}
+body[data-view="users"] .view-users,body[data-view="accounts"] .view-accounts,body[data-view="settings"] .view-settings,body[data-view="debug"] .view-debug,body[data-view="sessions"] .view-sessions{position:relative;top:auto}
+.view-home,.view-users,.view-accounts,.view-settings,.view-debug,.view-sessions{margin-top:0;margin-bottom:10px}
+/* Sessions grow with the table instead of a fixed height: the row count depends
+   on how many conversations exist upstream, so .tbl-scroll caps it instead. */
+.view-sessions{display:none}
+body[data-view="sessions"] .view-sessions{display:block}
+/* The page shell and every card clip by default.  The session filter menu is
+   rendered inside this card, so all ancestors in this view must release their
+   overflow while it is open; z-index alone cannot paint through a clip. */
+body[data-view="sessions"] .main{overflow:visible}
+.view-sessions:has(.glass-select.open),.view-sessions:has(.glass-select.open) .flow-box{overflow:visible!important;z-index:2000}
+.view-sessions:has(.glass-select.open) .glass-select,.view-sessions:has(.glass-select.open) .glass-select-menu{z-index:4000}
+.view-sessions .tbl-scroll{max-height:520px}
 body[data-view="debug"] .debug-gate-card{height:250px;min-height:250px;display:flex;align-items:center;justify-content:center}
 body[data-view="debug"] .debug-guide-card{height:200px!important;min-height:200px!important;overflow:hidden}
 body[data-view="debug"] .debug-guide-card:has(details[open]){height:auto!important;min-height:200px!important;overflow:visible}
-.accounts-main-card{position:relative;padding-bottom:64px;height:450px}
-.accounts-main-card .accounts-table-scroll{height:260px;max-height:260px;overflow-y:auto;overflow-x:hidden;border-radius:8px;scrollbar-width:none;-ms-overflow-style:none;scrollbar-gutter:auto}
+.accounts-main-card{position:relative;padding-bottom:64px;height:800px}
+.accounts-main-card .accounts-table-scroll{height:610px;max-height:610px;overflow-y:auto;overflow-x:auto;border-radius:8px;scrollbar-width:none;-ms-overflow-style:none;scrollbar-gutter:auto}
 .accounts-main-card .accounts-table-scroll::-webkit-scrollbar{width:0;height:0;display:none}
+/* Keep utility columns fixed; the name column absorbs wide-screen slack. */
+.accounts-table{width:100%;min-width:698px;max-width:none;table-layout:fixed}
+.accounts-table th:nth-child(1),.accounts-table td:nth-child(1){width:32px}
+.accounts-table th:nth-child(2),.accounts-table td:nth-child(2){width:auto;min-width:216px}
+.accounts-table th:nth-child(3),.accounts-table td:nth-child(3){width:146px}
+.accounts-table th:nth-child(4),.accounts-table td:nth-child(4){width:80px}
+.accounts-table th:nth-child(5),.accounts-table td:nth-child(5){width:74px}
+.accounts-table th:nth-child(6),.accounts-table td:nth-child(6){width:78px;white-space:nowrap}
+.accounts-table th:nth-child(7),.accounts-table td:nth-child(7){width:72px}
+.accounts-table th,.accounts-table td{padding:7.5px!important;box-sizing:border-box}
+.accounts-table tr[id^="atok-"]>td{padding:.7rem .9rem!important}
+.acct-token-control{display:grid;grid-template-rows:auto auto;gap:4px;width:131px;min-width:131px;box-sizing:border-box}
+.acct-token-primary,.acct-token-secondary{display:grid;gap:4px;align-items:center;box-sizing:border-box}
+.acct-token-primary{grid-template-columns:minmax(0,1fr)}
+.acct-token-secondary{grid-template-columns:repeat(3,minmax(0,1fr))}
+.acct-token-control button{box-sizing:border-box;width:100%;min-width:0;font-size:.68rem;padding:3px 2px;white-space:nowrap}
+.acct-token-status{display:inline-flex;width:100%;box-sizing:border-box;justify-content:center;align-items:center}
+.acct-token-remove{background:rgba(239,68,68,.18);color:#fecaca;border:1px solid rgba(239,68,68,.35)}
+.acct-token-update{background:rgba(255,255,255,.12);color:var(--strong);border:1px solid var(--chip-border);box-shadow:none}
+.acct-token-update:hover{background:rgba(255,255,255,.2);color:var(--text);box-shadow:0 0 12px rgba(96,242,255,.14)}
+.accounts-table .acct-actions-head,.accounts-table .acct-actions-cell{position:sticky;right:0;min-width:72px;width:72px;z-index:6;background:var(--card);box-shadow:-8px 0 14px rgba(0,0,0,.2)}
+.accounts-table .acct-actions-head{z-index:8}
+.accounts-table .acct-actions-cell{background:linear-gradient(180deg,rgba(13,19,45,.96),rgba(7,10,24,.96))}
+.acct-delete-btn{width:57px!important;box-sizing:border-box;color:#fff!important;border:1px solid rgba(255,255,255,.26)!important;box-shadow:0 5px 14px rgba(239,68,68,.24)!important}
+.cookie-meta{display:grid;grid-template-rows:auto auto;gap:4px;width:65px;justify-items:stretch;white-space:nowrap}
+.cookie-status-tag,.cookie-refresh-btn{box-sizing:border-box;width:65px}
+.media-status-list{display:flex;gap:.35rem;flex-wrap:wrap;width:59px}
+.media-status-list .media-status-tag{width:59px;box-sizing:border-box}
 .accounts-main-card .accounts-table thead th{position:sticky;top:0;z-index:5;background:var(--card)}
 body[data-view="accounts"] .view-accounts{animation:none!important}
 .view-accounts + .view-accounts,.view-settings + .view-settings,.view-debug + .view-debug{margin-top:0}
-#status-card{position:relative!important;top:auto!important;margin-top:0!important;margin-bottom:10px!important;transform:none!important;animation:none!important;height:330px}
 .view-settings{height:90px;min-height:90px}
 .view-settings.details-open,.view-settings:has(details[open]){height:auto;min-height:90px;overflow:visible}
 .view-debug{height:90px;min-height:90px}
@@ -150,12 +191,13 @@ body[data-theme="light"] .tone-select{color:#1c1c1e;background-color:rgba(255,25
 body[data-theme="light"] .tone-select option{background:#fff;color:#1c1c1e}
 """ + _GLASS_SELECT_CSS + _NO_SPIN_CSS + """
 .view-settings .tone-select+.glass-select{margin-left:auto}
-.runtime-settings-grid{display:grid!important;grid-template-columns:repeat(3,minmax(180px,1fr))!important;gap:1rem 1.1rem!important;margin-top:.75rem!important;align-items:start!important;max-width:1080px!important}
+.runtime-settings-grid{display:grid!important;grid-template-columns:repeat(auto-fit,minmax(200px,1fr))!important;gap:1rem 1.1rem!important;margin-top:.75rem!important;align-items:start!important;max-width:1180px!important}
 .runtime-settings-grid>div{display:grid!important;gap:1rem!important}
-.runtime-settings-grid .runtime-field-label{display:flex!important;flex-direction:column!important;gap:.55rem!important;min-width:0!important;font-size:.95rem!important;font-weight:800!important;color:var(--strong)!important}
+.runtime-settings-grid .runtime-field-label{position:relative!important;display:flex!important;flex-direction:column!important;gap:.55rem!important;min-width:0!important;font-size:.95rem!important;font-weight:800!important;color:var(--strong)!important}
 .runtime-settings-grid input{min-height:44px!important;margin-top:0!important;padding:11px 13px!important;border-radius:10px!important;font-size:.95rem!important;font-weight:700!important;background:var(--inner)!important;border:1px solid var(--inner-border)!important;color:var(--strong)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 8px 22px rgba(0,0,0,.12)!important}
 .runtime-settings-grid .glass-select{display:block!important;width:100%!important;min-width:0!important;margin-left:0!important}
 .runtime-settings-grid .glass-select-trigger{min-height:44px!important;padding:11px 36px 11px 13px!important;border-radius:10px!important;font-size:.95rem!important;font-weight:700!important}
+""" + _FIELD_TIP_CSS + """
 .ports-logs-card{overflow:visible!important;z-index:10}
 .ports-logs-card:has(.glass-select.open){z-index:3000!important}
 .ports-logs-card label{font-size:.875rem!important;font-weight:800!important;color:var(--strong)!important}
@@ -323,7 +365,7 @@ body[data-lang="en"] .brand .tenant-pill{font-size:.62rem;padding:.16rem .48rem;
 body[data-lang="en"] .btn-ghost{font-size:.72rem!important}
 body[data-lang="en"] .acct-token-actions{width:auto!important;min-width:148px}
 body[data-lang="en"] .acct-token-actions button{width:auto!important;min-width:46px;padding:3px 6px!important;font-size:.68rem!important}
-body[data-lang="en"] .cookie-refresh-btn{width:auto!important;min-width:46px;font-size:.68rem!important}
+body[data-lang="en"] .cookie-refresh-btn{width:65px!important;min-width:65px;font-size:.68rem!important}
 body[data-lang="en"] .admin-tbl button{font-size:.68rem!important;padding:3px 7px!important;white-space:nowrap}
 .page-size-unit:empty{display:none}
 body[data-lang="en"] .page-size-unit{font-size:.72rem}
@@ -340,7 +382,7 @@ body[data-view="home"] .view-home,body[data-view="users"] .view-users,body[data-
 @keyframes toneShareBreath{0%,100%{opacity:.82;filter:saturate(1)}50%{opacity:1;filter:saturate(1.35) brightness(1.12)}}
 @keyframes loginSpin{to{transform:translate(-50%,-50%) rotate(360deg)}}
 @keyframes loginPulse{50%{scale:1.08;opacity:.42}}
-@media(max-width:680px){.sidebar{width:60px;padding:1rem .4rem}.brand,.nav-item span:not(.nav-ico){display:none}.nav-item{justify-content:center}.main{padding:1rem}.ports-logs-card>div{grid-template-columns:1fr!important}}
+@media(max-width:680px){.sidebar{width:60px;padding:1rem .4rem}.brand,.nav-item span:not(.nav-ico){display:none}.nav-item{justify-content:center}.main{padding:1rem}.ports-logs-card>div,.dash-overview-donuts{grid-template-columns:1fr!important}}
 
 /* iOS26 light — component overrides (system blue, soft glass, no neon rainbow) */
 body[data-theme="light"]{scrollbar-color:rgba(0,122,255,.28) rgba(120,120,128,.08)}
@@ -361,7 +403,7 @@ body[data-theme="light"] .icon-btn{background:linear-gradient(135deg,rgba(255,25
 body[data-theme="light"] .switch input:checked+.slider{background:linear-gradient(135deg,#0a84ff,#007aff);border-color:transparent;box-shadow:0 0 10px rgba(0,122,255,.28),inset 0 1px 2px rgba(255,255,255,.35)}
 body[data-theme="light"] .glass-select-trigger{color:#1c1c1e!important;background:linear-gradient(135deg,rgba(255,255,255,.88),rgba(0,122,255,.06))!important;border-color:rgba(60,60,67,.14)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.92),0 4px 12px rgba(0,0,0,.04)!important}
 body[data-theme="light"] .glass-select.open .glass-select-trigger{border-color:rgba(0,122,255,.4)!important;box-shadow:0 0 0 3px rgba(0,122,255,.12),0 4px 14px rgba(0,0,0,.05)!important}
-body[data-theme="light"] .glass-select-menu{background:linear-gradient(180deg,rgba(255,255,255,.94),rgba(242,243,247,.9));border-color:rgba(60,60,67,.12);box-shadow:0 16px 36px rgba(0,0,0,.1),inset 0 1px 0 rgba(255,255,255,.92);backdrop-filter:blur(28px) saturate(160%)}
+body[data-theme="light"] .glass-select-menu{background:linear-gradient(180deg,rgba(255,255,255,.98),rgba(242,243,247,.97));border-color:rgba(60,60,67,.12);box-shadow:0 16px 36px rgba(0,0,0,.1),inset 0 1px 0 rgba(255,255,255,.92);backdrop-filter:blur(28px) saturate(160%)}
 body[data-theme="light"] .glass-select-menu:before{background:linear-gradient(90deg,rgba(0,122,255,.35),rgba(88,86,214,.25),rgba(0,122,255,.35));animation:none;opacity:.45}
 body[data-theme="light"] .glass-select-option{color:#6b6b70!important}
 body[data-theme="light"] .glass-select-option:hover{background:rgba(0,122,255,.08)!important;color:#1c1c1e!important}
@@ -369,4 +411,4 @@ body[data-theme="light"] .glass-select-option.active{color:#007aff!important;bac
 body[data-theme="light"] .role-toggle .role-u{color:#8e8e93}
 body[data-theme="light"] .role-toggle:has(input:checked) .role-u{color:#007aff}
 body[data-theme="light"] .data-globe .orbit:after{background:#007aff;box-shadow:0 0 8px rgba(0,122,255,.45)}
-"""
+""" + _DONUT_SPIN_CSS + _STILL_DECOR_CSS

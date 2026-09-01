@@ -6,11 +6,14 @@ from .template_admin_dashboard import _ADMIN_DASHBOARD_JS
 from .template_admin_dialogs import _ADMIN_DIALOGS_JS
 from .template_admin_i18n import _ADMIN_I18N_JS
 from .template_admin_keys import _ADMIN_KEYS_JS
+from .template_admin_modeltest import _ADMIN_MODELTEST_JS
+from .template_admin_sessions import _ADMIN_SESSIONS_JS
 from .template_admin_settings_js import _ADMIN_SETTINGS_JS
 from .template_admin_tables import _ADMIN_TABLES_JS
 from .template_admin_css import _ADMIN_CSS
 from .template_admin_shell import _ADMIN_SHELL_HTML
 from .template_assets import _GLASS_SELECT_JS
+from .template_pkce import _ADMIN_PKCE_JS
 
 _ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -69,6 +72,10 @@ function applyLang(){
   try{if(typeof renderCapture==='function'&&window.__capItems)renderCapture(window.__capItems)}catch(e){}
   try{if(typeof renderMediaProxyEvents==='function'&&window.__mediaProxyEvents)renderMediaProxyEvents(window.__mediaProxyEvents)}catch(e){}
   try{if(typeof renderStatus==='function')renderStatus()}catch(e){}
+  try{if(typeof renderSessions==='function'&&__sessions)renderSessions()}catch(e){}
+  try{if(typeof renderModelTest==='function')renderModelTest()}catch(e){}
+  try{if(typeof renderCacheStats==='function')renderCacheStats()}catch(e){}
+  try{if(typeof renderUsageOverview==='function')renderUsageOverview()}catch(e){}
 }
 applyLang();
 
@@ -195,7 +202,7 @@ function switchView(view){
   localStorage.setItem('admin_view',view);
   document.querySelectorAll('.nav-item').forEach(el=>{el.classList.toggle('active',el.getAttribute('data-nav')===view)});
   const vt=document.getElementById('view-title');
-  const map={home:'nav_home',users:'nav_users',accounts:'nav_accounts',settings:'nav_settings',debug:'nav_debug'};
+  const map={home:'nav_home',users:'nav_users',accounts:'nav_accounts',sessions:'nav_sessions',settings:'nav_settings',debug:'nav_debug'};
   const vk=map[view]||'nav_home';
   if(vt){vt.setAttribute('data-i18n',vk);vt.textContent=(i18n[lang]&&i18n[lang][vk])||vt.textContent}
   loadViewData(view);
@@ -204,10 +211,15 @@ function loadViewData(view){
   if(view==='home'){loadSummary();loadTrend();loadStats();return}
   if(view==='accounts'){loadAccounts();loadStats();return}
   if(view==='users'){loadKeys();loadAccounts();return}
+  if(view==='sessions'){loadSessions();return}
   if(view==='settings'){loadTone();loadRuntimeSettings();loadToolPrompt();loadSystemPrompt();return}
-  if(view==='debug'){loadCaptureToggle();loadRuntimeSettings();loadCallLog();loadMediaProxyEvents();loadCapture()}
+  if(view==='debug'){loadProtocolProfileAccounts();loadCaptureToggle();loadRuntimeSettings();loadModelTest();loadCallLog();loadMediaProxyEvents();loadCapture()}
 }
-switchView(localStorage.getItem('admin_view')||'home');
+// The first switchView() call lives at the very bottom of this script, after the
+// module blocks: view loaders read module-level `let`s (__accounts, __keys,
+// __sessions), and calling one before those declarations are evaluated throws a
+// TDZ ReferenceError that an async loader swallows into a silent rejection --
+// the view then never renders on a reload.
 
 function showInlineLogin(){location.replace('/admin')}
 function toggleInlineLang(){localStorage.setItem('lang',localStorage.getItem('lang')==='zh'?'en':'zh');showInlineLogin()}
@@ -408,8 +420,22 @@ function kpiCard(label,val,color){
     +'<div style="font-size:1.5rem;font-weight:700;color:'+color+'">'+val+'</div>'
     +'<div style="font-size:.72rem;color:var(--muted);margin-top:.15rem">'+label+'</div></div>';
 }
-function donut(parts,centerLabel,centerVal){
+function donut(parts,centerLabel,centerVal,centerUnit){
   // parts: [{value,color,label}] — render a glassy SVG ring + legend.
+  //
+  // The rings used to spin and breathe via SMIL: each segment carried three
+  // indefinitely-repeating <animate> elements, on stroke-dashoffset, opacity and
+  // stroke-width. On an idle dashboard that alone was 105% of a CPU core in
+  // style recalculation (~1460 recalcs/s), because SMIL drives the same
+  // per-frame restyle as CSS but sits outside it — `animation:none` cannot
+  // reach it and `document.getAnimations()` does not report it. `stroke-width`
+  // made it worse by invalidating layout each frame too.
+  //
+  // The spin is back, rebuilt two ways: one CSS rotation of a wrapper <g>
+  // instead of nine SMIL animations (0% recalc, down from 82%), stepped rather
+  // than continuous (see .donut-spin for why steps, and the measurements). The
+  // opacity/stroke-width breathing is not restored — it was the part nobody
+  // asked for, and static values near the old midpoints keep the glow.
   const total=parts.reduce((s,p)=>s+p.value,0);
   const R=46,C=2*Math.PI*R;let off=0;
   const uid='d'+Math.random().toString(36).slice(2,8);
@@ -432,19 +458,24 @@ function donut(parts,centerLabel,centerVal){
       const ringCap=8.25,outerCap=10,innerCap=1.3;
       const ringLen=Math.max(0.01,len-ringCap*2),outerDrawLen=Math.max(0.01,outerLen-outerCap*2),innerDrawLen=Math.max(0.01,innerLen-innerCap*2);
       const ringStart=off+ringCap,outerStart=outerOff+outerCap,innerStart=innerOff+innerCap;
-      ring+='<circle cx="60" cy="60" r="'+R+'" fill="none" stroke="'+p.color+'" stroke-width="15" stroke-linecap="round" stroke-dasharray="'+ringLen+' '+(C-ringLen)+'" stroke-dashoffset="'+(-ringStart)+'" transform="rotate(-90 60 60)" filter="url(#'+uid+'sh)" opacity="0.96"><animate attributeName="stroke-dasharray" from="0 '+C+'" to="'+ringLen+' '+(C-ringLen)+'" dur="0.55s" fill="freeze"/><animate attributeName="stroke-dashoffset" values="'+(-ringStart)+';'+(-ringStart-C)+'" dur="5.5s" repeatCount="indefinite"/><animate attributeName="opacity" values="0.84;1;0.84" dur="5.5s" repeatCount="indefinite"/><animate attributeName="stroke-width" values="14;16.5;14" dur="5.5s" repeatCount="indefinite"/></circle>';
-      halo+='<circle cx="60" cy="60" r="'+outerR+'" fill="none" stroke="'+p.color+'" stroke-width="14" stroke-linecap="round" stroke-dasharray="'+outerDrawLen+' '+(outerC-outerDrawLen)+'" stroke-dashoffset="'+(-outerStart)+'" transform="rotate(-90 60 60)" filter="url(#'+uid+'halo)" opacity="0.2"><animate attributeName="stroke-dashoffset" values="'+(-outerStart)+';'+(-outerStart-outerC)+'" dur="5.5s" repeatCount="indefinite"/><animate attributeName="opacity" values="0.16;0.62;0.16" dur="5.5s" repeatCount="indefinite"/><animate attributeName="stroke-width" values="9;20;9" dur="5.5s" repeatCount="indefinite"/></circle>';
-      halo+='<circle cx="60" cy="60" r="'+innerR+'" fill="none" stroke="'+p.color+'" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="'+innerDrawLen+' '+(innerC-innerDrawLen)+'" stroke-dashoffset="'+(-innerStart)+'" transform="rotate(-90 60 60)" filter="url(#'+uid+'halo)" opacity="0.16"><animate attributeName="stroke-dashoffset" values="'+(-innerStart)+';'+(-innerStart-innerC)+'" dur="5.5s" repeatCount="indefinite"/><animate attributeName="opacity" values="0.08;0.28;0.08" dur="5.5s" repeatCount="indefinite"/><animate attributeName="stroke-width" values="1;2.6;1" dur="5.5s" repeatCount="indefinite"/></circle>';
+      ring+='<circle cx="60" cy="60" r="'+R+'" fill="none" stroke="'+p.color+'" stroke-width="15" stroke-linecap="round" stroke-dasharray="'+ringLen+' '+(C-ringLen)+'" stroke-dashoffset="'+(-ringStart)+'" transform="rotate(-90 60 60)" filter="url(#'+uid+'sh)" opacity="0.96"><animate attributeName="stroke-dasharray" from="0 '+C+'" to="'+ringLen+' '+(C-ringLen)+'" dur="0.55s" fill="freeze"/></circle>';
+      halo+='<circle cx="60" cy="60" r="'+outerR+'" fill="none" stroke="'+p.color+'" stroke-width="14" stroke-linecap="round" stroke-dasharray="'+outerDrawLen+' '+(outerC-outerDrawLen)+'" stroke-dashoffset="'+(-outerStart)+'" transform="rotate(-90 60 60)" filter="url(#'+uid+'halo)" opacity="0.4"/>';
+      halo+='<circle cx="60" cy="60" r="'+innerR+'" fill="none" stroke="'+p.color+'" stroke-width="1.8" stroke-linecap="round" stroke-dasharray="'+innerDrawLen+' '+(innerC-innerDrawLen)+'" stroke-dashoffset="'+(-innerStart)+'" transform="rotate(-90 60 60)" filter="url(#'+uid+'halo)" opacity="0.18"/>';
       off+=len;
     });
   }
-  // glossy highlight arc over the top of the ring for a glass sheen
+  // glossy highlight arc over the top of the ring for a glass sheen — stays put,
+  // it reads as a fixed reflection on the glass rather than part of the ring.
   const sheen='<circle cx="60" cy="60" r="'+(R+3.5)+'" fill="none" stroke="url(#'+uid+'gl)" stroke-width="4" stroke-linecap="round" stroke-dasharray="'+(C*0.4)+' '+C+'" transform="rotate(-108 60 60)" pointer-events="none"/>';
-  let svg='<svg viewBox="0 0 120 120" style="width:120px;height:120px;flex-shrink:0;overflow:visible;filter:drop-shadow(0 0 14px rgba(96,242,255,.38)) drop-shadow(0 0 28px rgba(140,107,255,.28)) drop-shadow(0 0 42px rgba(255,94,219,.16))">'+defs+halo+ring+sheen
-    +'<text x="60" y="66" text-anchor="middle" fill="var(--strong)" font-size="24" font-weight="700">'+centerVal+'</text></svg>';
-  let legend='<div style="display:flex;flex-direction:column;gap:.35rem;justify-content:center">';
+  // The rings spin as one group (see .donut-spin) instead of each arc animating
+  // its own stroke-dashoffset. Same look — every arc moved at the same speed
+  // through a full circumference, which is a rotation — at a fraction of the cost.
+  const unit=centerUnit?'<tspan dx=".18em" font-size="10" font-weight="600">'+esc(centerUnit)+'</tspan>':'';
+  let svg='<svg viewBox="0 0 120 120" style="width:120px;height:120px;flex-shrink:0;overflow:visible;filter:drop-shadow(0 0 14px rgba(96,242,255,.38)) drop-shadow(0 0 28px rgba(140,107,255,.28)) drop-shadow(0 0 42px rgba(255,94,219,.16))">'+defs+'<g class="donut-spin">'+halo+ring+'</g>'+sheen
+    +'<text class="donut-center-label" x="60" y="66" text-anchor="middle" fill="var(--strong)" font-size="24" font-weight="700">'+centerVal+unit+'</text></svg>';
+  let legend='<div class="donut-legend-scroll"><div class="donut-legend-items" style="display:flex;flex-direction:column;gap:.35rem;justify-content:center">';
   parts.forEach(p=>{legend+='<div style="display:flex;align-items:center;gap:.4rem;font-size:.78rem;color:var(--muted)"><span style="width:10px;height:10px;border-radius:3px;background:'+p.color+';display:inline-block;box-shadow:0 1px 2px rgba(0,0,0,.25),inset 0 1px 0 rgba(255,255,255,.4)"></span>'+p.label+' <b style="color:var(--strong)">'+p.value+'</b></div>'});
-  legend+='</div>';
+  legend+='</div></div>';
   return '<div style="display:flex;gap:.8rem;align-items:center">'+svg+legend+'</div>';
 }
 function renderDashboard(){
@@ -480,6 +511,9 @@ let __runtimeSettings={};
 """ + _ADMIN_ACCOUNTS_JS + """
 """ + _ADMIN_COPY_JS + """
 """ + _ADMIN_KEYS_JS + """
+""" + _ADMIN_SESSIONS_JS + """
+""" + _ADMIN_MODELTEST_JS + """
+""" + _ADMIN_PKCE_JS + """
 function initDetailsCards(){
   document.querySelectorAll('.view-settings,.view-debug').forEach(card=>{
     const details=[...card.querySelectorAll('details')];
@@ -501,6 +535,7 @@ function updateAccountCountdownText(){
 initDetailsCards();
 loadStatus();
 initGlassSelect(document);
+switchView(localStorage.getItem('admin_view')||'home');
 setInterval(loadStatus,60000);
 setInterval(()=>{if(document.body.dataset.view==='debug')loadCallLog()},5000);
 setInterval(()=>{if(document.body.dataset.view==='debug')loadMediaProxyEvents()},5000);
@@ -569,8 +604,10 @@ document.addEventListener('click',e=>{
 });
 function _toneOptsSource(){
   // Debug view loads runtime-settings (not /admin/tone), so prefer its tone_options;
-  // fall back to the picker's __toneOpts, then empty.
-  return (window.__runtimeSettings&&window.__runtimeSettings.tone_options)||window.__toneOpts||[];
+  // fall back to the picker's __toneOpts, then empty. __runtimeSettings is a
+  // script-scope `let`, NOT window.__runtimeSettings — reading it off window
+  // always missed, which left the debug view with unlabelled raw tone values.
+  return (__runtimeSettings&&__runtimeSettings.tone_options)||window.__toneOpts||[];
 }
 function _toneLabel(v){
   const o=_toneOptsSource().find(x=>x.value===v);
@@ -628,6 +665,29 @@ function renderCallLog(logs){
       const toneBadge=l.tone?'<span class="tone-badge" title="'+esc(l.tone)+'">'+esc(_toneLabel(l.tone))+'</span>':'';
       const tr=l.tool_calls_result&&l.tool_calls_result.length?
         '<span style="color:#22c55e">'+t('tool_calls_parsed')+': '+l.tool_calls_result.join(', ')+'</span>':'';
+      // Tools were declared but this tone is measured to ignore the contract, and
+      // none came back: the one case where an ordinary-looking 200 was actually a
+      // degraded turn. Say so here, where a "it's broken" report gets diagnosed.
+      // "flaky" gets its own line because the follow-up differs -- retry, not
+      // switch models (Consumer mode smart complied 1 turn in 6).
+      // Not shown for a declined or a routed turn: the measured native status did
+      // not decide either outcome, and tcSkip/tcPlan below already name what did.
+      // The raw status stays in the copyable record either way.
+      const tcNone=!(l.tool_calls_result&&l.tool_calls_result.length)&&!l.tool_declined&&l.tool_planning!=='router'&&(l.tool_calling==='unsupported'||l.tool_calling==='flaky')?
+        '<span style="color:#f59e0b">'+t(l.tool_calling==='flaky'?'tool_calling_flaky':'tool_calling_unsupported')+'</span>':'';
+      // A call was produced and then thrown away for not matching the client's own
+      // tool definition. Red, not orange: unlike the note above this is a concrete
+      // defect in one turn, and the reason names the offending argument.
+      const tcBad=l.tool_calls_rejected&&l.tool_calls_rejected.length?
+        '<span style="color:#ef4444">'+t('tool_calls_rejected')+': '+esc(l.tool_calls_rejected.join(' / '))+'</span>':'';
+      // The model said outright that no tool was needed, which is why this turn has
+      // no tool_calls. Distinguishes a correct no-action turn from a broken one.
+      const tcSkip=l.tool_declined?
+        '<span style="color:var(--faint)">'+t('tool_declined')+'</span>':'';
+      // Which injection shape planned this turn. Only shown when it was the router,
+      // because that is the one that costs an extra upstream turn.
+      const tcPlan=l.tool_planning==='router'?
+        '<span style="color:var(--faint)">'+t('tool_planning_label')+': router</span>':'';
       const fullKey='f'+i;
       // Full single-record text: call info + repr + text
       const fullParts=[];
@@ -637,6 +697,10 @@ function renderCallLog(logs){
       fullParts.push('mode: '+(l.stream?'stream':'sync'));
       fullParts.push('tools: '+tc);
       if(l.tool_calls_result&&l.tool_calls_result.length)fullParts.push('tool_calls_result: '+l.tool_calls_result.join(', '));
+      if(l.tool_calling)fullParts.push('tool_calling: '+l.tool_calling);
+      if(l.tool_calls_rejected&&l.tool_calls_rejected.length)fullParts.push('tool_calls_rejected: '+l.tool_calls_rejected.join(' / '));
+      if(l.tool_declined)fullParts.push('tool_declined: yes');
+      if(l.tool_planning)fullParts.push('tool_planning: '+l.tool_planning);
       if(l.response_len!=null)fullParts.push('resp: '+l.response_len+' chars');
       if(l.response_repr!=null)fullParts.push('repr:\\n'+l.response_repr);
       if(l.response_text!=null)fullParts.push('text:\\n'+l.response_text);
@@ -649,6 +713,10 @@ function renderCallLog(logs){
         '<div style="color:var(--strong);margin-top:2px">tools: <span style="color:#38bdf8">'+tc+'</span></div>'+
         (l.incremental!=null?'<div style="color:var(--faint);margin-top:2px">incremental: <span style="color:'+(l.incremental?'#22c55e':'#f59e0b')+'">'+(l.incremental?'yes':'no')+'</span> &nbsp; turn: '+(l.turn_count==null?'-':l.turn_count)+'</div>':'')+
         (tr?'<div style="margin-top:2px">'+tr+'</div>':'')+
+        (tcNone?'<div style="margin-top:2px">'+tcNone+'</div>':'')+
+        (tcBad?'<div style="margin-top:2px">'+tcBad+'</div>':'')+
+        (tcSkip?'<div style="margin-top:2px">'+tcSkip+'</div>':'')+
+        (tcPlan?'<div style="margin-top:2px">'+tcPlan+'</div>':'')+
         (l.response_len?'<div style="color:var(--faint);margin-top:2px">resp: '+l.response_len+' chars</div>':'')+
         rawView+
         '</div>';
@@ -681,7 +749,11 @@ function renderCapture(ps){
     let html='';
     for(let i=0;i<ps.length;i++){
       const p=ps[i];
-      const opts=(p.optionsSets||[]).join(', ');
+      // Not necessarily a list: the capture endpoint takes whatever the userscript
+      // pushed, and .join on a string/object threw inside loadCapture's catch --
+      // the whole panel went blank with nothing logged, and it stayed blank because
+      // __capVersion had already advanced so every later poll answered "unchanged".
+      const opts=Array.isArray(p.optionsSets)?p.optionsSets.join(', '):formatRawText(p.optionsSets);
       const gpt=p.gptId&&Object.keys(p.gptId).length?JSON.stringify(p.gptId):'-';
       const capKey='c'+i;
       window.__capTexts[capKey]=JSON.stringify(p);

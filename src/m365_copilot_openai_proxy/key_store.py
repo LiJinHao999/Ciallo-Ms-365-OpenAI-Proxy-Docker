@@ -53,8 +53,18 @@ class ApiKey:
     model_alias: str = ""
     time_zone: str = ""
     run_permission: str = ""  # "" = inherit global, "read_only" or "full"
+    # How this user's tools-bearing turns are planned. "" => inherit the global
+    # setting; "auto"/"native"/"router"/"studio" override it. Per-user because whether the
+    # inline contract is honoured depends on the tone this key is bound to, and
+    # the extra router turn is spent out of this key's own account quota.
+    tool_planning_mode: str = ""
     # Per-user chat WebSocket idle timeout (minutes). 0 => inherit the global setting.
     ws_idle_timeout_minutes: int = 0
+    # Per-user request ceiling (requests/minute) for /v1/ endpoints. 0 => inherit
+    # the global setting; a negative value disables limiting for this key alone.
+    # M365 publishes no rate-limit headers, so this is a self-imposed valve that
+    # stops one shared key from exhausting the account everyone else is on.
+    rate_limit_rpm: int = 0
     # Per-user media proxy suffix override. Empty list => inherit the global
     # runtime setting; a non-empty list fully replaces the global suffixes for
     # this user's signed media URLs.
@@ -144,7 +154,9 @@ class KeyStore:
                     model_alias=raw.get("model_alias", ""),
                     time_zone=raw.get("time_zone", ""),
                     run_permission=raw.get("run_permission", ""),
+                    tool_planning_mode=raw.get("tool_planning_mode", ""),
                     ws_idle_timeout_minutes=int(raw.get("ws_idle_timeout_minutes", 0) or 0),
+                    rate_limit_rpm=int(raw.get("rate_limit_rpm", 0) or 0),
                     media_proxy_suffixes=list(raw.get("media_proxy_suffixes", []) or []),
                     username=raw.get("username", ""),
                     password=raw.get("password", ""),
@@ -227,7 +239,7 @@ class KeyStore:
 
     def update(self, key_id: str, **fields: Any) -> ApiKey | None:
         """Update mutable fields. Pass password=<str> to (re)set the login password."""
-        allowed = {"name", "account_id", "enabled", "tone", "tool_prompt", "system_prompt", "model_alias", "time_zone", "run_permission", "ws_idle_timeout_minutes", "media_proxy_suffixes", "username", "role", "displaced_at"}
+        allowed = {"name", "account_id", "enabled", "tone", "tool_prompt", "system_prompt", "model_alias", "time_zone", "run_permission", "tool_planning_mode", "ws_idle_timeout_minutes", "rate_limit_rpm", "media_proxy_suffixes", "username", "role", "displaced_at"}
         with self._lock:
             k = self._keys.get(key_id)
             if k is None:

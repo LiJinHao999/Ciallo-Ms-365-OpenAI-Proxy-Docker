@@ -83,3 +83,70 @@ def test_recovery_backoff_blocks_immediate_retry(tmp_path):
     acct = _acct(cookie_valid=False, cookies=[{"name": "ESTSAUTH", "value": "x"}])
     sched._recovery_attempted_at[acct.id] = time.time()
     assert sched._recovery_due(acct) is False
+
+
+# ------------------------------------------- _consumer_keepalive_due (Camoufox re-mint)
+
+def _consumer(**kw) -> Account:
+    """A consumer account whose credential was captured `age` seconds ago."""
+    age = kw.pop("age", 0.0)
+    base = dict(
+        provider="consumer",
+        consumer_token="tok",
+        consumer_account_id="home:account-a",
+        consumer_updated_at=time.time() - age,
+    )
+    base.update(kw)
+    return _acct(**base)
+
+
+def test_consumer_keepalive_due_once_the_credential_is_stale(tmp_path):
+    sched = _make_scheduler(tmp_path)
+    acct = _consumer(age=rs._CONSUMER_KEEPALIVE_AGE_SECONDS + 60)
+    assert sched._consumer_keepalive_due(acct) is True
+
+
+def test_consumer_keepalive_not_due_while_the_credential_is_fresh(tmp_path):
+    sched = _make_scheduler(tmp_path)
+    acct = _consumer(age=60)
+    assert sched._consumer_keepalive_due(acct) is False
+
+
+def test_consumer_keepalive_skips_m365_accounts(tmp_path):
+    """The age predicate must not touch M365 accounts, which have a real exp."""
+    sched = _make_scheduler(tmp_path)
+    acct = _acct(provider="m365", consumer_token="tok", consumer_updated_at=0.0)
+    assert sched._consumer_keepalive_due(acct) is False
+
+
+def test_consumer_keepalive_not_due_without_a_captured_credential(tmp_path):
+    """No token means no MSA session to renew from -- the first push must be human."""
+    sched = _make_scheduler(tmp_path)
+    acct = _consumer(consumer_token="", age=99_999)
+    assert sched._consumer_keepalive_due(acct) is False
+
+
+def test_consumer_keepalive_not_due_without_a_pinned_microsoft_subject(tmp_path):
+    sched = _make_scheduler(tmp_path)
+    acct = _consumer(
+        consumer_account_id="",
+        age=rs._CONSUMER_KEEPALIVE_AGE_SECONDS + 60,
+    )
+    assert sched._consumer_keepalive_due(acct) is False
+
+
+def test_consumer_keepalive_backoff_blocks_immediate_retry(tmp_path):
+    sched = _make_scheduler(tmp_path)
+    acct = _consumer(age=rs._CONSUMER_KEEPALIVE_AGE_SECONDS + 60)
+    sched._consumer_attempted_at[acct.id] = time.time()
+    assert sched._consumer_keepalive_due(acct) is False
+
+
+def test_consumer_profile_dir_is_separate_from_the_chromium_one(tmp_path):
+    """Firefox profiles are isolated by both proxy account and MSAL subject."""
+    sched = _make_scheduler(tmp_path)
+    account_a = sched._consumer_profile_dir("acct1", "home:account-a")
+    account_b = sched._consumer_profile_dir("acct1", "home:account-b")
+    assert account_a.parent == tmp_path
+    assert account_a.name.startswith("acct1-consumer-")
+    assert account_a != account_b

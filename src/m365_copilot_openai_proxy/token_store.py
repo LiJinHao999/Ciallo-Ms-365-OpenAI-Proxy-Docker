@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .atomic_write import write_text_atomic
+
 SUBSTRATE_AUDIENCE_PREFIX = "https://substrate.office.com/"
 
 # Token storage paths — initialized lazily via init_token_dir() or from TOKEN_DIR env var
@@ -39,13 +41,30 @@ def init_token_dir(token_dir: str) -> None:
 
 
 def decode_jwt_payload(token: str) -> dict[str, Any]:
-    payload = token.split(".")[1]
+    # Reject a non-JWT up front. Indexing [1] on the split raised IndexError for
+    # an empty or malformed token, which every caller surfaced verbatim as the
+    # opaque "list index out of range" -- reported from /healthz on a deployment
+    # whose global token is unset because each account carries its own.
+    parts = token.split(".")
+    if len(parts) < 2 or not parts[1]:
+        raise ValueError("not a JWT (expected header.payload.signature)")
+    payload = parts[1]
     payload += "=" * (-len(payload) % 4)
     return json.loads(base64.urlsafe_b64decode(payload))
 
 
 def is_substrate_token_claims(claims: dict[str, Any]) -> bool:
     return str(claims.get("aud", "")).startswith(SUBSTRATE_AUDIENCE_PREFIX)
+
+
+def _write_profile_file(path: Path, text: str, *, mode: int | None = None) -> None:
+    """Persist one profile field atomically.
+
+    These are single-value files (token, username, tone, prompts), and a reader
+    treats an empty one as "not set": a torn write of the token file reads back as
+    "no token" and the account stops serving until someone re-pushes one.
+    """
+    write_text_atomic(path, text, mode=mode)
 
 
 class AccessTokenStore:
@@ -63,6 +82,13 @@ class AccessTokenStore:
     def status(self) -> dict[str, Any]:
         token = self.get()
         now = time.time()
+        # An unset global token is the normal state of a multi-account deployment:
+        # every request resolves its token from the account behind the API key, so
+        # nothing populates this one. Say so plainly instead of reporting a decode
+        # failure for a token that was never meant to exist, matching
+        # Account.token_status().
+        if not token:
+            return {"valid": False, "error": "No token", "expires_at": None, "seconds_remaining": 0}
         try:
             claims = decode_jwt_payload(token)
             if not is_substrate_token_claims(claims):
@@ -125,14 +151,7 @@ def read_token() -> str | None:
 
 def write_token(token: str) -> None:
     """Write token to isolated token file on TOKEN_DIR volume."""
-    token_dir = _get_token_dir()
-    token_file = _get_token_file()
-    token_dir.mkdir(parents=True, exist_ok=True)
-    token_file.write_text(token, encoding="utf-8")
-    try:
-        token_file.chmod(0o600)
-    except OSError:
-        pass
+    _write_profile_file(_get_token_file(), token, mode=0o600)
 
 
 def write_username(username: str) -> None:
@@ -140,10 +159,7 @@ def write_username(username: str) -> None:
     # Skip single-character values (avatar initials like "G")
     if len(username.strip()) <= 1:
         return
-    token_dir = _get_token_dir()
-    username_file = token_dir / "username"
-    token_dir.mkdir(parents=True, exist_ok=True)
-    username_file.write_text(username, encoding="utf-8")
+    _write_profile_file(_get_token_dir() / "username", username)
 
 
 def read_username() -> str:
@@ -161,9 +177,7 @@ def write_tone(tone: str) -> None:
     tone = (tone or "").strip()
     if not tone:
         return
-    token_dir = _get_token_dir()
-    token_dir.mkdir(parents=True, exist_ok=True)
-    (token_dir / "tone").write_text(tone, encoding="utf-8")
+    _write_profile_file(_get_token_dir() / "tone", tone)
 
 
 def read_tone() -> str:
@@ -176,9 +190,7 @@ def read_tone() -> str:
 
 def write_tool_prompt(prompt: str) -> None:
     """Persist a user-defined extra tool-call instruction across restarts."""
-    token_dir = _get_token_dir()
-    token_dir.mkdir(parents=True, exist_ok=True)
-    (token_dir / "tool_prompt").write_text(prompt or "", encoding="utf-8")
+    _write_profile_file(_get_token_dir() / "tool_prompt", prompt or "")
 
 
 def read_tool_prompt() -> str:
@@ -191,9 +203,7 @@ def read_tool_prompt() -> str:
 
 def write_system_prompt(prompt: str) -> None:
     """Persist a user-defined system-level tool-call instruction override across restarts."""
-    token_dir = _get_token_dir()
-    token_dir.mkdir(parents=True, exist_ok=True)
-    (token_dir / "system_prompt").write_text(prompt or "", encoding="utf-8")
+    _write_profile_file(_get_token_dir() / "system_prompt", prompt or "")
 
 
 def read_system_prompt() -> str:

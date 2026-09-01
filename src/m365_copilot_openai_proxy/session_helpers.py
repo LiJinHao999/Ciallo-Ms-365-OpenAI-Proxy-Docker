@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import uuid
 from typing import Any
 
 from fastapi import Request
 
+from .history_index import normalize_history
 from .models import AnthropicMessagesRequest, OpenAIChatRequest, OpenAIResponsesRequest
 from .session_store import PersistentSession
 from .translator import flatten_content
@@ -15,6 +17,30 @@ from .translator import flatten_content
 _PERSIST_MODEL_SUFFIX = ":persist"
 _SESSION_ID_HEADER = "x-m365-session-id"
 _RESP_ID_PREFIX = "resp_"
+
+
+def _studio_session_namespace(agent_id: str | None) -> str:
+    """Return an opaque per-Agent namespace for Studio conversations.
+
+    The raw Agent ID is tenant metadata and must not become part of a session
+    key.  Hashing it also makes a rebind land on a fresh conversation instead
+    of accidentally continuing the previous Agent's thread.
+    """
+    normalized = str(agent_id or "").strip()
+    if not normalized:
+        return "studio"
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"studio-{digest}"
+
+
+def _request_tenant(raw_request: Request) -> str:
+    key_obj = getattr(raw_request.state, "api_key_obj", None)
+    account = getattr(raw_request.state, "account", None)
+    key_id = str(getattr(key_obj, "id", "") or "")
+    account_id = str(getattr(account, "id", "") or "")
+    if key_id and account_id:
+        return f"{key_id}:{account_id}"
+    return key_id or account_id or "global"
 
 
 def _detect_conversation_session(request: OpenAIChatRequest) -> tuple[str, str]:
@@ -28,30 +54,80 @@ def _detect_conversation_session(request: OpenAIChatRequest) -> tuple[str, str]:
     return "conv_" + uuid.uuid4().hex[:12], "New conversation"
 
 
-def _encode_responses_session_id(session_key: str) -> str:
+def _encode_responses_session_id(
+    session_key: str,
+    secret: str | None = None,
+    call_ids: set[str] | None = None,
+) -> str:
     """Encode a session key into a Responses `resp_...` id so the client can
     echo it back as `previous_response_id` on the next turn. A random suffix
     keeps each id unique (per OpenAI semantics) while the encoded prefix stays
     stable across the conversation."""
-    token = base64.urlsafe_b64encode(session_key.encode()).decode().rstrip("=")
-    return f"{_RESP_ID_PREFIX}{token}.{uuid.uuid4().hex[:8]}"
+    payload = json.dumps(
+        {"session": session_key, "calls": sorted(call_ids or set())},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    token = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    nonce = uuid.uuid4().hex[:8]
+    if not secret:
+        return f"{_RESP_ID_PREFIX}{token}.{nonce}"
+    signature = hmac.new(
+        secret.encode(), f"{token}.{nonce}".encode(), hashlib.sha256
+    ).hexdigest()[:32]
+    return f"{_RESP_ID_PREFIX}{token}.{nonce}.{signature}"
 
 
-def _decode_responses_session_id(resp_id: str | None) -> str | None:
+def _decode_responses_session_id(
+    resp_id: str | None,
+    secret: str | None = None,
+) -> str | None:
     """Recover the session key previously encoded by
     `_encode_responses_session_id`. Returns None for ids that were not produced
     by us (e.g. plain random ids) so callers fall back to other keys."""
     if not isinstance(resp_id, str) or not resp_id.startswith(_RESP_ID_PREFIX):
         return None
-    token = resp_id[len(_RESP_ID_PREFIX):].split(".", 1)[0]
+    parts = resp_id[len(_RESP_ID_PREFIX):].split(".")
+    token = parts[0] if parts else ""
     if not token:
         return None
+    if secret:
+        if len(parts) != 3:
+            return None
+        expected = hmac.new(
+            secret.encode(), f"{parts[0]}.{parts[1]}".encode(), hashlib.sha256
+        ).hexdigest()[:32]
+        if not hmac.compare_digest(parts[2], expected):
+            return None
     try:
         padded = token + "=" * (-len(token) % 4)
-        decoded = base64.urlsafe_b64decode(padded.encode()).decode()
-    except (ValueError, UnicodeDecodeError):
+        decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
-    return decoded or None
+    if isinstance(decoded, str):
+        return decoded or None
+    session_key = decoded.get("session") if isinstance(decoded, dict) else None
+    return session_key if isinstance(session_key, str) and session_key else None
+
+
+def _decode_responses_response_claims(
+    resp_id: str | None,
+    secret: str,
+) -> tuple[str, set[str]] | None:
+    """Verify an issued Responses id and recover its session + tool call ids."""
+    session_key = _decode_responses_session_id(resp_id, secret)
+    if session_key is None or not isinstance(resp_id, str):
+        return None
+    token = resp_id[len(_RESP_ID_PREFIX):].split(".", 1)[0]
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    calls = decoded.get("calls") if isinstance(decoded, dict) else None
+    if not isinstance(calls, list) or any(not isinstance(item, str) for item in calls):
+        return None
+    return session_key, set(calls)
 
 
 def _responses_session_key(request: OpenAIResponsesRequest) -> str | None:
@@ -67,6 +143,20 @@ def _responses_session_key(request: OpenAIResponsesRequest) -> str | None:
     return None
 
 
+def _responses_store_key(app: Any, session: PersistentSession | None) -> str | None:
+    """Return the actual tenant-qualified store key selected for this request."""
+    if session is None:
+        return None
+    return app.state.session_store.key_for(session)
+
+
+def _responses_store_key_belongs_to_request(
+    raw_request: Request,
+    store_key: str,
+) -> bool:
+    return store_key.startswith(f"{_request_tenant(raw_request)}:")
+
+
 def _messages_session_key(request: AnthropicMessagesRequest) -> str | None:
     for msg in request.messages:
         if msg.role == "user":
@@ -76,27 +166,119 @@ def _messages_session_key(request: AnthropicMessagesRequest) -> str | None:
     return None
 
 
+def _auto_session(
+    app: Any,
+    tenant: str,
+    request: OpenAIChatRequest | AnthropicMessagesRequest,
+) -> PersistentSession:
+    """Pick the session for a conversation the client did not name itself.
+
+    Prefers the exact history index (longest strict prefix of the messages just
+    sent), which keeps two conversations that open with the same text on separate
+    upstream threads instead of resetting each other. A history miss with
+    assistant messages starts a fresh local session: after a restart or a client
+    history rewrite, reusing the first-user-message key could merge two
+    conversations that share an opener. The fresh session has ``turn_count == 0``
+    so the translator sends the complete client history upstream.
+    """
+    index = getattr(app.state, "history_index", None)
+    pairs = normalize_history(request.messages) if index is not None else []
+    if pairs and any(m.role == "assistant" for m in request.messages):
+        matched = index.match(tenant, pairs)
+        if matched is not None:
+            session = app.state.session_store.get_existing(matched)
+            if session is not None:
+                index.record(tenant, pairs, matched)
+                return session
+    sid, _title = _detect_conversation_session(request)
+    # An unnamed first turn is not enough to distinguish a retry from a new
+    # Cherry conversation: both can carry the same templated opener. Reusing a
+    # deterministic first-message key would let the newer request overwrite the
+    # older session and leak its upstream context. Allocate a unique owner and
+    # rely on the exact-history index for later continuations; callers that need
+    # retry/idempotency semantics can send the explicit session header.
+    key = f"{tenant}:auto:{sid}:{uuid.uuid4().hex[:12]}"
+    # Never fall back to the first-user-message key after an exact-history miss.
+    # Two Cherry conversations commonly share a templated opener; the old fallback
+    # merged them after a restart or client-side history rewrite.
+    session = app.state.session_store.reset(key)
+    if pairs:
+        index.record(tenant, pairs, key)
+    return session
+
+
+def record_auto_session_response(
+    app: Any,
+    raw_request: Request,
+    request: OpenAIChatRequest | AnthropicMessagesRequest,
+    session: PersistentSession | None,
+    assistant: Any,
+) -> None:
+    """Bind a successful client-visible assistant message to an auto session.
+
+    The request-side index records the history the client sent.  Without this
+    response-side entry, two conversations with the same opener cannot be
+    distinguished on their next turn: neither full ``user + assistant`` prefix
+    exists in the index.  Only auto sessions participate; named/persist sessions
+    already have an explicit selector and must not become discoverable by an
+    unrelated unnamed request.
+    """
+    if session is None:
+        return
+    key = app.state.session_store.key_for(session)
+    if not key or ":auto:" not in key:
+        return
+    index = getattr(app.state, "history_index", None)
+    if index is None:
+        return
+    pairs = normalize_history([*request.messages, assistant])
+    # The namespace is part of the tenant string used by `_auto_session`.
+    # Deriving it from the actual store key also handles Studio's parallel
+    # session without exposing raw account/agent metadata to the index API.
+    tenant = key.split(":auto:", 1)[0]
+    index.record(tenant, pairs, key)
+
+
 def _persistent_session(
     app: Any,
     raw_request: Request,
     model: str,
     fallback_key: str | None = None,
     request: OpenAIChatRequest | AnthropicMessagesRequest | None = None,
+    namespace: str = "",
 ) -> PersistentSession | None:
-    key_obj = getattr(raw_request.state, "api_key_obj", None)
-    account = getattr(raw_request.state, "account", None)
-    tenant = (key_obj.id if key_obj is not None else None) or (account.id if account is not None else "global")
+    tenant = _request_tenant(raw_request)
+    namespace = str(namespace or "").strip()
+    if namespace:
+        tenant = f"{tenant}:{namespace}"
     header_key = (raw_request.headers.get(_SESSION_ID_HEADER) or "").strip()
     if header_key:
         return app.state.session_store.get(f"{tenant}:header:{header_key}")
     if model.endswith(_PERSIST_MODEL_SUFFIX):
         return app.state.session_store.get(f"{tenant}:model:{fallback_key or 'default'}")
     if request is not None:
-        sid, _title = _detect_conversation_session(request)
-        has_assistant = any(m.role == "assistant" for m in request.messages)
-        if not has_assistant:
-            return app.state.session_store.reset(f"{tenant}:auto:{sid}")
-        return app.state.session_store.get(f"{tenant}:auto:{sid}")
+        return _auto_session(app, tenant, request)
     if fallback_key:
         return app.state.session_store.get(f"{tenant}:auto:{fallback_key}")
     return None
+
+
+def _namespaced_session(
+    app: Any,
+    raw_request: Request,
+    session: PersistentSession | None,
+    namespace: str,
+) -> PersistentSession | None:
+    """Return a parallel session under the same tenant and a named namespace."""
+    if session is None:
+        return None
+    namespace = str(namespace or "").strip()
+    if not namespace:
+        return session
+    key = app.state.session_store.key_for(session)
+    if not key:
+        return None
+    tenant = _request_tenant(raw_request)
+    prefix = f"{tenant}:"
+    suffix = key[len(prefix):] if key.startswith(prefix) else key
+    return app.state.session_store.get(f"{tenant}:{namespace}:{suffix}")

@@ -8,12 +8,15 @@ from .admin_auth import AdminAuth
 from .config import Settings
 from .routes_admin import register_admin_account_key_routes
 from .routes_admin_debug import register_admin_debug_routes
+from .routes_admin_modeltest import register_admin_model_test_routes
 from .routes_admin_observability import register_admin_observability_routes
 from .routes_admin_settings import register_admin_settings_routes
 from .routes_admin_token import register_admin_token_routes
 from .routes_api import register_api_routes
 from .routes_media_proxy import register_media_proxy_routes
 from .routes_oauth import register_oauth_routes
+from .routes_pkce import register_pkce_routes
+from .routes_sessions import register_session_routes
 from .routes_user import register_user_routes
 from .routes_web import register_web_routes
 from .substrate_client import SubstrateCopilotClient
@@ -44,6 +47,10 @@ def register_app_routes(
 
     register_admin_debug_routes(app, admin_auth.require_admin)
 
+    register_admin_model_test_routes(app, admin_auth.require_admin, get_copilot_client)
+
+    register_pkce_routes(app, admin_auth.require_admin)
+
     register_admin_settings_routes(app, admin_auth.require_admin, resolved_settings, TONE_OPTIONS, TONE_VALUES)
 
     register_admin_account_key_routes(app, admin_auth.require_admin, TONE_VALUES)
@@ -51,6 +58,7 @@ def register_app_routes(
     register_user_routes(app, resolved_settings, TONE_OPTIONS)
 
     register_oauth_routes(app, admin_auth.require_admin)
+    register_session_routes(app, admin_auth.require_admin)
 
     register_media_proxy_routes(app)
 

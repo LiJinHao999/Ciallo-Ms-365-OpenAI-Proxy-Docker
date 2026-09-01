@@ -11,6 +11,7 @@ from m365_copilot_openai_proxy.template_admin_accounts import _ADMIN_ACCOUNTS_JS
 from m365_copilot_openai_proxy.template_admin_copy import _ADMIN_COPY_JS
 from m365_copilot_openai_proxy.template_admin_dashboard import _ADMIN_DASHBOARD_JS
 from m365_copilot_openai_proxy.template_admin_dialogs import _ADMIN_DIALOGS_JS
+from m365_copilot_openai_proxy.template_admin_i18n import _ADMIN_I18N_JS
 from m365_copilot_openai_proxy.template_admin_keys import _ADMIN_KEYS_JS
 from m365_copilot_openai_proxy.template_admin_settings_js import _ADMIN_SETTINGS_JS
 from m365_copilot_openai_proxy.template_admin_tables import _ADMIN_TABLES_JS
@@ -29,6 +30,7 @@ def test_admin_observability_routes_are_registered_by_observability_routes_modul
     assert "/admin/metrics-history" in paths
     assert "/admin/metrics-history/clear" in paths
     assert "/admin/summary" in paths
+    assert "/admin/usage/clear" in paths
 
 
 def test_admin_call_log_returns_version_and_short_circuits_unchanged_payload(tmp_path):
@@ -54,13 +56,44 @@ def test_admin_call_log_returns_version_and_short_circuits_unchanged_payload(tmp
     }
 
 
-def test_admin_trend_chart_uses_stable_polyline_rendering_with_breathing_glow():
+def test_admin_usage_clear_resets_persistent_totals_without_clearing_call_log(tmp_path):
+    app = create_app(Settings(TOKEN_DIR=str(tmp_path), API_KEY="", ADMIN_PASSWORD=""))
+    append_call_log(app.state, {"time": "12:00:00", "ts": 1, "api": "chat"})
+    app.state.usage_store.record("gpt-5.6", input_tokens=3, output_tokens=2)
+    client = TestClient(app)
+
+    response = client.post("/admin/usage/clear")
+
+    assert response.status_code == 200
+    assert app.state.usage_store.summary()["total_tokens"] == 0
+    assert len(app.state.call_log) == 1
+
+
+def test_dashboard_clear_call_stats_clears_log_and_usage():
+    clear_code_start = _ADMIN_DASHBOARD_JS.index("async function clearCallStats()")
+    clear_code_end = _ADMIN_DASHBOARD_JS.index("async function clearCapturePayloads()", clear_code_start)
+    clear_code = _ADMIN_DASHBOARD_JS[clear_code_start:clear_code_end]
+
+    assert "'/admin/call-log/clear'" in clear_code
+    assert "'/admin/usage/clear'" in clear_code
+
+
+def test_admin_trend_chart_uses_stable_polyline_rendering_with_static_glow():
+    """Two straight polylines, the wide one a static glow.
+
+    This used to assert the glow *breathed* (`attributeName="opacity"` on an
+    `<animate repeatCount="indefinite">`). That animation was measured at ~105%
+    of a CPU core in style recalculation on an idle dashboard -- SMIL drives the
+    same per-frame restyle as CSS while sitting outside it, so no
+    `animation:none` rule could switch it off. The glow is now a static opacity;
+    see tests/test_web_idle_cpu.py for the guard that keeps it that way.
+    """
     start = _ADMIN_HTML.index("function lineChart(points,series){")
     end = _ADMIN_HTML.index("async function loadSummary()", start)
     chart_code = _ADMIN_HTML[start:end]
 
     assert chart_code.count("<polyline") >= 2
-    assert 'attributeName="opacity"' in chart_code
+    assert "<animate" not in chart_code
     assert "smoothPath" not in chart_code
     assert "<path" not in chart_code
     assert "drop-shadow" not in chart_code
@@ -95,7 +128,6 @@ def test_admin_dialog_javascript_is_split_into_dialogs_module():
 
 def test_admin_accounts_javascript_is_split_into_accounts_module():
     assert "async function loadAccounts(localOnly=false)" in _ADMIN_ACCOUNTS_JS
-    assert "function renderSelectedStatus()" in _ADMIN_ACCOUNTS_JS
     assert "async function submitAccount()" in _ADMIN_ACCOUNTS_JS
     assert "async function batchDeleteAccounts()" in _ADMIN_ACCOUNTS_JS
     assert "const __page={keys:1,accounts:1};" not in _ADMIN_ACCOUNTS_JS
@@ -125,6 +157,79 @@ def test_admin_ports_logs_swaps_idle_timeout_before_account_cdp_port():
 
     assert idle_pos < account_cdp_pos
 
+
+
+def test_admin_settings_include_independent_m365_and_consumer_model_cards():
+    for element_id in (
+        "tone-options-details",
+        "tone-options-input",
+        "tone-options-save",
+        "tone-options-reset",
+        "tone-options-saved",
+        "consumer-mode-options-details",
+        "consumer-mode-options-input",
+        "consumer-mode-options-save",
+        "consumer-mode-options-reset",
+        "consumer-mode-options-saved",
+    ):
+        assert f'id="{element_id}"' in _ADMIN_HTML
+
+    assert 'data-i18n="m365_tone_options_title"' in _ADMIN_HTML
+    assert 'data-i18n="consumer_mode_options_title"' in _ADMIN_HTML
+    assert "M365 模型 / Tone" in _ADMIN_HTML
+    assert "个人版模型 / Mode" in _ADMIN_HTML
+    assert _ADMIN_HTML.index('id="tone-options-input"') < _ADMIN_HTML.index(
+        'id="consumer-mode-options-input"'
+    )
+
+
+def test_admin_consumer_mode_editor_serializes_three_columns():
+    assert "function _consumerModeOptionsToText(opts)" in _ADMIN_SETTINGS_JS
+    assert "o.model+' | '+o.mode+' | '+o.status" in _ADMIN_SETTINGS_JS
+    assert "async function saveConsumerModeOptions()" in _ADMIN_SETTINGS_JS
+    assert "consumer_mode_options:ta.value" in _ADMIN_SETTINGS_JS
+    assert "_consumerModeOptionsToText(__runtimeSettings.consumer_mode_options||[])" in _ADMIN_SETTINGS_JS
+    assert "async function resetConsumerModeOptions()" in _ADMIN_SETTINGS_JS
+
+
+def test_admin_consumer_mode_actions_are_independent_and_surface_errors():
+    consumer_save = _ADMIN_SETTINGS_JS[
+        _ADMIN_SETTINGS_JS.index("async function saveConsumerModeOptions()"):
+        _ADMIN_SETTINGS_JS.index("async function resetConsumerModeOptions()")
+    ]
+    consumer_reset = _ADMIN_SETTINGS_JS[
+        _ADMIN_SETTINGS_JS.index("async function resetConsumerModeOptions()"):
+        _ADMIN_SETTINGS_JS.index("async function loadToolPrompt()")
+    ]
+    tone_reset = _ADMIN_SETTINGS_JS[
+        _ADMIN_SETTINGS_JS.index("async function resetToneOptions()"):
+        _ADMIN_SETTINGS_JS.index("async function saveConsumerModeOptions()")
+    ]
+
+    assert "consumer_mode_options:ta.value" in consumer_save
+    assert "consumer_mode_options:[]" in consumer_reset
+    assert "tone_options" not in consumer_save + consumer_reset
+    assert "tone_options:[]" in tone_reset
+    assert "consumer_mode_options" not in tone_reset
+    assert "d.error&&d.error.message" in consumer_save
+    assert "d.error&&d.error.message" in consumer_reset
+    result_helper = _ADMIN_SETTINGS_JS[
+        _ADMIN_SETTINGS_JS.index("function _showConsumerModeResult"):
+        _ADMIN_SETTINGS_JS.index("async function saveConsumerModeOptions()")
+    ]
+    assert "consumer-mode-options-saved" in result_helper
+    assert "_showConsumerModeResult" in consumer_save
+    assert "_showConsumerModeResult" in consumer_reset
+
+
+def test_admin_consumer_mode_i18n_explains_status_and_rollout():
+    assert _ADMIN_I18N_JS.count("model | mode | status") >= 2
+    assert _ADMIN_I18N_JS.count("stable") >= 2
+    assert _ADMIN_I18N_JS.count("experimental") >= 2
+    assert "可能受账户、地区和 Microsoft rollout 限制" in _ADMIN_I18N_JS
+    assert "may be limited by account, region, or Microsoft rollout" in _ADMIN_I18N_JS
+    assert "恢复个人版默认" in _ADMIN_I18N_JS
+    assert "Restore Consumer defaults" in _ADMIN_I18N_JS
 
 
 def test_admin_settings_include_media_suffix_card():
@@ -171,8 +276,11 @@ def test_admin_debug_logs_include_copy_all_buttons():
 
 
 def test_admin_accounts_table_keeps_header_fixed_and_scrolls_rows_without_scrollbar():
-    assert ".accounts-main-card{position:relative;padding-bottom:64px;height:450px}" in _ADMIN_HTML
-    assert ".accounts-main-card .accounts-table-scroll{height:260px;max-height:260px;overflow-y:auto;overflow-x:hidden;border-radius:8px;scrollbar-width:none;-ms-overflow-style:none;scrollbar-gutter:auto}" in _ADMIN_HTML
+    # Same box as the users view, which is the other single-card view.
+    assert ".view-users{height:800px;display:none;position:relative;padding-bottom:64px}" in _ADMIN_HTML
+    assert ".accounts-main-card{position:relative;padding-bottom:64px;height:800px}" in _ADMIN_HTML
+    assert ".accounts-main-card .accounts-table-scroll{height:610px;max-height:610px;overflow-y:auto;overflow-x:auto;border-radius:8px;scrollbar-width:none;-ms-overflow-style:none;scrollbar-gutter:auto}" in _ADMIN_HTML
+    assert ".accounts-table{width:100%;min-width:698px;max-width:none;table-layout:fixed}" in _ADMIN_HTML
     assert ".accounts-main-card .accounts-table-scroll::-webkit-scrollbar{width:0;height:0;display:none}" in _ADMIN_HTML
     assert ".accounts-main-card .accounts-table thead th{position:sticky;top:0;z-index:5;background:var(--card)}" in _ADMIN_HTML
     assert '<div class="tbl-scroll accounts-table-scroll"><table class="admin-tbl accounts-table">' in _ADMIN_ACCOUNTS_JS
@@ -233,4 +341,22 @@ def test_admin_settings_javascript_is_split_into_settings_module():
     assert "async function resetSystemPrompt()" in _ADMIN_SETTINGS_JS
     assert _ADMIN_SETTINGS_JS in _ADMIN_HTML
     assert _ADMIN_HTML.index("let __runtimeSettings={};") < _ADMIN_HTML.index(_ADMIN_SETTINGS_JS)
+
+
+def test_first_view_switch_runs_after_the_module_state_it_reads():
+    """View loaders read module-level `let`s, so the first switchView must come last.
+
+    Called earlier, `loadSessions`/`loadModelTest` hit `__keys`/`__accounts` in the
+    temporal dead zone; the ReferenceError is swallowed by the async function and
+    the view silently never renders after a reload.
+    """
+    first_switch = _ADMIN_HTML.index("switchView(localStorage.getItem('admin_view')||'home')")
+
+    assert first_switch > _ADMIN_HTML.index("let __accounts=[];")
+    assert first_switch > _ADMIN_HTML.index("let __keys=[];")
+    assert first_switch > _ADMIN_HTML.index("let __sessions=null;")
+    assert first_switch > _ADMIN_HTML.index("let __runtimeSettings={};")
+    # And the debug view no longer reads tone options off a window property that
+    # nothing ever sets (__runtimeSettings is a script-scope binding).
+    assert "return (__runtimeSettings&&__runtimeSettings.tone_options)||window.__toneOpts||[];" in _ADMIN_HTML
 

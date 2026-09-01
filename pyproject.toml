@@ -6,17 +6,45 @@ license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=43.0.0,<47.0.0",
+    # Consumer Copilot fingerprints the TLS client: the same cookies/token are
+    # challenged under httpx + websockets and under every Chrome/Edge/Safari
+    # profile, and answered under curl_cffi's firefox147. Any floor here must
+    # still ship that profile -- see consumer_client._IMPERSONATE.
+    "curl-cffi>=0.16.0,<1.0.0",
     "fastapi>=0.116.0,<1.0.0",
-    "httpx>=0.28.0,<1.0.0",
+    # [socks] pulls in socksio so an admin-configured socks5:// proxy works for
+    # the media/token HTTP calls, not just http:// proxies.
+    "httpx[socks]>=0.28.0,<1.0.0",
+    "jsonschema>=4.23.0,<5.0.0",
     "pydantic-settings>=2.10.0,<3.0.0",
     "python-multipart>=0.0.9,<1.0.0",
+    # zoneinfo has no database of its own on hosts that ship none (Windows, a
+    # future slim image): without this the per-turn timeZoneOffset silently
+    # falls back to +8 for every zone. Data only, no code.
+    "tzdata>=2025.1",
+    # python-socks is what gives websockets its socks5 support; HTTP CONNECT
+    # tunnelling is built in.
+    "python-socks[asyncio]>=2.4.0,<3.0.0",
     "uvicorn>=0.35.0,<1.0.0",
-    "websockets>=12.0,<15.0",
+    # >=15.0 for the `proxy=` argument on connect() -- the substrate chat socket
+    # is the one connection that must traverse the proxy for a mainland-China
+    # deployment to work at all.
+    "websockets>=15.0,<16.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.4.0,<9.0.0",
+]
+# Unattended consumer-credential refresh. Kept optional because the browser it
+# downloads is ~936 MB on disk, which is not a cost an M365-only deployment
+# should pay; without it consumer accounts simply fall back to a userscript
+# re-push. Camoufox is a Firefox fork, and Firefox is what the consumer path
+# needs -- Chromium fingerprints are challenged where Firefox ones are not.
+# [geoip] is what lets the browser's reported timezone/locale match the exit IP,
+# which matters here because the egress is usually a proxy in another country.
+camoufox = [
+    "camoufox[geoip]>=0.5.4,<1.0.0",
 ]
 
 [project.scripts]

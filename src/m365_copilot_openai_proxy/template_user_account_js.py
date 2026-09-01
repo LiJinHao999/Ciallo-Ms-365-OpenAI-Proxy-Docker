@@ -94,48 +94,27 @@ function renderUserCountdown(){
 function tickUserCountdown(){if(_userRemainSec>0){_userRemainSec--;renderUserCountdown()}}
 function boundAccountName(a){
   if(!a)return t('status_unknown');
-  // Prefer real identity once token/RT/cookie is present. Do NOT show
-  // "none (Token)" after a successful PKCE login — that looks like failure.
-  if(a.name||a.email)return a.name||a.email;
-  if(a.has_token||a.has_refresh_token||a.cookie_valid)return a.id||t('status_unknown');
-  return t('account_none');
-}
-function accountLoginMode(a){
-  if(!a)return t('login_mode_none');
-  if(a.oauth_client_id)return t('login_mode_oauth');
-  if(a.has_refresh_token)return t('login_mode_rt');
-  if(a.cookie_valid)return t('login_mode_cookie');
-  if(a.has_token)return t('login_mode_token');
-  return t('login_mode_none');
-}
-function accountRefreshMode(a){
-  if(!a)return t('refresh_manual');
-  if(a.has_refresh_token)return t('refresh_auto_rt');
-  if(a.token_source==='cdp'&&a.cookie_valid)return t('refresh_auto');
-  if(a.token_source==='cdp')return t('refresh_unavailable');
-  return t('refresh_manual');
+  const state=a.binding_state||(a.cookie_valid?'cookie':(a.has_token?'token_only':'none'));
+  if(state==='cookie')return a.name||a.email||a.id;
+  return state==='token_only'?t('account_none_token'):t('account_none');
 }
 function renderAccountStatus(d){
   const box=document.getElementById('account-status-panel');if(!box)return;
   const a=d.account||null,st=a?(a.token_status||{}):{};
   const valid=!!st.valid;
-  // Logged-in for text API: token and/or RT is enough. Cookie is optional extras.
-  const login=!!(a&&(a.has_refresh_token||a.has_token||a.cookie_valid));
-  const refresh=!!(a&&(a.has_refresh_token||(a.token_source==='cdp'&&a.cookie_valid)));
+  const login=!!(a&&a.cookie_valid);
+  const refresh=!!(a&&(a.provider==='consumer'||a.token_source==='cdp'||a.has_refresh_token));
+  const expiryKnown=!!st.expires_at;
   const name=boundAccountName(a);
   const mark=(ok)=>'<span class="status-mark '+(ok?'ok':'bad')+'"></span>';
-  const mode=accountLoginMode(a);
-  const rmode=accountRefreshMode(a);
   box.innerHTML='<h3 style="margin:0;color:var(--strong);font-size:1rem;display:none">'+t('status_panel_title')+'</h3>'
     +'<div class="status-grid">'
     +'<div class="status-line status-first"><span>'+t('status_account')+'</span><b>'+esc(name)+'</b></div>'
-    +(a&&a.email?'<div class="status-line"><span>Email</span><b style="font-size:.78rem;word-break:break-all">'+esc(a.email)+'</b></div>':'')
-    +'<div class="status-line"><span>'+t('status_login')+'</span><b>'+mark(login)+' <span style="font-size:.72rem;color:var(--muted)">'+esc(mode)+'</span></b></div>'
-    +'<div class="status-line"><span>'+t('status_refresh')+'</span><b>'+mark(refresh)+' <span style="font-size:.72rem;color:var(--muted)">'+esc(rmode)+'</span></b></div>'
+    +'<div class="status-line"><span>'+t('status_login')+'</span><b>'+mark(login)+'</b></div>'
+    +'<div class="status-line"><span>'+t('status_refresh')+'</span><b>'+mark(refresh)+'</b></div>'
     +'<div class="status-line"><span>'+t('status_valid')+'</span><b>'+mark(valid)+'</b></div>'
-    +'<div class="status-line"><span>'+t('status_remaining')+'</span><b data-user-remaining>'+fmtRemaining(st.seconds_remaining)+'</b></div>'
+    +'<div class="status-line"><span>'+t('status_remaining')+'</span><b'+(expiryKnown?' data-user-remaining':'')+'>'+(expiryKnown?fmtRemaining(st.seconds_remaining):t('status_unknown'))+'</b></div>'
     +'<div class="status-line"><span>'+t('status_expire')+'</span><b>'+fmtExpire(st.expires_at)+'</b></div>'
-    +'<div class="status-line"><span>Cookie</span><b>'+mark(!!(a&&a.cookie_valid))+' <span style="font-size:.72rem;color:var(--muted)">'+(a&&a.cookie_valid?t('cookie_optional_ok'):t('cookie_optional_na'))+'</span></b></div>'
     +'</div>';
 }
 
@@ -151,28 +130,23 @@ function renderAccountInfo(d){
   const consoleActions='<span class="account-console-icons" style="height:32px;display:inline-flex;align-items:center;gap:.4rem"><button type="button" class="account-icon-btn account-icon-btn-pass" title="'+t('change_password')+'" onclick="changeLoginPassword(this)" aria-label="'+t('change_password')+'">'+keyIcon+'</button><button type="button" class="account-icon-btn account-icon-btn-out" title="'+t('console_logout')+'" onclick="logoutConsole()" aria-label="'+t('console_logout')+'">'+doorIcon+'</button></span>';
   const actionBox=document.getElementById('account-console-actions');if(actionBox)actionBox.innerHTML=consoleActions;
   if(d.account){
-    const a=d.account;
-    const st=a.token_status||{};
+    const st=d.account.token_status||{};
     const valid=st.valid;
-    const rem=valid?(' · '+t('remaining')+' <span data-user-remaining>'+fmtRemaining(_userRemainSec>0?_userRemainSec:st.seconds_remaining)+'</span>'):'';
-    const loggedIn=!!(a.has_refresh_token||a.has_token||a.cookie_valid);
-    acc+='<div class="row" style="flex-wrap:wrap;gap:.4rem;align-items:center">'
-      +'<span class="pill '+(loggedIn?'ok':'')+'">'+t('bound_account')+': '+esc(boundAccountName(a))+'</span>'
-      +(a.email?'<span class="pill">'+esc(a.email)+'</span>':'')
-      +'<span class="pill '+(valid?'ok':'bad')+'">'+(valid?t('token_valid'):t('token_invalid'))+rem+'</span>'
-      +'<span class="pill '+(a.has_refresh_token?'ok':'')+'">'+(a.has_refresh_token?t('rt_ready'):t('rt_missing'))+'</span>'
-      +'<span class="pill">'+esc(accountLoginMode(a))+' · '+esc(accountRefreshMode(a))+'</span>'
-      +'</div>';
-    if(loggedIn&&a.has_refresh_token){
-      acc+='<div class="hint" style="margin-top:.45rem">'+t('login_ready_hint')+'</div>';
-    }else if(loggedIn&&!a.has_refresh_token){
-      acc+='<div class="hint" style="margin-top:.45rem">'+t('login_token_only_hint')+'</div>';
-    }
+    const rem=valid&&st.expires_at?(' · '+t('remaining')+' <span data-user-remaining>'+fmtRemaining(_userRemainSec>0?_userRemainSec:st.seconds_remaining)+'</span>'):'';
+    // Only while the window upstream named is still open. There is no remaining
+    // count to show -- no provider reports one -- so the reset time it did name
+    // is the whole of what can honestly be said, with the exact instant on hover.
+    const thr=Number(d.account.throttled_until||0);
+    const thrPill=(thr*1000>Date.now())?'<span class="pill bad" title="'+esc(t('throttled_until_label')+': '+fmtExpire(new Date(thr*1000).toISOString()))+'">'+t('throttled_short')+' · '+fmtRemaining(thr-Date.now()/1000)+'</span>':'';
+    acc+='<div class="row" style="flex-wrap:wrap;gap:.4rem;align-items:center"><span class="pill">'+t('bound_account')+': '+esc(boundAccountName(d.account))+'</span>'
+      +'<span class="pill '+(valid?'ok':'bad')+'">'+(valid?t('token_valid'):t('token_invalid'))+rem+'</span>'+thrPill+'</div>';
   }else{
     acc+='<div class="row" style="flex-wrap:wrap;gap:.4rem;align-items:center"><span class="pill">'+t('no_account')+'</span></div>';
   }
   acc+='<div style="margin-top:.6rem;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center"><button class="btn-ghost account-action" onclick="logout(this)">'+t('logout')+'</button><button class="btn-ghost account-action" onclick="unbindAccount(this)">'+t('unbind_account')+'</button></div>';
   const info=document.getElementById('account-info');if(info)info.innerHTML=acc;
+  const upx=document.getElementById('user-proxy-url');if(upx&&document.activeElement!==upx)upx.value=(d.account&&d.account.proxy_url)||'';
+  renderUserPkce(d.account||null);
   renderAccountStatus(d);
 }
 function applyUserLangDynamic(){
@@ -186,8 +160,8 @@ function applyUserLangDynamic(){
     if(ums){const dg=(_userMeCache.default_media_proxy_suffixes||[]).join(' ');ums.placeholder=dg?(t('user_media_suffix_inherit')+dg):''}
     renderToneOptions();
     const tone=document.getElementById('tone');if(tone){tone.value=_userMeCache.tone||tone.value||'Magic';refreshGlassSelect(tone)}
-    renderRunPermissionOptions();
-    const rp=document.getElementById('user-run-permission');if(rp){rp.value=_userMeCache.run_permission||_userMeCache.effective_run_permission||rp.value||'full';refreshGlassSelect(rp)}
+    setRunPermission(_userMeCache.run_permission,_userMeCache.default_run_permission);
+    setToolPlanning(_userMeCache.tool_planning_mode,_userMeCache.default_tool_planning_mode);
   }catch(e){}
 }
 async function loadMe(){
@@ -205,9 +179,8 @@ async function loadMe(){
     renderToneOptions();
     document.getElementById('tone').value=d.tone||'Magic';
     refreshGlassSelect(document.getElementById('tone'));
-    renderRunPermissionOptions();
-    document.getElementById('user-run-permission').value=d.run_permission||d.effective_run_permission||'full';
-    refreshGlassSelect(document.getElementById('user-run-permission'));
+    setRunPermission(d.run_permission,d.default_run_permission);
+    setToolPlanning(d.tool_planning_mode,d.default_tool_planning_mode);
     document.getElementById('user-model-alias').value=d.model_alias||'';
     userTimeZone=d.time_zone||'';
     document.getElementById('user-time-zone').value=userTimeZone;
@@ -258,44 +231,18 @@ async function pushToken(btn){
   if(ok)document.getElementById('acct-token').value='';
   if(btn){btn.textContent=ok?t('push_ok'):t('token_update_failed');btn.style.color=ok?'#22c55e':'#ef4444';clearTimeout(btn._rTimer);btn._rTimer=setTimeout(async()=>{btn.textContent=t('push_token_btn');btn.style.color='';btn.disabled=false;if(ok)await loadMe()},3000)}
 }
-let _oauthState='';
-async function startOAuth(btn){
-  const msg=document.getElementById('oauth-msg');
-  if(msg){msg.textContent='';msg.style.color=''}
-  if(btn){btn.disabled=true;btn.textContent=t('oauth_starting')}
-  let ok=false,err='';
+
+async function saveAccountProxy(){
+  const el=document.getElementById('user-proxy-url');if(!el)return;
+  const msg=document.getElementById('user-proxy-msg');
+  const show=k=>{if(!msg)return;msg.textContent=t(k);msg.style.opacity='1';setTimeout(()=>{msg.style.opacity='0'},2500)};
   try{
-    const r=await fetch('/user/oauth/start',{method:'POST',headers:authHeaders()});
+    const r=await fetch('/user/account/proxy',{method:'POST',headers:authHeaders(),body:JSON.stringify({proxy_url:el.value.trim()})});
     const d=await r.json().catch(()=>({}));
-    ok=r.ok&&d.url;
-    if(ok){
-      _oauthState=d.state||'';
-      window.open(d.url,'_blank','noopener');
-      if(msg){msg.textContent=t('oauth_hint');msg.style.color='var(--muted)'}
-      const ta=document.getElementById('oauth-callback');if(ta)ta.focus();
-    }else{
-      err=(d.error&&d.error.message)||t('oauth_failed');
-    }
-  }catch(e){err=t('network_error')}
-  if(btn){btn.textContent=ok?t('oauth_start_btn'):t('oauth_failed');btn.style.color=ok?'':'#ef4444';clearTimeout(btn._rTimer);btn._rTimer=setTimeout(()=>{btn.textContent=t('oauth_start_btn');btn.style.color='';btn.disabled=false},2500)}
-  if(!ok&&msg){msg.textContent=err||t('oauth_failed');msg.style.color='#ef4444'}
-}
-async function submitOAuth(btn){
-  const ta=document.getElementById('oauth-callback');
-  const msg=document.getElementById('oauth-msg');
-  const url=(ta&&ta.value||'').trim();
-  if(!url){if(msg){msg.textContent=t('oauth_ph');msg.style.color='#ef4444'}return}
-  if(btn){btn.disabled=true;btn.textContent=t('oauth_submitting')}
-  let ok=false,err='';
-  try{
-    const r=await fetch('/user/oauth/callback',{method:'POST',headers:authHeaders(),body:JSON.stringify({url:url,state:_oauthState||undefined})});
-    const d=await r.json().catch(()=>({}));
-    ok=r.ok;
-    if(!ok)err=(d.error&&d.error.message)||t('oauth_failed');
-    else if(ta)ta.value='';
-  }catch(e){err=t('network_error')}
-  if(msg){msg.textContent=ok?t('oauth_ok'):(err||t('oauth_failed'));msg.style.color=ok?'#22c55e':'#ef4444'}
-  if(btn){btn.textContent=ok?t('oauth_ok'):t('oauth_failed');btn.style.color=ok?'#22c55e':'#ef4444';clearTimeout(btn._rTimer);btn._rTimer=setTimeout(async()=>{btn.textContent=t('oauth_submit_btn');btn.style.color='';btn.disabled=false;if(ok)await loadMe()},2500)}
-  else if(ok)await loadMe();
+    // A rejected URL leaves the stored value untouched, so restore the input
+    // from the response rather than leaving the bad text looking accepted.
+    if(r.ok){el.value=d.proxy_url||'';show('user_proxy_saved')}
+    else show('user_proxy_invalid');
+  }catch(e){show('user_proxy_invalid')}
 }
 """

@@ -11,6 +11,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from .build_info import check_for_update, current_build_id, inject_build_info, resolve_build_info
 from .templates import _ADMIN_HTML, _LOGIN_HTML, _USER_HTML
 
+# /healthz result reuse window. Short enough that a token expiring is reflected
+# promptly, long enough that repeated anonymous polling costs nothing.
+_HEALTHZ_CACHE_SECONDS = 5.0
+
 
 def register_web_routes(
     app: FastAPI,
@@ -24,7 +28,29 @@ def register_web_routes(
 ) -> None:
     @app.get("/healthz")
     async def healthz() -> dict:
-        return {"status": "ok", "token": app.state.token_store.status()}
+        # Cached because this endpoint is unauthenticated: each call stats the
+        # token file and JWT-decodes once per account, so an anonymous caller
+        # could otherwise drive that work as fast as it can send requests. A few
+        # seconds of staleness is irrelevant against token lifetimes measured in
+        # hours, and container probes poll far slower than the TTL.
+        cached = getattr(app.state, "_healthz_cache", None)
+        now = time.monotonic()
+        if cached and now - cached[0] < _HEALTHZ_CACHE_SECONDS:
+            return cached[1]
+        # Report the account pool when one is configured. Requests resolve their
+        # token from the account behind the API key, so on a multi-account
+        # deployment the global token is unset and reporting only it says nothing
+        # about whether the proxy can actually serve traffic.
+        accounts = app.state.account_store.list() if getattr(app.state, "account_store", None) else []
+        body = {"status": "ok", "token": app.state.token_store.status()}
+        if accounts:
+            statuses = [acc.token_status() for acc in accounts]
+            body["accounts"] = {
+                "total": len(statuses),
+                "valid": sum(1 for s in statuses if s["valid"]),
+            }
+        app.state._healthz_cache = (now, body)
+        return body
 
     @app.post("/admin/login")
     async def admin_login(request: Request) -> Response:

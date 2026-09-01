@@ -2,52 +2,565 @@ from __future__ import annotations
 
 import json
 import re
+from difflib import SequenceMatcher
 
 from .media_proxy import normalize_m365_media_text
+from .tone_options import tone_server_interpreter
+from .tool_call_parser import _NO_TOOL_MARKER
 
-# M365 injects private-use citation markers in streamed and final text.
-#
-# Observed real-world forms (from production call logs):
-#   1. Markdown:   [label](citeturn1search6)
-#   2. Bare PUA:   citeturn1search6
-#   3. Split residual after a partial delta ate the opener:
-#                  turn1search6   /   [^1]turn1search3
-#   4. Sydney footnote: [^3^]
-#   5. CN bracket id:  【1-1fd57a】 / 【2-ba0dbb】
-#
-# Strategy: keep human labels, emit stable plain ``[n]`` markers (not Markdown
-# ``[^n]`` footnotes — most chat UIs leave the caret form unrendered), map n →
-# sourceAttributions[n-1] when the final type=2 payload arrives. Hold
-# incomplete openers across deltas so we never emit raw turn/search tokens.
-_PUA = "-"
+# M365 injects private-use citation markers in streamed and final text, e.g.
+#   [label](\ue200cite\ue202turn1file1\ue201)
+# or bare  \ue200cite\ue202...\ue201  / PUA-wrapped "cite" runs.
+# These are not useful in OpenAI-compatible clients and break dedupe signatures.
 _MARKDOWN_CITE_RE = re.compile(
-    rf"\[([^\]]*)\]\(\s*([{_PUA}]*cite[{_PUA}][^)]*)\)",
+    r"\[[^\]]*\]\(\s*[\uE000-\uF8FF]*cite[\uE000-\uF8FF][^\)]*\)",
+    re.IGNORECASE,
+)
+# Bare markers look like: \ue200cite\ue202turn1file1\ue201
+# Only consume PUA + ascii id pieces, never trailing prose/CJK.
+#
+# One marker can carry SEVERAL ids, and the separator between them is another
+# private-use character: \ue200cite\ue202turn4search10\ue202turn4search12\ue201
+# The id run therefore repeats without bound, and consuming it once left every id
+# after the first sitting in the delivered text ("...直接触发这个错误。
+# turn4search10turn4search12"). The run is `*` rather than `+` so a delta that
+# ends right after the word "cite" still loses the opener instead of shipping it.
+_BARE_PUA_CITE_RE = re.compile(
+    r"[\uE000-\uF8FF]cite(?:[\uE000-\uF8FF][A-Za-z0-9_]*)*",
+    re.IGNORECASE,
+)
+
+# The closing half of a marker whose opening half went out in an earlier delta.
+# Upstream splits its stream mid-marker and the streaming path cleans each delta
+# alone (substrate_client feeds every writeAtCursor straight in), so the halves
+# are never in hand together: the rule above strips "\ue200cite\ue202" on its
+# own, and without this one the remainder ("turn3search5\ue201") matched nothing
+# and reached the client butted against the prose. Anchored on the trailing
+# private-use delimiter rather than on the id shape alone, so prose that merely
+# names an id -- a bug report, this project's own docs -- keeps the word it is
+# about. One id per match is all this needs: the substitution is global, so a
+# tail that orphaned a whole run of ids is taken one id at a time. A split
+# *inside* an id still leaks that fragment; closing that needs cross-delta
+# buffering, not a wider pattern.
+_ORPHAN_CITE_TAIL_RE = re.compile(
+    r"turn\d+[a-z]+\d*[\uE000-\uF8FF]",
+    re.IGNORECASE,
+)
+
+# Two further renderings, both seen within a SINGLE live turn: the streamed
+# deltas carried literal <cite> tags while the cumulative snapshot of the very
+# same sentences carried bracket marks.
+#
+#   deltas:   FastAPI 性能媲美 Node.js。<cite>turn1search7</cite>
+#   snapshot: FastAPI 性能媲美 Node.js。【4-6f710b】
+#
+# Both are bounded to citation-ID shapes rather than matching the delimiters
+# outright, because both delimiters have legitimate uses that must survive:
+# HTML's <cite> marks the title of a work, and 【】 is ordinary CJK punctuation
+# for emphasis. A citation id never contains spaces, and a bracket marker always
+# leads with "<digits>-", so real prose matches neither pattern.
+_LITERAL_CITE_TAG_RE = re.compile(r"<cite>[A-Za-z0-9_,\-]*</cite>", re.IGNORECASE)
+_BRACKET_CITE_RE = re.compile(r"【\d+-[0-9a-z]{3,}】", re.IGNORECASE)
+
+
+def clean_m365_citations(text: str, tracker: "CitationTracker | None" = None) -> str:
+    """Strip M365 citation markers from model text.
+
+    When ``tracker`` is provided, markers become stable ``[n]`` citations.
+
+    Safe on partial stream deltas, but by handling each half rather than by
+    waiting for both: the streaming path cleans every delta on its own, so a
+    marker split mid-way is never in hand whole. The PUA rule takes an opening
+    half alone and _ORPHAN_CITE_TAIL_RE takes the closing half alone. Leaving
+    either for a closing delimiter that arrives in a different call is what put
+    bare ids in front of readers.
+    """
+    if tracker is not None:
+        return tracker.clean(text)
+    if not text:
+        return ""
+    # Fast path: most chunks carry none of the marker shapes. "【" has to be part
+    # of this test -- a bracket marker contains neither the word "cite" nor a
+    # private-use character, so keying the fast path on those alone let every
+    # bracket marker through untouched.
+    if "cite" not in text.lower() and "【" not in text and not any("\ue000" <= c <= "\uf8ff" for c in text):
+        return text
+    cleaned = _MARKDOWN_CITE_RE.sub("", text)
+    cleaned = _BARE_PUA_CITE_RE.sub("", cleaned)
+    cleaned = _ORPHAN_CITE_TAIL_RE.sub("", cleaned)
+    cleaned = _LITERAL_CITE_TAG_RE.sub("", cleaned)
+    cleaned = _BRACKET_CITE_RE.sub("", cleaned)
+    # Collapse whitespace left by removed markers (keep newlines).
+    cleaned = re.sub(r"[^\S\n]{2,}", " ", cleaned)
+    return cleaned
+
+
+def _capture_suspicious_response_event(sink, msg: dict) -> None:
+    if sink is None:
+        return
+    try:
+        probe = json.dumps(msg, ensure_ascii=False).lower()
+    except (TypeError, ValueError):
+        return
+    if any(
+        key in probe
+        for key in (
+            "image",
+            "card",
+            "render",
+            "attachment",
+            "contenturl",
+            "downloadurl",
+            "filetoken",
+            "thumbnail",
+            "generatedgraphic",
+            "generatedaudio",
+            "asyncgw",
+            "citation",
+        )
+    ):
+        sink(msg)
+
+
+def _dedupe_signature(text: str) -> str:
+    """Normalize text down to the part that identifies WHAT was said.
+
+    Every form a URL can take must collapse to the same thing, because the two
+    sides of a dedupe comparison reach us through different pipelines: streamed
+    deltas are only citation-cleaned, while the upstream fallback also goes
+    through ``normalize_m365_media_text``, which rewrites a bare image URL into
+    ``![image](url)``. Leaving bare URLs (or the ``!`` of an image link) in the
+    signature made the same sentence produce two different signatures, so dedupe
+    missed the restatement and the answer was emitted twice.
+    """
+    normalized = clean_m365_citations(text)
+    normalized = re.sub(r"!?\[[^\]]*\]\(\s*https?://[^\)]*\)", "", normalized)
+    normalized = re.sub(r"`\s*https?://[^`]*`", "", normalized)
+    # Bounded to URL-legal characters, not \S+: a URL butted straight against
+    # CJK prose ("https://x/a.png完成") would otherwise swallow the prose too and
+    # make dedupe drop real content.
+    normalized = re.sub(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", "", normalized)
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized
+
+
+# Share of the fallback signature that must already appear in the streamed text
+# for the fallback to count as a restatement rather than new content.
+_RESTATEMENT_COVERAGE = 0.9
+
+
+def _signature_coverage(streamed_sig: str, fallback_sig: str) -> float:
+    """Fraction of ``fallback_sig`` that also appears in ``streamed_sig``.
+
+    Uses matching blocks rather than a plain substring test so a fallback that
+    only differs from the streamed answer in scattered spots (one swapped
+    character, a changed punctuation mark, a re-worded clause) still scores as
+    almost fully covered.
+    """
+    if not fallback_sig:
+        return 1.0
+    if not streamed_sig:
+        return 0.0
+    matcher = SequenceMatcher(None, streamed_sig, fallback_sig, autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return matched / len(fallback_sig)
+
+
+# Anchor sizes for locating the end of the delivered text inside the fallback.
+# Long enough that a match is not coincidence, short enough that a turn which
+# streamed only a few words can still be anchored.
+_TAIL_ANCHOR_MAX = 200
+_TAIL_ANCHOR_MIN = 24
+
+# Minimum size for a matching run to count as a trustworthy alignment point. Same
+# order as the exact anchor, for the same reason: shorter runs recur by chance (a
+# shared full stop, a markdown ``---``), and aligning on one either swallows real
+# content or appends text the reader already has.
+_ALIGN_BLOCK_MIN = 24
+
+# Share of the fallback the delivered text must account for before "the stream
+# already reached the end" is a plausible reading of an end-to-end alignment. A
+# stream missing most of the answer is a truncated one, whatever its last
+# character happens to match.
+_REACHED_END_MIN_SHARE = 0.5
+
+
+def _aligned_tail(streamed_text: str, fallback_text: str) -> str | None:
+    """Locate the delivered position by approximate alignment, or ``None`` when no
+    run is solid enough to align on.
+
+    Handles the one case the exact end anchor cannot: a stream that lost a run
+    NEAR ITS END. The delivered tail is then a splice of the text either side of
+    the gap -- a string that occurs nowhere in the authoritative answer -- so
+    ``rfind`` misses at every anchor length. Falling through to the common-prefix
+    trim then appended everything from the FIRST gap onward; measured on the shape
+    of the live capture, 288 characters appended against 125 lost, which is the
+    reader being shown the middle of the answer a second time.
+    """
+    blocks = [
+        block
+        for block in SequenceMatcher(
+            None, streamed_text, fallback_text, autojunk=False
+        ).get_matching_blocks()
+        if block.size
+    ]
+    if not blocks:
+        return None
+    # A final run that terminates BOTH texts means the stream reached the end of
+    # the answer. Whatever sits before that run is a hole, and the reader already
+    # has the text after it, so appending would duplicate -- and land out of order
+    # on top of it. Nothing to add.
+    final = blocks[-1]
+    if (
+        final.a + final.size == len(streamed_text)
+        and final.b + final.size == len(fallback_text)
+        and len(streamed_text) >= _REACHED_END_MIN_SHARE * len(fallback_text)
+    ):
+        return ""
+    solid = [block for block in blocks if block.size >= _ALIGN_BLOCK_MIN]
+    if not solid:
+        return None
+    last = solid[-1]
+    return fallback_text[last.b + last.size :]
+
+
+def _fallback_tail_after_delivered(streamed_text: str, fallback_text: str) -> str | None:
+    """Return the part of ``fallback_text`` that follows the END of what was
+    already delivered, or ``None`` when the end cannot be located.
+
+    Anchoring on the end is what keeps a stream that lost text in the MIDDLE from
+    having everything after the gap repeated. ``_common_prefix_len`` stops dead at
+    the first gap, so trimming by common prefix appended the whole rest of the
+    answer a second time -- observed live as an answer with holes punched through
+    its middle followed by a verbatim slab of everything from the first hole
+    onward. The already-delivered gap cannot be repaired (that text is long gone
+    to the client), but it must not cost the reader the answer twice.
+
+    ``rfind`` so a phrase that recurs earlier in the answer resolves to the most
+    recent occurrence, which is where the stream actually stands. When the gap
+    falls inside the anchor window itself no exact match exists at all, and
+    ``_aligned_tail`` takes over.
+    """
+    limit = min(len(streamed_text), _TAIL_ANCHOR_MAX)
+    for size in range(limit, _TAIL_ANCHOR_MIN - 1, -1):
+        anchor = streamed_text[-size:]
+        position = fallback_text.rfind(anchor)
+        if position >= 0:
+            return fallback_text[position + size:]
+    return _aligned_tail(streamed_text, fallback_text)
+
+
+def _cumulative_catchup(streamed_text: str, cumulative_text: str) -> str:
+    """Text to append so the stream catches up to a cumulative snapshot.
+
+    M365 sends two views of the same turn: ``writeAtCursor`` deltas, which are
+    incremental, and ``messages`` snapshots, which restate the whole answer so
+    far. When the deltas skip ahead the snapshot is the only place the skipped run
+    exists, and appending it AS SOON AS the snapshot lands keeps the answer in
+    order -- waiting for the final frame would append it after everything else.
+
+    Deliberately conservative: only an exact prefix relationship counts. The two
+    views do not always render citations the same way (one live capture had
+    ``【4-6f710b】`` in the snapshot against ``<cite>turn1search4</cite>`` in the
+    deltas), and guessing at an alignment across that difference risks emitting a
+    run the reader already has. Anything less certain is left to the final
+    reconciliation, which has the authoritative full text to work from.
+    """
+    if not cumulative_text or not streamed_text:
+        return ""
+    if cumulative_text.startswith(streamed_text):
+        return cumulative_text[len(streamed_text):]
+    return ""
+
+
+def _split_snapshot_lead(lead: str, delta: str) -> tuple[str, str] | None:
+    """Reconcile an incoming delta against text already delivered from a snapshot.
+
+    ``lead`` is the run a cumulative snapshot let us deliver BEFORE the deltas got
+    there. Deltas may then replay that same run from the top -- one live turn sent
+    a snapshot of the opening and then streamed that opening again as deltas -- and
+    forwarding them would tell the reader the same sentences twice.
+
+    Returns ``(remaining_lead, text_to_emit)``, or ``None`` when the delta is
+    unrelated to the lead and must be forwarded as-is:
+
+    * delta inside the lead   -> consumed, emit nothing, shrink the lead
+    * delta reaches past it   -> lead consumed, emit only the new remainder
+
+    Only exact matches count. This is safe against the "repeated fragment" trap
+    that ``_dedupe_repeated_delta`` warns about (a formula's ``2a_1``, a closing
+    ``}``) because the lead is non-empty only in the brief window after a snapshot
+    ran ahead of the deltas, and every character it covers has provably been sent.
+    """
+    if not lead or not delta:
+        return None
+    if lead.startswith(delta):
+        return lead[len(delta):], ""
+    if delta.startswith(lead):
+        return "", delta[len(lead):]
+    return None
+
+
+def _final_fallback_remainder(streamed_text: str, fallback_text: str) -> str:
+    """Final (t==3) reconciliation ONLY: return the tail of the whole fallback
+    answer that has not been streamed yet.
+
+    This compares the ENTIRE streamed-so-far text against the ENTIRE fallback
+    answer and is meant to run exactly once, after the stream ends. Do NOT use
+    it as a per-delta guard: its ``fallback in streamed`` / signature-subset
+    branches would drop small repeated fragments (``2a_1``, a closing ``}``)
+    and corrupt formulas or code. Per-delta dedupe belongs in
+    ``_dedupe_repeated_delta``.
+
+    The upstream fallback is the server's authoritative full message for the
+    turn, so it regularly restates text we already streamed with cosmetic
+    differences: ``_message_content`` runs ``normalize_m365_media_text`` over it
+    (a bare image URL becomes ``![image](url)``) while streamed deltas are only
+    citation-cleaned, and M365 sometimes re-words a clause in the final frame.
+    Neither startswith/contains nor a strict signature-subset test catches those,
+    so emitting the fallback verbatim appended the WHOLE answer a second time --
+    the "reply shows up twice" bug. Fall back to a coverage ratio instead: a
+    fallback that is already ``_RESTATEMENT_COVERAGE`` covered by the stream adds
+    nothing, and a partially-covered one is trimmed to whatever follows the END of
+    the delivered text (see ``_fallback_tail_after_delivered``) so neither its
+    already-streamed head nor a run the stream skipped is sent twice.
+    """
+    if not fallback_text:
+        return ""
+    if not streamed_text:
+        return fallback_text
+    if fallback_text.startswith(streamed_text):
+        return fallback_text[len(streamed_text):]
+    if fallback_text in streamed_text:
+        return ""
+    streamed_sig = _dedupe_signature(streamed_text)
+    fallback_sig = _dedupe_signature(fallback_text)
+    if streamed_sig and fallback_sig and (streamed_sig in fallback_sig or fallback_sig in streamed_sig):
+        return ""
+    if _signature_coverage(streamed_sig, fallback_sig) >= _RESTATEMENT_COVERAGE:
+        return ""
+    # Partially covered: append only what follows the END of the delivered text.
+    # Trimming by common PREFIX was wrong whenever the stream lost a run from its
+    # middle -- the prefix stops at the gap, so everything after the gap came back
+    # as a duplicate.
+    tail = _fallback_tail_after_delivered(streamed_text, fallback_text)
+    if tail is not None:
+        return tail
+    prefix = _common_prefix_len(streamed_text, fallback_text)
+    return fallback_text[prefix:] if prefix else fallback_text
+
+
+def _common_prefix_len(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+def _dedupe_repeated_delta(streamed_text: str, delta: str) -> str:
+    r"""Per-delta guard for the SSE response layer (response_helpers).
+
+    ``chat_stream`` already yields a deduplicated incremental stream (the t==3
+    fallback reconciliation happens inside substrate_client). As defense in
+    depth the response layer must still drop a delta that RE-EMITS the entire
+    answer so far -- observed with media answers, where the model restates the
+    whole message swapping a raw backtick-wrapped URL for a
+    ``[text](cite...)`` link.
+
+    It must NOT drop a delta merely because its short text already appeared
+    earlier: math and code answers legitimately repeat tokens such as ``2a_1``,
+    ``+ 3d = 6`` or a closing ``}`` across separate deltas. Dropping those
+    corrupts formulas (``\\frac{8}{2}(2a_1+7d)`` losing ``2a_1``) and silently
+    deletes code.
+
+    Rule: drop the delta only when its dedupe-signature is a SUPERSET of the
+    whole streamed-so-far signature (the delta reproduces everything already
+    emitted, modulo URL/citation noise). Incremental fragments never satisfy
+    this because their signature is a small subset, not a superset.
+    """
+    if not delta or not streamed_text:
+        return delta
+    streamed_sig = _dedupe_signature(streamed_text)
+    delta_sig = _dedupe_signature(delta)
+    if streamed_sig and delta_sig and streamed_sig in delta_sig:
+        return ""
+    return delta
+
+
+def _message_content(entry: dict) -> str:
+    text = clean_m365_citations(normalize_m365_media_text(str(entry.get("text") or "")))
+    image_urls = _extract_image_urls(entry)
+    if image_urls and _is_image_loading_placeholder(text):
+        text = ""
+    image_markdown = [_image_markdown(url) for url in image_urls]
+    parts = [part for part in [text, *image_markdown] if part]
+    return "\n\n".join(parts)
+
+
+def _is_image_loading_placeholder(text: str) -> bool:
+    return text.strip().lower() == "loading image"
+
+
+def _image_markdown(url: str) -> str:
+    return f"![image]({url})"
+
+
+def _extract_image_urls(value: object) -> list[str]:
+    urls: list[str] = []
+
+    def add(url: object) -> None:
+        if not isinstance(url, str):
+            return
+        cleaned = url.strip().strip("`").strip()
+        if not cleaned.startswith(("http://", "https://")):
+            return
+        if cleaned not in urls:
+            urls.append(cleaned)
+
+    def walk(node: object, image_context: bool = False) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item, image_context)
+            return
+        if isinstance(node, str):
+            if image_context:
+                add(node)
+            return
+        if not isinstance(node, dict):
+            return
+
+        type_value = str(node.get("type") or node.get("contentType") or node.get("mediaType") or "").lower()
+        kind_value = str(node.get("kind") or node.get("role") or "").lower()
+        local_image_context = image_context or type_value == "image" or type_value.startswith("image/") or "image" in kind_value
+
+        for key in ("url", "contentUrl", "source", "src", "imageUrl", "thumbnailUrl"):
+            if key in node and local_image_context:
+                add(node.get(key))
+
+        for key, child in node.items():
+            key_image_context = local_image_context or key in {"adaptiveCards", "attachments", "images", "image", "thumbnail", "previewImage"}
+            walk(child, key_image_context)
+
+    walk(value)
+    return urls
+
+
+# Appended to a turn that carries NO tool contract, for tones measured to have no
+# server-side interpreter (tone_options.TONE_SERVER_INTERPRETER). Those tones answer
+# "what is the SHA-256 of <nonce>" with a fabricated 64-hex digest -- measured, and
+# with no retraction when there is no tool list to notice the gap. A tools-bearing
+# turn is covered by the exact-computation rule in the injected contract instead, so
+# this only fires where that rule cannot reach.
+#
+# ponytail: prompt-level again, and it only claims what was measured -- the model
+# stops inventing when told it cannot execute. Nothing here can verify an arbitrary
+# claimed value, so a tone that ignores the sentence is not detectable downstream.
+# Three call sites send an empty context, so a no-tools turn reaches this note from all
+# three. Only the router turn is excluded (see _combine_text). The other two were measured
+# with the shipped sentence on Claude_Sonnet, one turn per arm, and neither changed
+# outcome:
+#   /v1/images/generations (routes_api_images, "Generate exactly one image...") -- the
+#       image is still produced, a designerapp document.ashx url in both arms.
+#   /admin/model-test (routes_admin_modeltest, "Reply with one word: pong") -- still
+#       answered non-empty, so classify_probe still reports "ok" to the operator.
+# Both survive because the sentence is conditional on an exact computation being asked
+# for; a non-computation turn is unaffected ("capital of France" -> "Paris."). The router
+# turn is different in kind -- its contract is in the prompt, so it contradicts.
+_NO_INTERPRETER_NOTE = (
+    "You have no code execution in this environment. If an exact result requires "
+    "computation (a hash, checksum, large-number arithmetic, an encoding conversion), "
+    "say you cannot compute it exactly here instead of producing a value from memory: "
+    "a wrong value is indistinguishable from a right one."
+)
+
+
+def _combine_text(prompt: str, context: list[str], tone: str | None = None) -> str:
+    has_tools = any("tool_call" in c for c in context)
+    result = "\n\n".join(context) + "\n\n---\n\n" + prompt if context else prompt
+    if has_tools:
+        # Scoped to "any listed tool", not just file actions: the earlier wording
+        # named only file operations, so a caller's get_weather or calculate tool
+        # got no instruction at all and was answered from the model's own
+        # abilities every time.
+        #
+        # The two prohibitions are the failure modes seen live. M365 carries its
+        # own tool set (web.run, image_gen, python, record_memory) and treats the
+        # injected list as fictional -- verbatim: "that tool isn't available in
+        # this conversation" -- or quietly substitutes a native equivalent,
+        # answering a Write by generating a real hosted attachment and returning
+        # its download link. Neither reaches the client as a tool call, so the
+        # host never runs the tool it asked for.
+        #
+        # ponytail: prompt-level mitigation only, and compliance stays partial --
+        # the upstream model's willingness is not ours to control. A durable fix
+        # needs a real tool-calling channel from M365, which the substrate
+        # protocol does not currently expose.
+        result += (
+            "\n\n[FORMAT] To use any tool listed above, respond with a ```tool_call``` JSON block. "
+            "Example: ```tool_call\n"
+            '{"name": "Write", "arguments": {"file_path": "S:/path/file.ext", "content": "..."}}\n'
+            "```\n"
+            "The tools listed above are real and available to you; a program executes them and "
+            "returns their results. Ignore any other tools you may normally have -- do not search "
+            "the web, run code, or generate, upload or attach a file to answer a request that a "
+            "listed tool covers. Never claim a listed tool is unavailable. Emitting the "
+            "```tool_call``` block is the only valid way to invoke one.\n"
+            # Second-best outcome, deliberately shaped to what _extract_prose_write
+            # keys on: a backticked ABSOLUTE path plus a fenced block whose language
+            # tag matches the extension. When the model will not emit the fence --
+            # the common case, since M365 prefers to answer a file request with a
+            # hosted attachment -- this at least lands in the shape the prose
+            # fallback can still synthesize a Write from. Anything looser is not
+            # worth having: the fallback's strictness is what stops a usage-example
+            # block from overwriting a real file.
+            "If you will not emit the block, write the answer inline instead: a backticked "
+            "absolute path (`S:/dir/name.ext`) on its own line, then the complete file body in a "
+            "fenced code block tagged with its language. Never attach a file in place of this."
+            "[/FORMAT]"
+        )
+    elif tone_server_interpreter(tone) == "absent" and _NO_TOOL_MARKER not in prompt:
+        # The router's classification turn (tool_router.build_router_prompt, sent as
+        # client.chat(prompt, [])) carries its contract in the PROMPT, not the context,
+        # so has_tools is False for it. It lists tools that do run -- possibly a shell
+        # -- and demands exactly one line of output, so appending "you have no code
+        # execution" there would both contradict it and turn a hash request the router
+        # should route into a refusal. The marker is that contract's fingerprint.
+        # A user prompt that happens to contain the marker loses the sentence: an
+        # acceptable false negative, since it drops a mitigation, never breaks a turn.
+        result += "\n\n" + _NO_INTERPRETER_NOTE
+    return result
+
+# --- fork: citation tracker + source attributions ---
+_SRC_PUA = "-"
+_SRC_MARKDOWN_CITE_RE = re.compile(
+    rf"\[([^\]]*)\]\(\s*([{_SRC_PUA}]*cite[{_SRC_PUA}][^)]*)\)",
     re.IGNORECASE,
 )
 # Require a non-empty ascii id so "cite" alone is NOT consumed (held instead).
-_BARE_PUA_CITE_RE = re.compile(
-    rf"[{_PUA}]cite[{_PUA}]([A-Za-z0-9_]+)[{_PUA}]?",
+_SRC_BARE_PUA_CITE_RE = re.compile(
+    rf"[{_SRC_PUA}]cite[{_SRC_PUA}]([A-Za-z0-9_]+)[{_SRC_PUA}]?",
     re.IGNORECASE,
 )
 # Leftover after a split ate the cite opener: "turn1search6" or plain "turn1search6".
-_LOOSE_TURN_CITE_RE = re.compile(
-    rf"(?:[{_PUA}])?(turn\d+(?:search|file|news|image|video|base|knowledge|gpt|cid|doc)\d+)(?:[{_PUA}])?",
+_SRC_LOOSE_TURN_CITE_RE = re.compile(
+    rf"(?:[{_SRC_PUA}])?(turn\d+(?:search|file|news|image|video|base|knowledge|gpt|cid|doc)\d+)(?:[{_SRC_PUA}])?",
     re.IGNORECASE,
 )
 # Chinese-bracket web cites used by some M365 answers: 【1-1fd57a】 or 【3】.
-_BRACKET_CITE_RE = re.compile(
+_SRC_BRACKET_CITE_RE = re.compile(
     r"【\s*(\d{1,3})\s*(?:[-–—]\s*([0-9a-fA-F]{3,16}))?\s*】"
 )
-_SYDNEY_FOOTNOTE_RE = re.compile(r"\[\^(\d+)\^\]")
-_CITE_KEY_NOISE_RE = re.compile(rf"[{_PUA}]+")
+_SRC_SYDNEY_FOOTNOTE_RE = re.compile(r"\[\^(\d+)\^\]")
+_SRC_CITE_KEY_NOISE_RE = re.compile(rf"[{_SRC_PUA}]+")
 
 # Incomplete tails we must HOLD across stream deltas (not emit raw).
-_INCOMPLETE_CITE_TAIL_RE = re.compile(
+_SRC_INCOMPLETE_CITE_TAIL_RE = re.compile(
     rf"(?:"
-    rf"\[[^\]]*\]\(\s*[{_PUA}]*cite[{_PUA}][^)]*$"  # open markdown cite
-    rf"|[{_PUA}]cite[{_PUA}][A-Za-z0-9_]*$"          # open bare PUA cite
-    rf"|[{_PUA}]cite$"
-    rf"|[{_PUA}]$"                                    # lone PUA starter
+    rf"\[[^\]]*\]\(\s*[{_SRC_PUA}]*cite[{_SRC_PUA}][^)]*$"  # open markdown cite
+    rf"|[{_SRC_PUA}]cite[{_SRC_PUA}][A-Za-z0-9_]*$"          # open bare PUA cite
+    rf"|[{_SRC_PUA}]cite$"
+    rf"|[{_SRC_PUA}]$"                                    # lone PUA starter
     rf"|\[$"                                          # lone "["
     rf"|\[[^\]]*$"                                    # open "[" label
     rf")",
@@ -57,7 +570,7 @@ _INCOMPLETE_CITE_TAIL_RE = re.compile(
 
 def _normalize_cite_key(raw: str) -> str:
     """Collapse a PUA cite target to a stable ascii key (e.g. ``turn1search0``)."""
-    key = _CITE_KEY_NOISE_RE.sub("", raw or "")
+    key = _SRC_CITE_KEY_NOISE_RE.sub("", raw or "")
     key = re.sub(r"^cite", "", key, flags=re.IGNORECASE)
     key = re.sub(r"[^A-Za-z0-9_]+", "", key).lower()
     return key
@@ -186,8 +699,8 @@ class CitationTracker:
             num = self._num_for(key, preferred=idx)
             return f"[{num}]"
 
-        cleaned = _MARKDOWN_CITE_RE.sub(md_repl, text)
-        cleaned = _BARE_PUA_CITE_RE.sub(bare_repl, cleaned)
+        cleaned = _SRC_MARKDOWN_CITE_RE.sub(md_repl, text)
+        cleaned = _SRC_BARE_PUA_CITE_RE.sub(bare_repl, cleaned)
         # If a footnote is immediately followed by the same turn token residual
         # (common when a prior delta already emitted [n] and a later delta
         # carries turnNsearchM), drop the residual instead of doubling.
@@ -197,9 +710,9 @@ class CitationTracker:
             cleaned,
             flags=re.IGNORECASE,
         )
-        cleaned = _LOOSE_TURN_CITE_RE.sub(loose_repl, cleaned)
-        cleaned = _BRACKET_CITE_RE.sub(bracket_repl, cleaned)
-        cleaned = _SYDNEY_FOOTNOTE_RE.sub(r"[\1]", cleaned)
+        cleaned = _SRC_LOOSE_TURN_CITE_RE.sub(loose_repl, cleaned)
+        cleaned = _SRC_BRACKET_CITE_RE.sub(bracket_repl, cleaned)
+        cleaned = _SRC_SYDNEY_FOOTNOTE_RE.sub(r"[\1]", cleaned)
         cleaned = re.sub(r"[-]+", "", cleaned)
         cleaned = re.sub(r"[^\S\n]{2,}", " ", cleaned)
         # Re-hold if replacements left a new incomplete tail.
@@ -212,83 +725,16 @@ class CitationTracker:
         if not self._hold:
             return ""
         held, self._hold = self._hold, ""
-        held = _MARKDOWN_CITE_RE.sub(lambda m: (m.group(1) or "").strip(), held)
-        held = _BARE_PUA_CITE_RE.sub("", held)
-        held = _LOOSE_TURN_CITE_RE.sub("", held)
-        held = _BRACKET_CITE_RE.sub("", held)
+        held = _SRC_MARKDOWN_CITE_RE.sub(lambda m: (m.group(1) or "").strip(), held)
+        held = _SRC_BARE_PUA_CITE_RE.sub("", held)
+        held = _SRC_LOOSE_TURN_CITE_RE.sub("", held)
+        held = _SRC_BRACKET_CITE_RE.sub("", held)
         held = re.sub(r"[-]+", "", held)
         held = re.sub(r"turn\d+\w*", "", held, flags=re.I)
         held = re.sub(r"\bcite\b", "", held, flags=re.I)
         held = re.sub(r"\[[^\]]*$", "", held)
         held = re.sub(r"【[^】]*$", "", held)
         return held
-
-
-def clean_m365_citations(text: str, tracker: CitationTracker | None = None) -> str:
-    """Resolve M365 citation markers to plain ``[n]`` markers (or strip-compatible).
-
-    When ``tracker`` is provided, marker numbers are stable across deltas of
-    the same turn and incomplete openers are held. Without a tracker each call
-    uses a fresh sequence (back-compat for one-shot cleaners / tests).
-    """
-    active = tracker if tracker is not None else CitationTracker()
-    out = active.clean(text)
-    if tracker is None:
-        out += active.flush()
-    return out
-
-
-# Full-removal patterns for dedupe signatures / fallback comparison only.
-# Body streaming uses CitationTracker.clean (keeps labels + [n]); signatures
-# must ignore both the opaque form AND the resolved marker form so a
-# "URL variant" and a "cite variant" of the same answer still match.
-_STRIP_MARKDOWN_CITE_RE = re.compile(
-    r"\[[^\]]*\]\(\s*[-]*cite[-][^)]*\)",
-    re.IGNORECASE,
-)
-_STRIP_BARE_PUA_CITE_RE = re.compile(
-    r"[-]cite[-][A-Za-z0-9_]*[-]?",
-    re.IGNORECASE,
-)
-_STRIP_LOOSE_TURN_RE = re.compile(
-    r"[-]?turn\d+(?:search|file|news|image|video|base|knowledge|gpt|cid|doc)\d+[-]?",
-    re.IGNORECASE,
-)
-_STRIP_BRACKET_CITE_RE = re.compile(
-    r"【\s*\d{1,3}\s*(?:[-–—]\s*[0-9a-fA-F]{3,16})?\s*】"
-)
-# ``[n]`` (legacy) and plain ``[n]`` (current emit form). Cap digits so we do
-# not strip arbitrary ``[2026]``-style years / code indexes aggressively in the
-# hot path — cite counts from M365 stay small.
-_STRIP_FOOTNOTE_RE = re.compile(r"\[\^\d{1,3}\^?\]|\[\d{1,3}\]")
-
-
-def strip_m365_citations(text: str) -> str:
-    """Remove citation markers entirely (labels, PUA targets, footnotes).
-
-    Used by ``_dedupe_signature`` so re-emissions that only swap a raw URL for a
-    cite link / footnote are recognized as duplicates. Not used on the streamed
-    body — that path wants the human-visible label preserved.
-    """
-    if not text:
-        return ""
-    if not (
-        "cite" in text.lower()
-        or "turn" in text.lower()
-        or "[^" in text
-        or re.search(r"\[\d{1,3}\]", text) is not None
-        or "【" in text
-        or any("" <= c <= "" for c in text)
-    ):
-        return text
-    cleaned = _STRIP_MARKDOWN_CITE_RE.sub("", text)
-    cleaned = _STRIP_BARE_PUA_CITE_RE.sub("", cleaned)
-    cleaned = _STRIP_LOOSE_TURN_RE.sub("", cleaned)
-    cleaned = _STRIP_BRACKET_CITE_RE.sub("", cleaned)
-    cleaned = _STRIP_FOOTNOTE_RE.sub("", cleaned)
-    cleaned = re.sub(r"[-]+", "", cleaned)
-    cleaned = re.sub(r"[^\S\n]{2,}", " ", cleaned)
-    return cleaned
 
 
 def _parse_reference_metadata(raw: object) -> dict:
@@ -743,209 +1189,6 @@ def sources_markdown_for_stream(
     return block
 
 
-def _capture_suspicious_response_event(sink, msg: dict) -> None:
-    if sink is None:
-        return
-    try:
-        probe = json.dumps(msg, ensure_ascii=False).lower()
-    except (TypeError, ValueError):
-        return
-    if any(
-        key in probe
-        for key in (
-            "image",
-            "card",
-            "render",
-            "attachment",
-            "contenturl",
-            "downloadurl",
-            "filetoken",
-            "thumbnail",
-            "generatedgraphic",
-            "generatedaudio",
-            "asyncgw",
-            "citation",
-        )
-    ):
-        sink(msg)
-
-
-def _dedupe_signature(text: str) -> str:
-    # Strip (not resolve) citations so URL-vs-cite re-emissions share a signature.
-    # Observed near-duplicate finals differ only by cite/link presentation, e.g.:
-    #   streamed:  类似 `[[1]](url)` 的来源链接
-    #   fallback:  类似 `url` 的来源链接
-    # or bare backticks vs markdown links vs resolved [n] markers. Treating all
-    # of those as noise keeps the prose signature stable across re-emissions.
-    normalized = strip_m365_citations(text)
-    normalized = re.sub(r"\[\[[^\]]*\]\([^)]*\)", "", normalized)  # [[1]](url)
-    normalized = re.sub(r"\[[^\]]+\]\([^)]*\)", "", normalized)     # [text](any)
-    normalized = re.sub(r"`[^`]+`", "", normalized)                 # `url` / `[[1]](url)`
-    normalized = re.sub(r"https?://\S+", "", normalized)            # bare URLs
-    normalized = re.sub(r"\[\^?\d{1,3}\^?\]", "", normalized)       # resolved [n] / [^n]
-    normalized = re.sub(r"\s+", "", normalized)
-    return normalized
-
-
-def _strip_stream_edge_noise(text: str) -> str:
-    """Trim trailing whitespace and a lone dangling ``\\`` often left by a cut delta."""
-    return text.rstrip(" \t\r\n\\")
-
-
-def _unsent_fallback_suffix(streamed_text: str, fallback_text: str) -> str | None:
-    """Best-effort recovery of the fallback tail that has not been streamed yet.
-
-    Used when raw ``startswith`` fails because of cite/link markup drift or a
-    dangling stream-edge character, but the bodies still largely align. Returns
-    ``None`` when alignment is too weak to trust.
-    """
-    from difflib import SequenceMatcher
-
-    streamed = _strip_stream_edge_noise(streamed_text)
-    if not streamed:
-        return fallback_text
-    if fallback_text.startswith(streamed):
-        return fallback_text[len(streamed):]
-
-    matcher = SequenceMatcher(None, streamed, fallback_text, autojunk=False)
-    blocks = [(a, b, size) for a, b, size in matcher.get_matching_blocks() if size > 0]
-    if not blocks:
-        return None
-    matched = sum(size for _, _, size in blocks)
-    # Require most of the streamed body to appear in the fallback, otherwise we
-    # risk inventing a "suffix" from an unrelated final.
-    if matched < int(0.80 * len(streamed)):
-        return None
-    # Take the match that advances farthest through the streamed text; the
-    # fallback index just after that block is the unsent tail start.
-    a_idx, b_idx, size = max(blocks, key=lambda item: item[0] + item[2])
-    if a_idx + size < int(0.85 * len(streamed)):
-        return None
-    return fallback_text[b_idx + size:]
-
-
-def _meaningful_remainder(text: str) -> str:
-    """Keep a recovered tail only when it still has real prose after cite/link strip."""
-    if not text:
-        return ""
-    if not _dedupe_signature(text):
-        return ""
-    return text
-
-
-def _final_fallback_remainder(streamed_text: str, fallback_text: str) -> str:
-    """Final (t==3) reconciliation ONLY: return the tail of the whole fallback
-    answer that has not been streamed yet.
-
-    This compares the ENTIRE streamed-so-far text against the ENTIRE fallback
-    answer and is meant to run exactly once, after the stream ends. Do NOT use
-    it as a per-delta guard: its ``fallback in streamed`` / signature-subset
-    branches would drop small repeated fragments (``2a_1``, a closing ``}``)
-    and corrupt formulas or code. Per-delta dedupe belongs in
-    ``_dedupe_repeated_delta``.
-
-    Near-duplicate / signature-subset guards must NOT discard a fallback that
-    still carries an unsent prose tail (production: long essay cut at
-    ``学习顺序是：`` while type=2 held the numbered list).
-    """
-    if not fallback_text:
-        return ""
-    if not streamed_text:
-        return fallback_text
-    if fallback_text.startswith(streamed_text):
-        return fallback_text[len(streamed_text):]
-    # Stream often ends mid-control-char / trailing backslash while type=2 is
-    # the clean full answer; treat that edge noise as already consumed.
-    streamed_clean = _strip_stream_edge_noise(streamed_text)
-    if streamed_clean and fallback_text.startswith(streamed_clean):
-        return fallback_text[len(streamed_clean):]
-    if fallback_text in streamed_text:
-        return ""
-    streamed_sig = _dedupe_signature(streamed_text)
-    fallback_sig = _dedupe_signature(fallback_text)
-    if streamed_sig and fallback_sig:
-        if streamed_sig == fallback_sig:
-            return ""
-        # Fallback already fully covered by what we streamed (possibly with
-        # extra stream-only noise) — nothing left to emit.
-        if fallback_sig in streamed_sig:
-            return ""
-        # Streamed body is a prefix (modulo cite/URL noise) of the final. Old
-        # code returned "" here and swallowed real endings such as a trailing
-        # numbered list. Recover the unsent suffix instead.
-        if streamed_sig in fallback_sig:
-            recovered = _unsent_fallback_suffix(streamed_text, fallback_text)
-            if recovered is None:
-                return ""
-            return _meaningful_remainder(recovered)
-    # Near-duplicate finals: same essay with slightly different cite markup that
-    # still leaves a tiny signature residual after stripping. Only engage for
-    # long answers so short legitimate revisions are not swallowed — and only
-    # drop when there is no meaningful unsent tail.
-    if (
-        streamed_sig
-        and fallback_sig
-        and len(streamed_sig) >= 200
-        and len(fallback_sig) >= 200
-        and abs(len(streamed_sig) - len(fallback_sig))
-        <= max(40, int(0.05 * max(len(streamed_sig), len(fallback_sig))))
-    ):
-        from difflib import SequenceMatcher
-
-        ratio = SequenceMatcher(None, streamed_sig, fallback_sig, autojunk=False).ratio()
-        if ratio >= 0.97:
-            recovered = _unsent_fallback_suffix(streamed_text, fallback_text)
-            if recovered is None:
-                return ""
-            remainder = _meaningful_remainder(recovered)
-            # Ignore tiny markup-only drift; keep real prose tails (lists, etc.).
-            if not remainder:
-                return ""
-            if _dedupe_signature(remainder) in streamed_sig:
-                return ""
-            # Short residual with almost-equal signatures is usually cite churn;
-            # require either a longer tail or a clear length advantage on fallback.
-            rem_sig = _dedupe_signature(remainder)
-            if len(rem_sig) < 8 and len(fallback_sig) <= len(streamed_sig) + 20:
-                return ""
-            return remainder
-    return fallback_text
-
-
-def _dedupe_repeated_delta(streamed_text: str, delta: str) -> str:
-    r"""Per-delta guard for the SSE response layer (response_helpers).
-
-    ``chat_stream`` already yields a deduplicated incremental stream (the t==3
-    fallback reconciliation happens inside substrate_client). As defense in
-    depth the response layer must still drop a delta that RE-EMITS the entire
-    answer so far -- observed with media answers, where the model restates the
-    whole message swapping a raw backtick-wrapped URL for a
-    ``[text](cite...)`` link.
-
-    It must NOT drop a delta merely because its short text already appeared
-    earlier: math and code answers legitimately repeat tokens such as ``2a_1``,
-    ``+ 3d = 6`` or a closing ``}`` across separate deltas. Dropping those
-    corrupts formulas (``\\frac{8}{2}(2a_1+7d)`` losing ``2a_1``) and silently
-    deletes code.
-
-    Rule: drop the delta only when its dedupe-signature is a SUPERSET of the
-    whole streamed-so-far signature (the delta reproduces everything already
-    emitted, modulo URL/citation noise). Incremental fragments never satisfy
-    this because their signature is a small subset, not a superset.
-    """
-    if not delta or not streamed_text:
-        return delta
-    streamed_sig = _dedupe_signature(streamed_text)
-    delta_sig = _dedupe_signature(delta)
-    if streamed_sig and delta_sig and streamed_sig in delta_sig:
-        return ""
-    return delta
-
-
-# Message types that can never be the final answer body. M365 sends these as
-# regular ``messages`` entries in type=1/type=2 payloads; treating their text as
-# a fallback answer leaks chain-of-thought / search progress / safety refusals
-# ("Hmm...it looks like I can't chat about this...") onto the end of the reply.
 _NON_BODY_MESSAGE_TYPES = {
     "Progress",            # incl. ChainOfThoughtSummary + EarlyProgress
     "ReferencesListComplete",
@@ -993,74 +1236,3 @@ def is_chain_of_thought_message(entry: dict) -> bool:
     )
 
 
-def _message_content(entry: dict) -> str:
-    text = clean_m365_citations(normalize_m365_media_text(str(entry.get("text") or "")))
-    image_urls = _extract_image_urls(entry)
-    if image_urls and _is_image_loading_placeholder(text):
-        text = ""
-    image_markdown = [_image_markdown(url) for url in image_urls]
-    parts = [part for part in [text, *image_markdown] if part]
-    return "\n\n".join(parts)
-
-
-def _is_image_loading_placeholder(text: str) -> bool:
-    return text.strip().lower() == "loading image"
-
-
-def _image_markdown(url: str) -> str:
-    return f"![image]({url})"
-
-
-def _extract_image_urls(value: object) -> list[str]:
-    urls: list[str] = []
-
-    def add(url: object) -> None:
-        if not isinstance(url, str):
-            return
-        cleaned = url.strip().strip("`").strip()
-        if not cleaned.startswith(("http://", "https://")):
-            return
-        if cleaned not in urls:
-            urls.append(cleaned)
-
-    def walk(node: object, image_context: bool = False) -> None:
-        if isinstance(node, list):
-            for item in node:
-                walk(item, image_context)
-            return
-        if isinstance(node, str):
-            if image_context:
-                add(node)
-            return
-        if not isinstance(node, dict):
-            return
-
-        type_value = str(node.get("type") or node.get("contentType") or node.get("mediaType") or "").lower()
-        kind_value = str(node.get("kind") or node.get("role") or "").lower()
-        local_image_context = image_context or type_value == "image" or type_value.startswith("image/") or "image" in kind_value
-
-        for key in ("url", "contentUrl", "source", "src", "imageUrl", "thumbnailUrl"):
-            if key in node and local_image_context:
-                add(node.get(key))
-
-        for key, child in node.items():
-            key_image_context = local_image_context or key in {"adaptiveCards", "attachments", "images", "image", "thumbnail", "previewImage"}
-            walk(child, key_image_context)
-
-    walk(value)
-    return urls
-
-
-def _combine_text(prompt: str, context: list[str]) -> str:
-    if not context:
-        return prompt
-    has_tools = any("tool_call" in c for c in context)
-    result = "\n\n".join(context) + "\n\n---\n\n" + prompt
-    if has_tools:
-        result += (
-            "\n\n[FORMAT] Respond with a ```tool_call``` JSON block for any file action. "
-            "Example: ```tool_call\n"
-            '{"name": "Write", "arguments": {"file_path": "S:/path/file.ext", "content": "..."}}\n'
-            "``` No other output format is valid for file operations.[/FORMAT]"
-        )
-    return result

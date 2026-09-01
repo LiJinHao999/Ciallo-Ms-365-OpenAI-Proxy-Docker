@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from .template_assets import _GLASS_SELECT_CSS, _GLASS_SELECT_JS, _NO_SPIN_CSS
+from .template_assets import _FIELD_TIP_CSS, _GLASS_SELECT_CSS, _GLASS_SELECT_JS, _NO_SPIN_CSS, _STILL_DECOR_CSS
+from .template_pkce import _USER_PKCE_JS
 from .template_user_account_js import _USER_ACCOUNT_JS
 from .template_user_config_js import _USER_CONFIG_JS
 from .template_user_i18n import _USER_I18N_JS
+from .template_user_sessions_js import _USER_SESSIONS_JS
 
 _USER_HTML = """<!DOCTYPE html>
 <html lang="zh">
@@ -62,6 +64,11 @@ button{color:#050815;border:none;border-radius:10px;padding:.55rem 1rem;font-siz
 button:hover{transform:translateY(-2px);box-shadow:0 16px 32px rgba(96,242,255,.34)}
 button:disabled{opacity:.5;cursor:not-allowed;transform:none}
 .btn-ghost{background:var(--chip);background-image:none;color:var(--strong);border:1px solid var(--chip-border);box-shadow:none}
+/* The sign-in panel markup is shared with /admin, which styles its secondary
+   buttons with an inline chip background and has no per-button top margin. */
+.pkce-panel button{margin-top:0}
+.pkce-panel button[style*="background:var(--chip)"]{background-image:none;color:var(--strong);border:1px solid var(--chip-border);box-shadow:none}
+.pkce-panel input{margin-top:0;border-radius:6px}
 .compact-action{width:58px;margin:0;padding:.2rem .55rem!important;font-size:.75rem!important;text-align:center;display:inline-flex;align-items:center;justify-content:center}
 .call-param-box{background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--text);padding:.6rem .7rem;font-size:.9rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}
 .call-param-row{display:grid;grid-template-columns:72px minmax(0,1fr) 58px;align-items:center;gap:.5rem;font-size:.8rem;color:var(--muted);margin-bottom:.4rem}
@@ -82,7 +89,7 @@ select option:checked{background:#1e40af;color:#fff}
 @keyframes userSelectGlow{50%{box-shadow:0 0 0 3px rgba(96,242,255,.22),0 0 30px rgba(255,94,219,.2),inset 0 1px 0 rgba(255,255,255,.14)}}
 .account-main select option{background:#10162f;color:#f3f6ff}
 body[data-theme="light"] .account-main select option{background:#fff;color:#1c1c1e}
-""" + _GLASS_SELECT_CSS + _NO_SPIN_CSS + """
+""" + _GLASS_SELECT_CSS + _NO_SPIN_CSS + _FIELD_TIP_CSS + """
 .account-main .glass-select.open{z-index:2000}
 .account-main .tone-select+.glass-select .glass-select-menu{left:0;right:auto;width:100%;max-width:100%;min-width:100%;overflow-x:hidden;overflow-y:auto}
 .account-main textarea{margin-top:.65rem}
@@ -124,9 +131,12 @@ body[data-theme="light"] .status-line,body[data-theme="light"] .status-line:firs
 .account-card{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:10px;align-items:start;min-height:600px;overflow:visible}
 .account-card:has(.glass-select.open){z-index:2000}
 .user-default-grid{display:grid;grid-template-columns:repeat(4,minmax(0,180px));gap:1rem;align-items:end;margin-top:.25rem}
-.user-config-field{display:flex;flex-direction:column;gap:.35rem;color:var(--strong);font-size:.86rem;font-weight:800;min-width:0}
+.user-config-field{position:relative;display:flex;flex-direction:column;gap:.35rem;color:var(--strong);font-size:.86rem;font-weight:800;min-width:0}
 body[data-lang="en"] .user-config-field,body[data-lang="en"] .user-media-suffix .user-config-label{font-size:.72rem;line-height:1.2;font-weight:700}
-body[data-lang="en"] .user-config-field>span,body[data-lang="en"] .user-config-label{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* English labels are long enough to need an ellipsis, but the rule must skip a
+   label wrapped in a .field-row: `display:block` would collapse the row and
+   `overflow:hidden` would clip the tip bubble out of existence. */
+body[data-lang="en"] .user-config-field>span:not(.field-row),body[data-lang="en"] .field-row>span:not(.field-tip),body[data-lang="en"] .user-config-label{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 body[data-lang="en"] .user-default-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:.75rem}
 body[data-lang="en"] .user-config-field input,body[data-lang="en"] .user-default-grid .glass-select-trigger{font-size:.78rem!important}
 body[data-lang="en"] button{font-size:.72rem!important;letter-spacing:0}
@@ -146,6 +156,20 @@ body[data-lang="en"] .card h2{font-size:.95rem}
 .user-default-grid .glass-select-trigger{height:38px!important;width:100%!important;box-sizing:border-box!important;padding:9px 34px 9px 14px!important;border-radius:14px!important;font-size:.86rem!important;font-weight:700!important}
 .mode-profile-card:has(.glass-select.open){overflow:visible;z-index:2000}
 .mode-profile-card .user-default-grid .glass-select-menu{left:0;right:auto;width:100%;min-width:100%;max-width:100%}
+/* One 180px column is too narrow to read three explanations in, and unlike the
+   admin grid this one never reflows, so a fixed wider bubble stays in the card. */
+.user-default-grid .field-tip-bubble{right:auto;width:290px}
+/* The caveat row that replaced the two prose hints. Not a grid field, so it has
+   to establish its own positioning context -- the bubble is absolutely positioned
+   against its containing block (same contract as .user-config-field /
+   .runtime-field-label). inline-flex keeps the label at its natural width so the
+   `!` icon sits right beside it instead of being pushed to the far edge by
+   .field-tip's margin-left:auto, and the bubble is wider than a grid field's
+   because it carries three measured caveats rather than one. */
+.user-notice{position:relative;display:inline-flex;align-items:center;margin-bottom:.5rem;font-size:.8rem;font-weight:800;color:var(--strong)}
+.user-notice .field-row{width:auto}
+.user-notice .field-tip{margin-left:.35rem}
+.user-notice .field-tip-bubble{right:auto;width:min(560px,78vw)}
 .user-media-suffix{margin-top:1.1rem}
 .user-media-suffix .user-config-label{font-size:.86rem;font-weight:800;color:var(--strong)}
 .user-media-suffix textarea{width:100%;box-sizing:border-box;min-height:60px;padding:9px 14px;background:rgba(96,242,255,.08);border:1px solid rgba(96,242,255,.45);border-radius:14px;color:var(--strong);font-size:.85rem;font-family:monospace;box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 8px 20px rgba(0,0,0,.16);resize:vertical;scrollbar-width:none;-ms-overflow-style:none}
@@ -157,6 +181,12 @@ body[data-lang="en"] .card h2{font-size:.95rem}
 .status-line{display:flex;justify-content:space-between;gap:.8rem;font-size:.78rem;color:var(--muted);border-bottom:1px solid rgba(255,255,255,.08);padding:.5rem 0}
 .status-line:first-child{border-top:1px solid rgba(255,255,255,.08)}
 .status-line b{color:var(--strong);font-weight:700;text-align:right;word-break:break-word}
+/* The session list is as long as the store allows (1000 rows), so it scrolls
+   instead of stretching the card: a `.card` taller than the compositor's max
+   texture (16384px in Chrome) silently stops painting its `backdrop-filter`,
+   and the whole viewport went flat grey-white from ~600 rows on. Same 520px
+   cap the admin session table uses. */
+#my-sessions-content{max-height:520px;overflow:auto;border-radius:8px;scrollbar-gutter:stable}
 .status-mark{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;padding:0;border-radius:50%;font-size:.55rem;font-weight:900;color:#050815;border:none;background:linear-gradient(135deg,var(--cyan),#d6fbff 52%,var(--gold));box-shadow:0 4px 10px rgba(96,242,255,.24),inset 0 1px 0 rgba(255,255,255,.4);line-height:1;position:relative;overflow:hidden}
 .status-mark:before{content:"";position:absolute;inset:0;border-radius:inherit;background:linear-gradient(180deg,rgba(255,255,255,.32),transparent 55%);pointer-events:none}
 .status-mark:after{display:none}
@@ -197,6 +227,7 @@ body[data-theme="light"] .glass-select.open .glass-select-trigger{border-color:r
 body[data-theme="light"] .glass-select-menu:before{background:linear-gradient(90deg,rgba(0,122,255,.35),rgba(88,86,214,.25),rgba(0,122,255,.35));animation:none;opacity:.45}
 body[data-theme="light"] .glass-select-option:hover{background:rgba(0,122,255,.08)!important;color:#1c1c1e!important}
 body[data-theme="light"] .glass-select-option.active{color:#007aff!important;background:rgba(0,122,255,.12)!important;box-shadow:inset 3px 0 0 #007aff!important}
+""" + _STILL_DECOR_CSS + """
 </style>
 </head>
 <body>
@@ -259,6 +290,8 @@ body[data-theme="light"] .glass-select-option.active{color:#007aff!important;bac
         <label class="section-title" data-i18n="manual_update_title">手动更新</label>
         <div class="row action-row"><button onclick="pushToken(this)" data-i18n="push_token_btn">更新 Token</button><span id="token-msg" class="msg"></span></div>
         <textarea id="acct-token" data-i18n-ph="push_token_ph" placeholder="粘贴 access_token 值或完整 wss:// URL。仅推送 Token 可临时使用，推送 Cookie 后才算绑定 Microsoft 账户。&#10;access_token / wss://substrate.office.com/..."></textarea>
+        <label class="section-title" data-i18n="pkce_section_title">授权登录 ( M365 Only )</label>
+        <div id="pkce-panel"></div>
       </div>
       <div class="account-side" id="account-status-panel"></div>
     </div>
@@ -271,10 +304,11 @@ body[data-theme="light"] .glass-select-option.active{color:#007aff!important;bac
       <span style="font-size:.7rem;color:#475569;margin-left:auto" data-i18n="click_expand">点击展开</span>
       </summary>
       <div style="margin-top:.75rem">
-      <div class="hint" data-i18n="user_tone_hint">保存后仅影响当前用户，不再跟随全局模板变化。</div>
+      <div class="user-notice"><span class="field-row"><span data-i18n="user_notice_label">注意事项</span><span class="field-tip" tabindex="0" role="note"><span class="field-tip-bubble"><span class="tip-line"><b data-i18n="user_notice_m365">M365 精确计算</b><span data-i18n="user_no_interpreter_hint">claude-sonnet-4-6 没有服务端代码执行：不带工具的轮次里，哈希、大数运算这类精确计算会直接答「算不了」，不然它会给一个看起来对的错值。要精确结果就声明一个能执行命令的工具，或改用 claude-sonnet-4-5，实测它既有服务端执行、也认工具调用。</span></span><span class="tip-line"><b data-i18n="user_notice_m365_others">其他 M365 模型</b><span data-i18n="user_other_tones_hint">服务端代码执行：Copilot_自动、Copilot_快速答复、Copilot_深度思考、claude-sonnet-4-5、gpt-5.6、gpt-5.5_Chat、gpt-5.5、gpt-5.4_Chat、gpt-5.4、gpt-5.3_Chat、gpt-5.3、gpt-5.2_Chat 实测都有，claude-fable-5、claude-opus、gpt-5.2 还没实测；gpt-5.6_Chat 三轮里两轮算对、一轮编了个假哈希，要精确值请另选一个或声明能执行命令的工具。工具调用：只有 claude-sonnet-4-6、claude-sonnet-4-5 实测遵守契约，Copilot_自动、Copilot_深度思考、gpt-5.6、gpt-5.5_Chat、gpt-5.5 实测不遵守——「工具调用规划」保持「自动」时只有这几个会多花一轮判定，其余模型不额外花轮数。</span></span><span class="tip-line"><b data-i18n="user_notice_consumer">个人版出图</b><span data-i18n="user_consumer_image_hint">要出图请选 copilot、copilot-smart、copilot-chat 或 copilot-search，实测这三种模式会真的返回图片。copilot-reasoning / copilot-thinking 会说「已为你生成」却一帧图都不发，copilot-study 只讲不画，copilot-research 给的是网页图搜结果，copilot-coco 会先反问一句——这是上游行为，代理这边没有图可交付。</span></span></span></span></span></div>
       <div class="user-default-grid">
         <label class="user-config-field" style="display:none"><span data-i18n="tone_title">对话模式</span><select id="tone" class="tone-select" onchange="saveTone()"></select></label>
-        <label class="user-config-field"><span data-i18n="run_permission_label">运行权限</span><select id="user-run-permission" class="tone-select" onchange="saveTone()"></select></label>
+        <label class="user-config-field"><span class="field-row"><span data-i18n="run_permission_label">运行权限</span><span class="field-tip" tabindex="0" role="note"><span class="field-tip-bubble"><span class="tip-line"><b data-i18n="run_permission_inherit">继承全局</b><span id="user-run-permission-default"></span></span><span class="tip-line"><b data-i18n="run_permission_read_only">只读</b><span data-i18n="run_permission_hint_read_only">只放行读取类工具调用，写入、执行类会被丢弃。</span></span><span class="tip-line"><b data-i18n="run_permission_full">完全</b><span data-i18n="run_permission_hint_full">放行客户端声明的全部工具调用。</span></span><span class="tip-line"><span data-i18n="run_permission_hint_ceiling">全局设置是上限：你只能收紧，不能放宽。</span></span></span></span></span><select id="user-run-permission" class="tone-select" onchange="saveTone()"></select></label>
+        <label class="user-config-field"><span class="field-row"><span data-i18n="tool_planning_label">工具调用规划</span><span class="field-tip" tabindex="0" role="note"><span class="field-tip-bubble"><span class="tip-line"><b data-i18n="tool_planning_inherit">继承全局</b><span id="user-tool-planning-default"></span></span><span class="tip-line"><b data-i18n="tool_planning_auto">自动</b><span data-i18n="tool_planning_hint_auto">只对实测不遵守契约的模式加一轮路由判定，其余模式不额外花轮数（默认）。</span></span><span class="tip-line"><b data-i18n="tool_planning_native">内联契约</b><span data-i18n="tool_planning_hint_native">契约写进提示词，永不多花轮数；模式不遵守时这一轮就没有工具调用。</span></span><span class="tip-line"><b data-i18n="tool_planning_router">路由模式</b><span data-i18n="tool_planning_hint_router">每轮先判定要不要调工具，判「不需要」也要多花一次上游往返。</span></span><span class="tip-line"><b data-i18n="tool_planning_studio">Studio Agent</b><span data-i18n="tool_planning_hint_studio">m365账户使用自己的 Studio Agent，未就绪或首个输出前不可用时回退Router。首个文本或工具增量发出后若失败，不再重试。</span></span></span></span></span><select id="user-tool-planning" class="tone-select" onchange="saveTone()"></select></label>
         <label class="user-config-field" style="display:none"><span data-i18n="model_alias_label">模型别名</span><input id="user-model-alias" onchange="saveTone()"></label>
         <label class="user-config-field"><span data-i18n="user_time_zone_label">更改时区</span><input id="user-time-zone" onchange="saveTone()"></label>
         <label class="user-config-field"><span data-i18n="ws_idle_timeout_label">对话响应超时分钟</span><input id="user-ws-idle-timeout" type="number" min="0" onchange="saveTone()"></label>
@@ -284,11 +318,34 @@ body[data-theme="light"] .glass-select-option.active{color:#007aff!important;bac
         <div class="hint" data-i18n="user_media_suffix_hint">填写后将强制覆盖全局媒体后缀，仅作用于你自己的 Key。用逗号、空格或换行分隔。留空则跟随全局。</div>
         <textarea id="user-media-suffix" rows="3" onchange="saveTone()" placeholder=""></textarea>
       </div>
+      <div class="user-media-suffix">
+        <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.35rem"><span class="user-config-label" data-i18n="user_proxy_label">出站代理</span><span id="user-proxy-msg" class="hint" style="opacity:0;transition:opacity .3s"></span></div>
+        <div class="hint" data-i18n="user_proxy_hint">仅作用于你绑定的账户。个人版 Copilot 与 M365 按来源 IP 分别风控，两者可能需要不同出口。格式 scheme://host:port，端口必填，支持 http/https/socks4/socks5。留空则跟随全局设置。</div>
+        <input id="user-proxy-url" type="text" onchange="saveAccountProxy()" placeholder="socks5h://127.0.0.1:1080" style="width:100%;box-sizing:border-box;padding:9px 14px;background:rgba(96,242,255,.08);border:1px solid rgba(96,242,255,.45);border-radius:14px;color:var(--strong);font-size:.85rem;font-family:monospace">
+      </div>
       </div>
       </details>
-    </div>
-
-    <div class="card">
+      <hr style="border:none;border-top:1px solid #334155;margin:1.1rem 0">
+      <details id="my-sessions-details" style="cursor:pointer" ontoggle="if(this.open)loadMySessions()">
+      <summary style="font-size:1rem;font-weight:600;color:var(--strong);list-style:none;display:flex;align-items:center;gap:.5rem">
+      <span data-i18n="my_sessions_title">会话管理</span>
+      <span id="sess-msg" class="msg"></span>
+      <span style="font-size:.7rem;color:#475569;margin-left:auto" data-i18n="click_expand">点击展开</span>
+      </summary>
+      <div style="margin-top:.75rem">
+      <div class="hint" data-i18n="my_sessions_hint">这里列出你自己的会话，以及它们在 M365 云端对应的对话。删除会同时删掉云端对话，不可恢复。</div>
+      <div class="row" style="flex-wrap:wrap;gap:.5rem;margin:.6rem 0 .35rem">
+        <input id="my-sess-ttl" type="number" min="0" style="width:150px">
+        <input id="my-sess-keep" type="number" min="0" style="width:150px">
+        <button class="btn-ghost" onclick="cleanupMySessions(this)" data-i18n="sess_cleanup_btn">执行清理</button>
+        <button class="btn-ghost" onclick="loadMySessions()" data-i18n="sess_refresh">刷新</button>
+        <span id="my-sessions-warn" class="hidden" style="margin-left:auto;cursor:help" title=""><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="#fbbf24" stroke-width="2" stroke-linecap="round" style="display:block"><circle cx="12" cy="12" r="9"></circle><path d="M12 7.5v5"></path><path d="M12 16.3h.01"></path></svg></span>
+      </div>
+      <div class="hint" data-i18n="sess_cleanup_hint">留空或 0 表示不启用该条件；勾选的会话永不被清理。</div>
+      <div id="my-sessions-content"></div>
+      </div>
+      </details>
+      <hr style="border:none;border-top:1px solid #334155;margin:1.1rem 0">
       <details id="tool-prompt-details" style="cursor:pointer">
       <summary style="font-size:1rem;font-weight:600;color:var(--strong);list-style:none;display:flex;align-items:center;gap:.5rem">
       <span data-i18n="tool_prompt_title">提示词增强</span>
@@ -340,6 +397,7 @@ function applyLang(){
   document.querySelectorAll('[data-i18n-ph]').forEach(el=>{const k=el.getAttribute('data-i18n-ph');if(i18n[lang][k]!=null)el.placeholder=i18n[lang][k]});
   document.querySelectorAll('[data-i18n-html]').forEach(el=>{const k=el.getAttribute('data-i18n-html');if(i18n[lang][k]!=null)el.innerHTML=i18n[lang][k]});
   renderToneOptions();
+  try{if(typeof renderMySessions==='function')renderMySessions()}catch(e){}
   try{
     if(typeof applyUserLangDynamic==='function' && _userMeCache){applyUserLangDynamic()}
     else if(getKey()){loadMe()}
@@ -351,6 +409,8 @@ function applyTheme(){const theme=localStorage.getItem('user_theme')||'dark';doc
 function toggleTheme(){localStorage.setItem('user_theme',(localStorage.getItem('user_theme')||'dark')==='dark'?'light':'dark');applyTheme()}
 """ + _USER_CONFIG_JS + """
 """ + _USER_ACCOUNT_JS + """
+""" + _USER_PKCE_JS + """
+""" + _USER_SESSIONS_JS + """
 applyTheme();
 applyLang();
 setInterval(tickUserCountdown,1000);

@@ -8,6 +8,7 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <a class="nav-item active" data-nav="home" onclick="switchView('home')"><span class="nav-ico">&#128202;</span><span data-i18n="nav_home">首页总览</span></a>
 <a class="nav-item" data-nav="users" onclick="switchView('users')"><span class="nav-ico">&#128100;</span><span data-i18n="nav_users">用户管理</span></a>
 <a class="nav-item" data-nav="accounts" onclick="switchView('accounts')"><span class="nav-ico">&#128273;</span><span data-i18n="nav_accounts">账户管理</span></a>
+<a class="nav-item" data-nav="sessions" onclick="switchView('sessions')"><span class="nav-ico">&#128172;</span><span data-i18n="nav_sessions">会话管理</span></a>
 <a class="nav-item" data-nav="settings" onclick="switchView('settings')"><span class="nav-ico">&#9881;&#65039;</span><span data-i18n="nav_settings">全局设置</span></a>
 <a class="nav-item" data-nav="debug" onclick="switchView('debug')"><span class="nav-ico">&#128295;</span><span data-i18n="nav_debug">调试</span></a>
 </nav>
@@ -39,10 +40,11 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <button onclick="loadKeys();loadAccounts()" style="margin-left:auto;font-size:.8rem;padding:5px 12px" data-i18n="dash_refresh">刷新</button>
 </div>
 <div id="dash-kpi" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:.6rem;margin-bottom:1.1rem"></div>
-<div style="display:flex;gap:1.2rem;flex-wrap:wrap">
-<div style="flex:1;min-width:230px"><div style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem" data-i18n="dash_acct_valid">账户有效 / 过期比</div><div id="dash-donut-acct"></div></div>
-<div style="flex:1;min-width:230px"><div style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem" data-i18n="dash_key_status">用户 启用 / 停用</div><div id="dash-donut-key"></div></div>
-<div style="flex:1;min-width:230px"><div style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem" data-i18n="dash_bind_status">用户 绑定 / 未绑定</div><div id="dash-donut-bind"></div></div>
+<div class="dash-overview-donuts" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1.2rem;align-items:start">
+<div style="min-width:0"><div style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem" data-i18n="dash_acct_valid">账户有效 / 过期比</div><div id="dash-donut-acct"></div></div>
+<div style="min-width:0"><div style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem" data-i18n="dash_key_status">用户 启用 / 停用</div><div id="dash-donut-key"></div></div>
+<div style="min-width:0"><div style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem" data-i18n="dash_bind_status">用户 绑定 / 未绑定</div><div id="dash-donut-bind"></div></div>
+<div style="min-width:0"><div style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem" data-i18n="dash_cumulative_usage">累计用量</div><div id="dash-model-share"></div></div>
 </div>
 </div>
 
@@ -52,10 +54,12 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 </div>
 
 <div class="card view-home">
-<div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.9rem"><h2 data-i18n="dash_calls_title" style="margin:0">调用统计</h2><button onclick="clearCallStats()" style="margin-left:auto;font-size:.8rem;padding:5px 12px" data-i18n="btn_clear">清空</button></div>
+<div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.9rem"><h2 data-i18n="dash_calls_title" style="margin:0">调用统计</h2><div style="display:flex;gap:.45rem;margin-left:auto"><button onclick="clearCallStats()" style="font-size:.8rem;padding:5px 12px" data-i18n="dash_clear_call_log">清空调用记录</button><button onclick="clearUsageStats()" style="font-size:.8rem;padding:5px 12px" data-i18n="dash_clear_usage">清空累计 Token</button></div></div>
 <div id="dash-stat-kpi" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:.6rem;margin-bottom:1rem"></div>
 <div style="font-size:.8rem;color:var(--muted);margin-bottom:.5rem" data-i18n="dash_tone_share">对话模式占比</div>
 <div id="dash-tone-share"></div>
+<div style="font-size:.8rem;color:var(--muted);margin:1.1rem 0 .5rem" data-i18n="dash_cache_title">会话复用与落盘</div>
+<div id="dash-cache"></div>
 </div>
 
 <div class="card view-accounts accounts-main-card">
@@ -121,9 +125,22 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <div id="keys-content"><span style="color:var(--faint)" data-i18n="loading">加载中...</span></div>
 </div>
 
-<div id="status-card" class="card view-accounts hide-card">
-<h2 style="margin:0 0 .5rem"><span data-i18n="title_status">Token 与 登录状态</span></h2>
-<div id="status-content"><span style="color:var(--faint)" data-i18n="loading">加载中...</span></div>
+<div class="card view-sessions">
+<div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.75rem;flex-wrap:wrap">
+<div class="flow-box" style="position:relative;border-radius:8px;min-width:200px"><select id="sess-key-filter" class="tone-select" onchange="loadSessions()" style="width:100%"></select></div>
+<label class="auto-toggle" title="cloud"><span data-i18n="sess_cloud">云端</span><input id="sess-cloud" type="checkbox" checked onchange="loadSessions()"><span class="role-track"></span></label>
+<button onclick="loadSessions()" style="margin-left:auto;font-size:.8rem;padding:5px 12px" data-i18n="dash_refresh">刷新</button>
+</div>
+<div style="font-size:.8rem;color:var(--faint);margin-bottom:.5rem" data-i18n="sess_hint">本地会话绑定与 M365 云端对话历史合并显示。删除云端对话会同时清掉指向它的本地绑定，否则该会话的下一轮必定失败。</div>
+<div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;padding:.6rem;margin-bottom:.6rem">
+<span style="font-size:.78rem;color:var(--muted)" data-i18n="sess_cleanup_label">批量清理</span>
+<input id="sess-ttl" type="number" min="0" style="width:120px;padding:6px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:6px;color:var(--strong);font-size:.82rem;outline:none">
+<input id="sess-keep" type="number" min="0" style="width:120px;padding:6px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:6px;color:var(--strong);font-size:.82rem;outline:none">
+<button onclick="cleanupSessions()" style="font-size:.8rem;padding:6px 14px;background:linear-gradient(135deg,#f59e0b,#b45309)" data-i18n="sess_cleanup_btn">执行清理</button>
+<span style="font-size:.75rem;color:var(--faint)" data-i18n="sess_cleanup_hint">留空或 0 表示不启用该条件；勾选的行永不被清理。</span>
+<span id="sessions-warn" class="hide-card" style="margin-left:auto;cursor:help" title=""><svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="#fbbf24" stroke-width="2" stroke-linecap="round" style="display:block"><circle cx="12" cy="12" r="9"></circle><path d="M12 7.5v5"></path><path d="M12 16.3h.01"></path></svg></span>
+</div>
+<div id="sessions-content"><span style="color:var(--faint)" data-i18n="loading">加载中...</span></div>
 </div>
 
 <div class="card view-settings">
@@ -132,11 +149,12 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <span data-i18n="runtime_title">运行设置（全局模板）</span><span style="font-size:.7rem;color:var(--faint);margin-left:auto" data-i18n="click_expand">点击展开</span>
 </summary>
 <div style="font-size:.82rem;color:var(--faint);line-height:1.65;margin-top:1rem;margin-bottom:1rem;max-width:760px" data-i18n="tone_hint"></div>
-<div class="runtime-settings-grid" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem .8rem;margin-top:.2rem;align-items:start">
+<div class="runtime-settings-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem .8rem;margin-top:.2rem;align-items:start">
 <div style="display:grid;gap:.7rem">
 <label class="runtime-field-label"><span data-i18n="title_tone">对话模式</span><select id="tone-select" class="tone-select" style="margin-top:.4rem;width:100%"></select></label>
 <label class="runtime-field-label"><span data-i18n="auto_refresh_label">自动刷新</span><select id="runtime-auto-refresh" class="tone-select" style="margin-top:.4rem;width:100%"></select></label>
 <label class="runtime-field-label"><span data-i18n="run_permission_label">运行权限</span><select id="runtime-run-permission" class="tone-select" style="margin-top:.4rem;width:100%"></select></label>
+<label class="runtime-field-label"><span class="field-row"><span data-i18n="tool_planning_label">工具调用规划</span><span class="field-tip tip-up" tabindex="0" role="note"><span class="field-tip-bubble"><span class="tip-line"><b data-i18n="tool_planning_auto">自动</b><span data-i18n="tool_planning_hint_auto">只对实测不遵守契约的模式加一轮路由判定，其余模式不额外花轮数（默认）。</span></span><span class="tip-line"><b data-i18n="tool_planning_native">内联契约</b><span data-i18n="tool_planning_hint_native">契约写进提示词，永不多花轮数；模式不遵守时这一轮就没有工具调用。</span></span><span class="tip-line"><b data-i18n="tool_planning_router">路由模式</b><span data-i18n="tool_planning_hint_router">每轮先判定要不要调工具，判「不需要」也要多花一次上游往返。</span></span><span class="tip-line"><b data-i18n="tool_planning_studio">Studio Agent</b><span data-i18n="tool_planning_hint_studio">m365账户使用自己的 Studio Agent，未就绪或首个输出前不可用时回退Router。首个文本或工具增量发出后若失败，不再重试。</span></span></span></span></span><select id="runtime-tool-planning-mode" class="tone-select" style="margin-top:.4rem;width:100%"></select></label>
 </div>
 <div style="display:grid;gap:.7rem">
 <label class="runtime-field-label"><span data-i18n="idle_timeout_label">空闲超时分钟</span><input id="runtime-idle-timeout" type="number" min="1" style="margin-top:.4rem;width:100%;box-sizing:border-box;padding:8px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong)"></label>
@@ -144,9 +162,14 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <label class="runtime-field-label"><span data-i18n="cookie_keepalive_before_label">Cookie 提前保活（小时）</span><input id="runtime-cookie-keepalive-before" type="number" min="1" style="margin-top:.4rem;width:100%;box-sizing:border-box;padding:8px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong)"></label>
 </div>
 <div style="display:grid;gap:.7rem">
-<label class="runtime-field-label"><span data-i18n="model_alias_label">模型别名</span><input id="runtime-model-alias" style="margin-top:.4rem;width:100%;box-sizing:border-box;padding:8px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong)"></label>
+<label class="runtime-field-label"><span data-i18n="auto_cleanup_minutes_label">自动回收间隔（分钟）</span><input id="runtime-auto-cleanup-minutes" type="number" min="0" style="margin-top:.4rem;width:100%;box-sizing:border-box;padding:8px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong)"></label>
+<label class="runtime-field-label"><span data-i18n="session_idle_hours_label">本地会话闲置回收（小时）</span><input id="runtime-session-idle-hours" type="number" min="0" style="margin-top:.4rem;width:100%;box-sizing:border-box;padding:8px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong)"></label>
+<label class="runtime-field-label"><span class="field-row"><span data-i18n="cloud_cleanup_idle_hours_label">云端对话闲置回收（小时）</span><span class="field-tip" tabindex="0" role="note"><span class="field-tip-bubble" data-i18n="auto_cleanup_hint">0 表示关闭该项。本地会话被回收后，同一对话的下一轮会开一条没有历史的新上游会话；云端回收会删除该账户下所有没有本地会话引用的旧对话，包括账户主人自己在 Copilot 网页里聊的，请谨慎开启。</span></span></span><input id="runtime-cloud-cleanup-idle-hours" type="number" min="0" style="margin-top:.4rem;width:100%;box-sizing:border-box;padding:8px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong)"></label>
+</div>
+<div style="display:grid;gap:.7rem">
 <label class="runtime-field-label"><span data-i18n="time_zone_label">时区</span><input id="runtime-time-zone" style="margin-top:.4rem;width:100%;box-sizing:border-box;padding:8px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong)"></label>
 <label class="runtime-field-label"><span data-i18n="media_ttl_label">媒体超时时间（天）</span><input id="media-proxy-ttl-input" type="number" min="1" style="margin-top:.4rem;width:100%;box-sizing:border-box;padding:8px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong)"></label>
+<label class="runtime-field-label"><span class="field-row"><span data-i18n="proxy_url_label">出站代理</span><span class="field-tip" tabindex="0" role="note"><span class="field-tip-bubble" data-i18n="proxy_url_hint">留空为直连。用于服务器无法直接访问 M365 的部署（如中国大陆）。本地 CDP 始终直连，不走代理。</span></span></span><input id="runtime-proxy-url" placeholder="socks5h://127.0.0.1:1080" style="margin-top:.4rem;width:100%;box-sizing:border-box;padding:8px 10px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong)"></label>
 </div>
 </div>
 <div style="display:flex;align-items:center;gap:.5rem;margin-top:.85rem"><button id="runtime-settings-save" onclick="saveTone(document.getElementById('tone-select')?.value);saveRuntimeSettings('runtime-settings-save')" data-i18n="save">保存</button><span id="tone-saved" style="display:none"></span><span id="runtime-settings-saved" style="display:none"></span></div>
@@ -156,15 +179,34 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <div class="card view-settings">
 <details id="tone-options-details" style="cursor:pointer">
 <summary style="font-size:1.1rem;font-weight:600;color:var(--strong);list-style:none;display:flex;align-items:center;gap:.5rem">
-<span data-i18n="tone_options_title">对话模式列表（全局）</span><span style="font-size:.7rem;color:var(--faint);margin-left:auto" data-i18n="click_expand">点击展开</span>
+<span data-i18n="m365_tone_options_title">M365 模型 / Tone</span><span style="font-size:.7rem;color:var(--faint);margin-left:auto" data-i18n="click_expand">点击展开</span>
 </summary>
 <div style="margin-top:.75rem">
-<div style="font-size:.8rem;color:var(--faint);margin-bottom:.5rem" data-i18n="tone_options_hint">每行一个模式，格式：底层tone值 | 显示名（显示名可省略，默认用tone值）。显示名会作为 /v1/models 里的模型名，其中的空格会自动转为下划线；每个模式会生成普通与「-持续」两个模型。底层值即发送给 M365 的 tone，可填任意字符串。保存后立即生效。</div>
+<div style="font-size:.8rem;color:var(--faint);margin-bottom:.5rem" data-i18n="m365_tone_options_hint">每行一个 M365 tone，格式：底层 tone 值 | 显示名。显示名作为 /v1/models 的模型 ID，每项生成普通与「-持续」模型。保存后立即生效。</div>
 <textarea id="tone-options-input" rows="7" style="width:100%;box-sizing:border-box;padding:8px 12px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong);font-size:.85rem;font-family:monospace;outline:none;resize:vertical;scrollbar-width:none;-ms-overflow-style:none" placeholder="Gpt_5_5_Chat | gpt-5.5_Chat"></textarea>
 <div style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem">
 <button id="tone-options-save" onclick="saveToneOptions()" data-i18n="media_suffix_save">保存</button>
 <button id="tone-options-reset" onclick="resetToneOptions()" style="background:linear-gradient(135deg,#64748b,#475569)" data-i18n="prompt_reset">恢复默认</button>
 <span id="tone-options-saved" style="font-size:.75rem;color:#22c55e;opacity:0;transition:opacity .3s"></span>
+</div>
+</div>
+</details>
+</div>
+
+<div class="card view-settings">
+<details id="consumer-mode-options-details" style="cursor:pointer">
+<summary style="font-size:1.1rem;font-weight:600;color:var(--strong);list-style:none;display:flex;align-items:center;gap:.5rem">
+<span data-i18n="consumer_mode_options_title">个人版模型 / Mode</span><span style="font-size:.7rem;color:var(--faint);margin-left:auto" data-i18n="click_expand">点击展开</span>
+</summary>
+<div style="margin-top:.75rem">
+<div style="font-size:.8rem;color:var(--faint);margin-bottom:.4rem" data-i18n="consumer_mode_options_hint">每行格式：model | mode | status。model 是兼容 API 的模型 ID，mode 原样发送给个人版 Copilot。</div>
+<div style="font-size:.8rem;color:var(--faint);margin-bottom:.4rem" data-i18n="consumer_mode_status_hint">stable 表示证据相对稳定；experimental 表示实验条目，不改变请求执行策略。</div>
+<div style="font-size:.8rem;color:#f59e0b;margin-bottom:.5rem" data-i18n="consumer_mode_rollout_warning">实验 mode 可能受账户、地区和 Microsoft rollout 限制。</div>
+<textarea id="consumer-mode-options-input" rows="11" style="width:100%;box-sizing:border-box;padding:8px 12px;background:var(--inner);border:1px solid var(--inner-border);border-radius:8px;color:var(--strong);font-size:.85rem;font-family:monospace;outline:none;resize:vertical;scrollbar-width:none;-ms-overflow-style:none" placeholder="copilot | smart | stable"></textarea>
+<div style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem">
+<button id="consumer-mode-options-save" onclick="saveConsumerModeOptions()" data-i18n="media_suffix_save">保存</button>
+<button id="consumer-mode-options-reset" onclick="resetConsumerModeOptions()" style="background:linear-gradient(135deg,#64748b,#475569)" data-i18n="consumer_mode_restore_default">恢复个人版默认</button>
+<span id="consumer-mode-options-saved" style="font-size:.75rem;color:#22c55e;opacity:0;transition:opacity .3s"></span>
 </div>
 </div>
 </details>
@@ -246,6 +288,9 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <label style="font-size:.95rem;font-weight:800;color:var(--strong)" title="为多用户分配的 CDP 端口起始点"><span data-i18n="account_cdp_port_base_label">CDP 用户端口</span><input id="runtime-account-cdp-port-base" type="number" min="1" style="margin-top:.6rem;width:100%;box-sizing:border-box;padding:11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></label>
 <label style="font-size:.95rem;font-weight:800;color:var(--strong)"><span data-i18n="refresh_before_label">提前刷新秒数</span><input id="runtime-refresh-before" type="number" min="0" style="margin-top:.6rem;width:100%;box-sizing:border-box;padding:11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></label>
 <label style="font-size:.95rem;font-weight:800;color:var(--strong)"><span data-i18n="ws_idle_timeout_label">对话响应超时分钟</span><input id="runtime-ws-idle-timeout" type="number" min="1" style="margin-top:.6rem;width:100%;box-sizing:border-box;padding:11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></label>
+<label style="font-size:.95rem;font-weight:800;color:var(--strong)" title="每个用户每分钟可发起的 /v1/ 请求数上限，0 表示不限制。用户可在用户管理中单独覆盖"><span data-i18n="rate_limit_rpm_label">速率限制（次/分）</span><input id="runtime-rate-limit-rpm" type="number" min="0" style="margin-top:.6rem;width:100%;box-sizing:border-box;padding:11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></label>
+<label style="font-size:.95rem;font-weight:800;color:var(--strong)" title="令牌桶深度：允许瞬间连发多少次请求，之后才按每分钟上限匀速放行"><span data-i18n="rate_limit_burst_label">突发容量</span><input id="runtime-rate-limit-burst" type="number" min="1" style="margin-top:.6rem;width:100%;box-sizing:border-box;padding:11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></label>
+<label style="font-size:.95rem;font-weight:800;color:var(--strong)" title="同一账户最多同时进行多少轮上游对话，0 表示不限制。超出的请求排队等待，不会被拒绝"><span data-i18n="account_concurrency_label">账户并发上限</span><input id="runtime-account-concurrency" type="number" min="0" style="margin-top:.6rem;width:100%;box-sizing:border-box;padding:11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></label>
 <label class="ports-log-level" style="display:flex;flex-direction:column;gap:.6rem;font-size:.95rem;font-weight:800;color:var(--strong)"><span data-i18n="log_level_label">日志等级</span><select id="runtime-log-level" style="width:100%;box-sizing:border-box;padding:11px 36px 11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"><option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option><option>CRITICAL</option></select></label>
 <label style="display:flex;flex-direction:column;gap:.6rem;font-size:.95rem;font-weight:800;color:var(--strong)"><span data-i18n="user_log_verbose_label">用户运行日志</span><select id="runtime-user-log-verbose" style="width:100%;box-sizing:border-box;padding:11px 36px 11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></select></label>
 <label style="display:flex;flex-direction:column;gap:.6rem;font-size:.95rem;font-weight:800;color:var(--strong)"><span data-i18n="user_log_errors_label">用户错误日志</span><select id="runtime-user-log-errors" style="width:100%;box-sizing:border-box;padding:11px 36px 11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></select></label>
@@ -257,13 +302,34 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 </div>
 
 <div class="card view-debug details-card" style="padding:20px">
+<details id="model-test-details" style="cursor:pointer;margin-bottom:20px">
+<summary style="font-size:1.1rem;font-weight:700;color:var(--strong);list-style:none;display:flex;align-items:center;gap:.5rem;padding:20px;border-radius:12px;background:var(--inner);border:1px solid var(--inner-border)">
+<span data-i18n="title_model_test">模型连通性测试</span>
+<span style="font-size:.7rem;color:var(--faint);margin-left:auto" data-i18n="click_expand">点击展开</span>
+</summary>
+<div style="margin-top:20px">
+<div style="font-size:.75rem;color:var(--faint);line-height:1.5;margin-bottom:.75rem" data-i18n="model_test_hint">用所选账号真发一轮请求，判断这个模式对该账号是否可用（可用/空回复/被拒/限额/故障）。走的是 /v1 同一条链路，因此结果与真实调用一致；每次测试会新建一个上游会话，可在「会话管理」里删掉。</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem 1.1rem;align-items:end">
+<label style="font-size:.95rem;font-weight:800;color:var(--strong);display:flex;flex-direction:column;gap:.6rem"><span data-i18n="col_account">账号</span><select id="model-test-account" onchange="renderModelTest()" style="width:100%;box-sizing:border-box;padding:11px 36px 11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></select></label>
+<label style="font-size:.95rem;font-weight:800;color:var(--strong);display:flex;flex-direction:column;gap:.6rem"><span data-i18n="mt_col_model">模型</span><select id="model-test-model" style="width:100%;box-sizing:border-box;padding:11px 36px 11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700"></select></label>
+<label style="font-size:.95rem;font-weight:800;color:var(--strong);display:flex;flex-direction:column;gap:.6rem"><span data-i18n="mt_prompt">测试提问</span><input id="model-test-prompt" style="width:100%;box-sizing:border-box;padding:11px 13px;background:var(--inner);border:1px solid var(--inner-border);border-radius:10px;color:var(--strong);font-size:.95rem;font-weight:700" placeholder=""></label>
+</div>
+<div style="display:flex;align-items:center;gap:.5rem;margin-top:20px;flex-wrap:wrap">
+<button id="model-test-run" onclick="runModelTest(false)" data-i18n="mt_run">测试所选模型</button>
+<button id="model-test-run-all" onclick="runModelTest(true)" style="background:linear-gradient(135deg,#64748b,#475569)" data-i18n="mt_run_all">测试全部模型</button>
+</div>
+<div id="model-test-result" style="margin-top:.6rem;padding:20px;border-radius:12px;background:var(--inner);border:1px solid var(--inner-border);max-height:400px;overflow-y:auto;font-size:.8rem">
+<span style="color:var(--faint)" data-i18n="mt_none">尚未测试</span>
+</div>
+</div>
+</details>
 <details id="call-log-details" style="cursor:pointer;margin-bottom:20px">
 <summary style="font-size:1.1rem;font-weight:700;color:var(--strong);list-style:none;display:flex;align-items:center;gap:.5rem;padding:20px;border-radius:12px;background:var(--inner);border:1px solid var(--inner-border)">
 <span data-i18n="title_call_log">API 调用日志</span>
 <span id="call-log-count" style="font-size:.75rem;color:var(--faint);background:rgba(255,255,255,.06);padding:2px 8px;border-radius:8px">0</span>
 <span style="font-size:.7rem;color:var(--faint);margin-left:auto" data-i18n="click_expand">点击展开</span>
 </summary>
-<div class="call-filter-bar"><div class="call-filter-group"><button class="call-filter-btn chat" data-api-filter="chat" onclick="setCallLogFilter('chat')">chat</button><button class="call-filter-btn responses" data-api-filter="responses" onclick="setCallLogFilter('responses')">responses</button><button class="call-filter-btn anthropic" data-api-filter="anthropic" onclick="setCallLogFilter('anthropic')">anthropic</button></div><div class="call-filter-group" id="tone-filter-group"></div><div class="debug-actions"><button id="copy-call-log-all" onclick="copyAllCallLog()" style="font-size:.8rem;padding:5px 12px" data-i18n="copy_all">复制全部</button><button onclick="clearCallStats()" style="font-size:.8rem;padding:5px 12px" data-i18n="btn_clear">清空</button></div></div>
+<div class="call-filter-bar"><div class="call-filter-group"><button class="call-filter-btn chat" data-api-filter="chat" onclick="setCallLogFilter('chat')">chat</button><button class="call-filter-btn responses" data-api-filter="responses" onclick="setCallLogFilter('responses')">responses</button><button class="call-filter-btn anthropic" data-api-filter="anthropic" onclick="setCallLogFilter('anthropic')">anthropic</button></div><div class="call-filter-group" id="tone-filter-group"></div><div class="debug-actions"><button id="copy-call-log-all" onclick="copyAllCallLog()" style="font-size:.8rem;padding:5px 12px" data-i18n="copy_all">复制全部</button><button onclick="clearCallStats()" style="font-size:.8rem;padding:5px 12px" data-i18n="dash_clear_call_log">清空调用记录</button></div></div>
 <div id="call-log-content" style="margin-top:.6rem;padding:20px;border-radius:12px;background:var(--inner);border:1px solid var(--inner-border);max-height:400px;overflow-y:auto;font-family:monospace;font-size:.8rem">
 <span style="color:var(--faint)" data-i18n="no_calls_yet">暂无调用记录</span>
 </div>
@@ -285,7 +351,8 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <span id="capture-count" style="font-size:.75rem;color:var(--faint);background:rgba(255,255,255,.06);padding:2px 8px;border-radius:8px">0</span>
 <span style="font-size:.7rem;color:var(--faint);margin-left:auto" data-i18n="click_expand">点击展开</span>
 </summary>
-<div style="display:flex;align-items:center;gap:.75rem;margin-top:20px"><div style="font-size:.75rem;color:var(--faint);line-height:1.5;flex:1" data-i18n="capture_hint">在 M365 Copilot 切换不同模式（快速答复/深度思考、GPT 5.5/5.2）各发一条消息，用油猴脚本推送抓包，下方对比哪些字段控制模式。</div><div class="debug-actions"><button id="copy-capture-all" onclick="copyAllCapturePayloads()" style="font-size:.8rem;padding:5px 12px" data-i18n="copy_all">复制全部</button><button onclick="clearCapturePayloads()" style="font-size:.8rem;padding:5px 12px" data-i18n="btn_clear">清空</button></div></div>
+<div style="display:flex;align-items:center;gap:.75rem;margin-top:20px;flex-wrap:wrap"><div style="font-size:.75rem;color:var(--faint);line-height:1.5;flex:1;min-width:220px" data-i18n="capture_hint">在 M365 Copilot 切换不同模式（快速答复/深度思考、GPT 5.5/5.2）各发一条消息，用油猴脚本推送抓包，下方对比哪些字段控制模式。</div><div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap"><select id="protocol-profile-account" class="tone-select" aria-label="Protocol profile account" style="min-width:150px"></select><select id="protocol-profile-scope" class="tone-select" aria-label="Protocol profile scope"><option value="account">account</option><option value="tenant">tenant</option></select></div><div class="debug-actions"><button id="copy-capture-all" onclick="copyAllCapturePayloads()" style="font-size:.8rem;padding:5px 12px" data-i18n="copy_all">复制全部</button><button onclick="showProtocolCandidate()" style="font-size:.8rem;padding:5px 12px" data-i18n="protocol_profile_candidate">生成协议候选</button><button onclick="applyProtocolCandidate()" style="font-size:.8rem;padding:5px 12px" data-i18n="protocol_profile_apply">应用候选</button><button onclick="rollbackProtocolProfile()" style="font-size:.8rem;padding:5px 12px" data-i18n="protocol_profile_rollback">回滚内置</button><button onclick="clearCapturePayloads()" style="font-size:.8rem;padding:5px 12px" data-i18n="btn_clear">清空</button></div></div>
+<div id="protocol-profile-status" style="font-size:.75rem;color:var(--faint);margin-top:.5rem"></div>
 <div id="capture-content" style="margin-top:.6rem;padding:20px;border-radius:12px;background:var(--inner);border:1px solid var(--inner-border);max-height:400px;overflow-y:auto;font-family:monospace;font-size:.78rem">
 <span style="color:var(--faint)" data-i18n="no_capture_yet">暂无抓包数据</span>
 </div>
@@ -316,11 +383,13 @@ _ADMIN_SHELL_HTML = """<div class="orb" aria-hidden="true"></div>
 <div class="api-grp" data-i18n="api_grp_admin">管理接口</div>
 <div class="api-row"><span>GET&nbsp; /admin/call-log</span><span data-i18n="api_call_log">调用记录</span></div>
 <div class="api-row"><span>POST /admin/call-log/clear</span><span data-i18n="api_call_log_clear">清空调用记录</span></div>
+<div class="api-row"><span>POST /admin/usage/clear</span><span data-i18n="api_usage_clear">清空累计 Token</span></div>
 <div class="api-row"><span>GET&nbsp; /admin/metrics-history</span><span data-i18n="api_metrics_history">趋势数据</span></div>
 <div class="api-row"><span>POST /admin/metrics-history/clear</span><span data-i18n="api_metrics_clear">清空趋势数据</span></div>
 <div class="api-row"><span>GET&nbsp; /admin/capture-payload</span><span data-i18n="api_cap_get">查看抓包数据</span></div>
 <div class="api-row"><span>POST /admin/capture-payload</span><span data-i18n="api_cap_post">推送抓包数据</span></div>
 <div class="api-row"><span>POST /admin/capture-payload/clear</span><span data-i18n="api_cap_clear">清空抓包数据</span></div>
+<div class="api-row"><span>GET/POST /admin/protocol-profile</span><span data-i18n="api_protocol_profile">协议 profile 候选/应用/回滚</span></div>
 <div class="api-row"><span>GET&nbsp; /admin/capture-toggle</span><span data-i18n="api_captgl_get">接收开关状态</span></div>
 <div class="api-row"><span>POST /admin/capture-toggle</span><span data-i18n="api_captgl_post">设置接收开关</span></div>
 <div class="api-row"><span>GET&nbsp; /admin/chromium/login-status</span><span data-i18n="api_login_status">Chromium 登录状态</span></div>
