@@ -63,8 +63,9 @@ async function loadAccounts(localOnly=false){
       const countdown=valid&&st.expiry_known?'<span data-token-rem="'+esc(a.id)+'">'+rem+'</span>':'';
       const badge='<span class="acct-token-status" style="padding:.15rem .25rem;border-radius:99px;font-size:.68rem;white-space:nowrap;background:'+(valid?'rgba(63,185,112,.16)':'rgba(224,138,138,.16)')+';color:'+(valid?'#3fb970':'#e08a8a')+';border:1px solid '+(valid?'rgba(63,185,112,.4)':'rgba(224,138,138,.4)')+'">'+(valid?t('valid_short'):t('invalid_short'))+countdown+'</span>';
       const cookieValid=liveCookieValid(a);
-      const cookieTitle=esc(t('cookie_updated_label')+': '+fmtTs(a.cookie_updated_at))+'&#10;'+esc(t('cookie_expires_label')+': '+fmtTs(a.cookie_expires_at));
-      const cookieBadge='<span class="cookie-status-tag"'+(cookieValid?' title="'+cookieTitle+'"':'')+' style="display:inline-flex;justify-content:center;padding:.15rem .6rem;border-radius:99px;font-size:.72rem;white-space:nowrap;background:'+(cookieValid?'rgba(96,242,255,.15)':'rgba(148,163,184,.12)')+';color:'+(cookieValid?'#60f2ff':'#94a3b8')+';border:1px solid '+(cookieValid?'rgba(96,242,255,.4)':'rgba(148,163,184,.25)')+'">'+(cookieValid?t('cookie_valid_short'):t('cookie_invalid_short'))+'</span>';
+      const personalSession=a.provider==='m365'&&!!a.has_personal_substrate_session;
+      const cookieTitle=personalSession?esc('Substrate · '+t('protocol_stored')+' · '+t('protocol_refresh_browser')+' · '+t('protocol_saved_note')):esc(t('cookie_updated_label')+': '+fmtTs(a.cookie_updated_at))+'&#10;'+esc(t('cookie_expires_label')+': '+fmtTs(a.cookie_expires_at));
+      const cookieBadge='<span class="cookie-status-tag"'+(cookieValid?' title="'+cookieTitle+'"':'')+' style="display:inline-flex;justify-content:center;padding:.15rem .6rem;border-radius:99px;font-size:.72rem;white-space:nowrap;background:'+(cookieValid?'rgba(96,242,255,.15)':'rgba(148,163,184,.12)')+';color:'+(cookieValid?'#60f2ff':'#94a3b8')+';border:1px solid '+(cookieValid?'rgba(96,242,255,.4)':'rgba(148,163,184,.25)')+'">'+(cookieValid?t(personalSession?'protocol_stored':'cookie_valid_short'):t('cookie_invalid_short'))+'</span>';
       const cookieMeta='<div class="cookie-meta"><div>'+cookieBadge+'</div><button class="cookie-refresh-btn" data-id="'+esc(a.id)+'" data-refresh-id="'+esc(a.id)+'" style="font-size:.7rem;padding:3px 5px">'+t('btn_cookie_refresh')+'</button></div>';
       const boundNames=Array.isArray(a.bound_names)?a.bound_names.filter(Boolean):[];
       const boundMain=boundNames[0]||a.name||'name';
@@ -75,9 +76,11 @@ async function loadAccounts(localOnly=false){
       const refreshMode=refreshAutomatic?t('refresh_auto'):t('refresh_manual');
       const refreshColor=refreshAutomatic?'#a78bfa':'var(--faint)';
       const refreshBadge='<span class="refresh-mode-tag" title="'+t('protocol_refresh_'+(refreshAutomatic?renewal:'manual'))+'" style="width:63px;box-sizing:border-box;display:inline-flex;justify-content:center;padding:.15rem .25rem;border-radius:99px;font-size:.72rem;background:rgba(167,139,250,.12);color:'+refreshColor+';border:1px solid rgba(167,139,250,.28)">'+refreshMode+'</span>';
-      const protocolBadges='<div style="font-size:.68rem;color:var(--muted)" title="'+t('protocol_saved_note')+'">'+['m365','consumer'].map(provider=>{
+      const protocolBadges='<div style="font-size:.68rem;color:var(--muted)">'+['m365','consumer'].map(provider=>{
         const p=a.protocols?.[provider]||{};
-        return '<span data-protocol="'+provider+'" style="display:block">'+(provider==='m365'?'Substrate':'ChatAI')+' · '+t(p.stored?'protocol_stored':'protocol_missing')+(p.active?' · '+t('protocol_current'):'')+'</span>';
+        const label=provider==='m365'?'Substrate':'ChatAI';
+        const title=label+' · '+t(p.stored?'protocol_stored':'protocol_missing')+(p.active?' · '+t('protocol_current')+' · '+t('protocol_refresh_'+(p.refresh_mode||'manual')):'')+(p.stored?' · '+t('protocol_saved_note'):'');
+        return '<span data-protocol="'+provider+'" title="'+esc(title)+'" style="display:block;color:'+(p.stored?'#3fb970':'var(--faint)')+'">'+label+' '+(p.stored?'&#8730;':'&#8212;')+'</span>';
       }).join('')+'</div>';
       const tokenCell='<div class="acct-token-control"><div class="acct-token-primary">'+badge+'</div><div class="acct-token-secondary"><button class="acct-token-refresh" data-refresh-id="'+esc(a.id)+'" onclick="event.stopPropagation();refreshAccount(\\''+a.id+'\\')">'+t('btn_token_refresh')+'</button><button class="acct-token-update" onclick="event.stopPropagation();toggleAccountToken(\\''+a.id+'\\')">'+t('btn_push_token')+'</button><button class="acct-token-remove" onclick="event.stopPropagation();clearAccountToken(\\''+a.id+'\\')">'+t('btn_remove_token')+'</button></div></div>';
       const mediaTag=(label,ok)=>'<span class="media-status-tag" style="display:inline-flex;align-items:center;justify-content:center;padding:.14rem .5rem;border-radius:99px;font-size:.68rem;background:'+(ok?'rgba(63,185,112,.16)':'rgba(148,163,184,.12)')+';color:'+(ok?'#3fb970':'#94a3b8')+';border:1px solid '+(ok?'rgba(63,185,112,.4)':'rgba(148,163,184,.25)')+'">'+label+'</span>';
@@ -190,7 +193,7 @@ async function refreshAccountCookie(id){
     const d=await r.json().catch(()=>({}));
     const fallback=t('btn_cookie_refresh')+': '+t('cookie_invalid_short');
     if(!r.ok)await adminAlert(refreshResponseError(r,d,fallback));
-    else if(d.cookie_valid!==true)await adminAlert(fallback);
+    else if(d.refreshed!==true&&d.cookie_valid!==true)await adminAlert(fallback);
     else await adminAlert(t('refresh_ok'));
   }catch(e){await adminAlert(t('network_error'))}
   finally{endAccountRefresh(id)}

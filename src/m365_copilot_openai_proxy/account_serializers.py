@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from .account_store import Account
 from .key_store import ApiKey
+from .personal_substrate_session import normalize_personal_substrate_error
+from .token_store import is_valid_substrate_jwe
 
 
 def account_binding_state(acc: Account | None) -> str:
@@ -9,6 +11,8 @@ def account_binding_state(acc: Account | None) -> str:
         return "none"
     if acc.provider == "consumer":
         return "cookie" if acc.consumer_cookies else "token_only" if acc.consumer_token else "none"
+    if acc.provider == "m365" and is_valid_substrate_jwe(acc.token):
+        return "cookie" if acc.has_personal_substrate_session else "token_only"
     if getattr(acc, "cookie_valid", False):
         return "cookie"
     if acc.token:
@@ -17,19 +21,36 @@ def account_binding_state(acc: Account | None) -> str:
 
 
 def _provider_fields(acc: Account) -> dict:
-    """Provider tag plus presence-only flags for the consumer credential pair."""
+    """Active-provider state and presence-only flags for saved credentials."""
+    has_personal_session = acc.has_personal_substrate_session
+    cookie_valid = acc.cookie_valid
+    cookie_updated_at = acc.cookie_updated_at
+    cookie_expires_at = acc.cookie_expires_at
+    if acc.provider == "consumer":
+        cookie_valid = bool(acc.consumer_cookies)
+        cookie_updated_at = acc.consumer_updated_at
+        cookie_expires_at = 0.0
+    elif acc.provider == "m365" and is_valid_substrate_jwe(acc.token):
+        # Personal browser state is separate from the enterprise Cookie cache.
+        # Presence does not supply a verified, session-wide Cookie deadline.
+        cookie_valid = has_personal_session
+        cookie_updated_at = 0.0
+        cookie_expires_at = 0.0
     return {
         "provider": getattr(acc, "provider", "m365"),
         "is_personal": acc.is_personal,
         "protocols": acc.protocol_states(),
-        "cookie_valid": bool(acc.consumer_cookies) if acc.provider == "consumer" else acc.cookie_valid,
-        "cookie_updated_at": acc.consumer_updated_at if acc.provider == "consumer" else acc.cookie_updated_at,
-        "cookie_expires_at": 0.0 if acc.provider == "consumer" else acc.cookie_expires_at,
+        "cookie_valid": cookie_valid,
+        "cookie_updated_at": cookie_updated_at,
+        "cookie_expires_at": cookie_expires_at,
         "throttled_until": acc.throttled_until if acc.provider == "consumer" else 0.0,
         "throttled_mode": acc.throttled_mode if acc.provider == "consumer" else "",
         "throttled_at": acc.throttled_at if acc.provider == "consumer" else 0.0,
         "has_token": bool(acc.token) if acc.provider == "m365" else False,
         "has_consumer_token": bool(getattr(acc, "consumer_token", "")),
+        "has_personal_substrate_session": has_personal_session,
+        "personal_substrate_refresh_error": normalize_personal_substrate_error(acc.personal_substrate_refresh_error),
+        "substrate_token_expires_at": acc.substrate_token_expires_at,
         "consumer_updated_at": getattr(acc, "consumer_updated_at", 0.0),
         # Presence only, never the value: this is a long-lived bearer credential.
         # Surfaced because it is what decides whether renewal costs ~1.4s of HTTP
@@ -83,9 +104,6 @@ def user_account_public(acc: Account | None) -> dict | None:
             getattr(acc, "refresh_token_disabled_reason", "") or ""
         ),
         "refresh_token_disabled_at": getattr(acc, "refresh_token_disabled_at", 0.0),
-        "cookie_valid": bool(getattr(acc, "cookie_valid", False)),
-        "cookie_updated_at": getattr(acc, "cookie_updated_at", 0.0),
-        "cookie_expires_at": getattr(acc, "cookie_expires_at", 0.0),
         "throttled_until": getattr(acc, "throttled_until", 0.0),
         "throttled_mode": getattr(acc, "throttled_mode", ""),
         "throttled_at": getattr(acc, "throttled_at", 0.0),
@@ -104,9 +122,6 @@ def account_public(acc: Account, bound_keys: list[ApiKey] | None = None) -> dict
         "cdp_port": acc.cdp_port,
         "token_source": acc.token_source,
         "binding_state": binding_state,
-        "cookie_valid": bool(getattr(acc, "cookie_valid", False)),
-        "cookie_updated_at": getattr(acc, "cookie_updated_at", 0.0),
-        "cookie_expires_at": getattr(acc, "cookie_expires_at", 0.0),
         "has_token": bool(acc.token),
         "has_media_auth": bool(getattr(acc, "media_auth_token", "")),
         "media_auth_updated_at": getattr(acc, "media_auth_updated_at", 0.0),

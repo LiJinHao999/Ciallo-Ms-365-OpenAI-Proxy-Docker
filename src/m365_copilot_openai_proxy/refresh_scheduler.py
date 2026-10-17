@@ -56,6 +56,8 @@ from .refresh_via_rt import (
     refresh_via_rt,
 )
 from .runtime_flags import elog, ulog
+from .personal_substrate_session import has_usable_personal_substrate_session
+from .token_store import is_valid_substrate_jwe
 
 
 
@@ -91,6 +93,8 @@ _CONSUMER_KEEPALIVE_AGE_SECONDS = 60 * 60
 # in the profile lapsed, which only an interactive sign-in fixes, so retrying
 # hard would spin a browser for nothing.
 _CONSUMER_RETRY_SECONDS = 30 * 60
+_PERSONAL_SUBSTRATE_RECHECK_SECONDS = 60 * 60
+_PERSONAL_SUBSTRATE_RETRY_SECONDS = 30 * 60
 
 
 class RefreshScheduler:
@@ -102,9 +106,9 @@ class RefreshScheduler:
     fresh token via CDP, then tear it down. A single asyncio.Lock serialises the
     whole thing so at most one Chromium is alive at any instant.
 
-    Only accounts whose token_source == "cdp" are auto-refreshed; "manual"
-    accounts have no signed-in profile to capture from and are left untouched
-    (their tokens are pushed by the user via the Tampermonkey script / paste).
+    AAD/CDP, Consumer, and personal Substrate credentials have separate refresh
+    paths. Personal JWEs use only their pinned copilot.com session, never the
+    enterprise browser profile or another protocol's refresh grant.
     """
 
     def __init__(self, account_store: AccountStore, profile_root: str | Path):
@@ -134,6 +138,11 @@ class RefreshScheduler:
         self._consumer_attempted_at: dict[str, float] = {}
         # Injected in tests; None means "build the real Camoufox gate on demand".
         self._consumer_gate_factory = None
+        self._personal_substrate_gate_factory = None
+        self._personal_refresh_generation: dict[str, int] = {}
+        self._personal_refresh_result: dict[str, bool] = {}
+        self._personal_refresh_snapshot: dict[str, str] = {}
+        self._personal_attempted_at: dict[str, tuple[str, float]] = {}
 
     def set_keepalive_params(self, check_interval_seconds: float | None = None, cookie_before_seconds: float | None = None) -> None:
         """Update keepalive tunables from admin runtime settings (seconds)."""
@@ -171,6 +180,8 @@ class RefreshScheduler:
     def _keepalive_due(self, account) -> bool:
         """True if a cdp account's cookie is close enough to expiry to refresh."""
         if account.provider != "m365" or account.token_source != "cdp":
+            return False
+        if is_valid_substrate_jwe(getattr(account, "token", "")):
             return False
         if not account.cookie_valid:
             return False
@@ -479,6 +490,126 @@ class RefreshScheduler:
         )
         return True
 
+    @staticmethod
+    def _personal_substrate_state(account) -> str:
+        material = (
+            account.token, account.substrate_account_id, account.protocol_epoch,
+            account.personal_substrate_session, account.proxy_url,
+        )
+        return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+
+    @staticmethod
+    def _personal_substrate_deadline(account) -> float:
+        issued = _normalize_consumer_token_expiry(account.substrate_token_expires_at)
+        if issued:
+            return issued
+        captured = _normalize_consumer_token_expiry(account.token_updated_at)
+        return captured + _PERSONAL_SUBSTRATE_RECHECK_SECONDS if captured else 0.0
+
+    def _personal_substrate_retry_ready(self, account) -> bool:
+        attempted = self._personal_attempted_at.get(account.id)
+        return (
+            attempted is None or attempted[0] != self._personal_substrate_state(account)
+            or time.time() - attempted[1] >= _PERSONAL_SUBSTRATE_RETRY_SECONDS
+        )
+
+    def _personal_substrate_keepalive_due(self, account) -> bool:
+        if account.provider != "m365" or not is_valid_substrate_jwe(getattr(account, "token", "")):
+            return False
+        if not has_usable_personal_substrate_session(
+            account.token, account.substrate_account_id, account.personal_substrate_session,
+        ):
+            return False
+        window = max(_REFRESH_BEFORE_SECONDS, self._keepalive_interval_seconds)
+        return (
+            self._personal_substrate_deadline(account) - time.time() <= window
+            and self._personal_substrate_retry_ready(account)
+        )
+
+    async def refresh_personal_substrate(self, account_id: str, *, force: bool = False) -> bool:
+        """Coalesce one pinned personal browser attempt, including queued failures."""
+        queued = self._personal_refresh_generation.get(account_id, 0)
+        async with self._account_lock(account_id):
+            account = self._accounts.get_request_snapshot(account_id)
+            if account is None or account.provider != "m365" or not has_usable_personal_substrate_session(
+                account.token, account.substrate_account_id, account.personal_substrate_session,
+            ):
+                return False
+            snapshot = self._personal_substrate_state(account)
+            generation = self._personal_refresh_generation.get(account_id, 0)
+            if generation != queued and self._personal_refresh_snapshot.get(account_id) == snapshot:
+                return self._personal_refresh_result.get(account_id, False)
+            if not force and not self._personal_substrate_retry_ready(account):
+                return False
+            self._personal_refresh_snapshot[account_id] = snapshot
+            self._personal_attempted_at[account_id] = (snapshot, time.time())
+            result = False
+            try:
+                result = await self._refresh_personal_substrate_once(account, snapshot)
+                return result
+            finally:
+                current = self._accounts.get(account_id)
+                if result and current is not None:
+                    self._personal_refresh_snapshot[account_id] = self._personal_substrate_state(current)
+                self._personal_refresh_generation[account_id] = generation + 1
+                self._personal_refresh_result[account_id] = result
+
+    async def _refresh_personal_substrate_once(self, account, snapshot: str) -> bool:
+        from .personal_substrate_refresh import PersonalSubstrateBrowserGate, PersonalSubstrateRefreshError
+
+        try:
+            if self._personal_substrate_gate_factory is not None:
+                gate = self._personal_substrate_gate_factory(account.id)
+            else:
+                gate = PersonalSubstrateBrowserGate(
+                    self._profile_root, session=account.personal_substrate_session,
+                    previous_token=account.token, proxy_url=account.proxy_url,
+                )
+            async with self._lock:
+                current = self._accounts.get(account.id)
+                if current is None or self._personal_substrate_state(current) != snapshot or current.provider != "m365":
+                    return False
+                auth = await gate()
+            current = self._accounts.get(account.id)
+            if current is None or current.proxy_url != account.proxy_url:
+                return False
+            stored = self._accounts.apply_personal_substrate_refresh_result(
+                account.id, expected_token=account.token, expected_epoch=account.protocol_epoch,
+                expected_session=account.personal_substrate_session,
+                token=auth.get("access_token", ""), account_id=auth.get("account_id", ""),
+                session=auth.get("session"), expires_at=auth.get("expires_at", 0.0),
+            )
+            if stored is None:
+                return False
+            ulog(f"Personal Substrate refresh for {account.id}: new pinned JWE captured without a chat")
+            return True
+        except Exception as exc:
+            code = exc.code if isinstance(exc, PersonalSubstrateRefreshError) else "refresh_failed"
+            self._accounts.set_personal_substrate_refresh_error(
+                account.id, code, expected_token=account.token, expected_epoch=account.protocol_epoch,
+                expected_session=account.personal_substrate_session,
+            )
+            elog(f"Personal Substrate refresh for {account.id}: {code}")
+            return False
+
+    async def _ensure_personal_substrate_fresh(self, account, *, force: bool) -> bool:
+        if account is None:
+            return False
+        if not force and self._personal_substrate_deadline(account) - time.time() > _REFRESH_BEFORE_SECONDS:
+            return True
+        if await self.refresh_personal_substrate(account.id, force=force):
+            return True
+        current = self._accounts.get(account.id)
+        if (
+            current is None or current.provider != "m365"
+            or current.protocol_epoch != account.protocol_epoch
+            or current.substrate_account_id != account.substrate_account_id
+        ):
+            return False
+        if force and current.token == account.token:
+            return False
+        return self._personal_substrate_deadline(current) > time.time()
+
     def _recovery_due(self, account) -> bool:
         """True for a cdp account stuck at cookie_valid=False that still holds
         stored cookies we can replay to self-heal.
@@ -491,6 +622,8 @@ class RefreshScheduler:
         keeps a genuinely dead session from relaunching Chromium every tick.
         """
         if account.provider != "m365" or account.token_source != "cdp":
+            return False
+        if is_valid_substrate_jwe(getattr(account, "token", "")):
             return False
         if account.cookie_valid:
             return False
@@ -507,7 +640,9 @@ class RefreshScheduler:
                 for account in self._accounts.list():
                     if stop.is_set():
                         break
-                    if self._consumer_keepalive_due(account):
+                    if self._personal_substrate_keepalive_due(account):
+                        await self.refresh_personal_substrate(account.id)
+                    elif self._consumer_keepalive_due(account):
                         # Refresh for issuer-reported expiry or credential age;
                         # opaque tokens without a deadline still get keepalive.
                         ulog(f"Keepalive: re-minting consumer {account.id}")
@@ -788,6 +923,10 @@ class RefreshScheduler:
             # A failed proactive attempt leaves the existing token available for
             # the consumer client's own ClearanceRequired recovery path.
             return bool(getattr(account, "consumer_token", ""))
+        if is_valid_substrate_jwe(account.token):
+            return await self._ensure_personal_substrate_fresh(
+                self._accounts.get_request_snapshot(account_id), force=force,
+            )
         cdp_refresh_state = self._cdp_refresh_state(account)
         # Fast path: if the account carries an OAuth2 refresh_token, try the
         # plain-HTTP substrate exchange first (no headless Chromium, no Copilot
@@ -841,6 +980,9 @@ class RefreshScheduler:
             return 0, len(cookies or [])
         async with self._account_lock(account_id):
             async with self._lock:
+                current = self._accounts.get(account_id)
+                if current is not None and is_valid_substrate_jwe(current.token):
+                    raise ValueError("Personal Substrate uses its pinned copilot.com session, not M365 cookie injection")
                 return await self._inject_cookies_one(account_id, cookies, allow_nudge=allow_nudge)
 
     async def fetch_image(self, account_id: str, url: str, event_sink=None) -> tuple[bytes, str]:

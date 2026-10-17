@@ -7,8 +7,9 @@ from fastapi import FastAPI, HTTPException, Request
 from .account_concurrency import ThrottledClient
 from .account_store import resolve_account_proxy
 from .config import Settings
-from .substrate_client import SubstrateCopilotClient
-from .token_store import decode_jwt_payload
+from .personal_substrate_session import has_usable_personal_substrate_session
+from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
+from .token_store import decode_jwt_payload, is_valid_substrate_jwe
 
 
 _CAPTURE_LIMIT = 20
@@ -154,6 +155,38 @@ def _consumer_gate_for(app: FastAPI, account_id: str, expected_epoch: int | None
     return gate
 
 
+def _personal_substrate_gate_for(app: FastAPI, account):
+    scheduler = getattr(app.state, "refresh_scheduler", None)
+    if scheduler is None or not has_usable_personal_substrate_session(
+        account.token, account.substrate_account_id, account.personal_substrate_session,
+    ):
+        return None
+    account_id, epoch, subject = account.id, account.protocol_epoch, account.substrate_account_id
+
+    def current_account():
+        current = app.state.account_store.get_request_snapshot(account_id)
+        if (
+            current is None or current.provider != "m365" or current.protocol_epoch != epoch
+            or current.substrate_account_id != subject or not is_valid_substrate_jwe(current.token)
+        ):
+            raise SubstrateCopilotError("Account identity or protocol changed; start a new request.")
+        return current
+
+    async def gate(rejected_token: str) -> str:
+        current = current_account()
+        if current.token == rejected_token:
+            await scheduler.refresh_personal_substrate(account_id)
+            current = current_account()
+        if current.token == rejected_token:
+            raise SubstrateCopilotError(
+                "Personal Substrate credentials could not be renewed. "
+                "Re-push this account's login session from the userscript on copilot.com."
+            )
+        return current.token
+
+    return gate
+
+
 def create_api_dependencies(
     app: FastAPI,
 ) -> tuple[Callable[[], Settings], Callable[..., SubstrateCopilotClient]]:
@@ -258,6 +291,8 @@ def create_api_dependencies(
                 )
                 client._variants = ",".join(profile["variants"])
                 client._options_sets = list(profile["options_sets"])
+            if account is not None and token == account.token and is_valid_substrate_jwe(token):
+                client._personal_substrate_gate = _personal_substrate_gate_for(app, account)
             _attach_response_debug_sink(app, client)
             _attach_quota_sink(app, client, account)
             return _throttled(app, account, client)

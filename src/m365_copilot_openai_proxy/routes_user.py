@@ -15,6 +15,12 @@ from .account_store import (
 )
 from .config import Settings
 from .key_store import ApiKey
+from .personal_substrate_session import (
+    PersonalSubstrateSessionError,
+    PersonalSubstrateSubjectMismatch,
+    normalize_personal_substrate_expiry,
+    normalize_personal_substrate_session,
+)
 from .response_helpers import _json_err
 from .routes_api_common import effective_run_permission
 from .consumer_refresh_via_rt import (
@@ -272,6 +278,21 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
         except Exception:
             if not is_valid_substrate_jwe(token):
                 return _json_err(400, "Not a valid Substrate JWT or supported JWE token")
+        personal_session = None
+        personal_expiry = None
+        try:
+            if "personal_substrate_session" in body:
+                if not is_valid_substrate_jwe(token):
+                    return _json_err(400, "Personal Substrate session requires a supported personal JWE")
+                personal_session = normalize_personal_substrate_session(
+                    body["personal_substrate_session"], substrate_account_id,
+                )
+            if is_valid_substrate_jwe(token) and "expires_at" in body:
+                personal_expiry = normalize_personal_substrate_expiry(body["expires_at"])
+        except PersonalSubstrateSubjectMismatch as exc:
+            return _json_err(409, str(exc))
+        except PersonalSubstrateSessionError as exc:
+            return _json_err(400, str(exc))
         _, email = extract_identity(token)
         # Dedupe by identity: if the pushed token belongs to an M365 account
         # already in the pool, reuse that record instead of creating a duplicate.
@@ -286,7 +307,12 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
             try:
                 acc = app.state.account_store.push_token(
                     reused.id, token, substrate_account_id=substrate_account_id, activate=activate,
+                    personal_substrate_session=personal_session, expires_at=personal_expiry,
                 )
+            except PersonalSubstrateSubjectMismatch as exc:
+                return _json_err(409, str(exc))
+            except PersonalSubstrateSessionError as exc:
+                return _json_err(400, str(exc))
             except ValueError as exc:
                 return _json_err(409, str(exc))
             now = time.time()
@@ -308,18 +334,29 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
         else:
             acc_id = k.account_id
             if not acc_id or app.state.account_store.get(acc_id) is None:
-                acc = app.state.account_store.add(
-                    name=k.name or "user", token=token, token_source="manual",
-                    display_email=body.get("display_email") or "",
-                    substrate_account_id=substrate_account_id,
-                )
+                try:
+                    acc = app.state.account_store.add(
+                        name=k.name or "user", token=token, token_source="manual",
+                        display_email=body.get("display_email") or "",
+                        substrate_account_id=substrate_account_id,
+                        personal_substrate_session=personal_session, expires_at=personal_expiry,
+                    )
+                except PersonalSubstrateSubjectMismatch as exc:
+                    return _json_err(409, str(exc))
+                except PersonalSubstrateSessionError as exc:
+                    return _json_err(400, str(exc))
                 app.state.key_store.update(k.id, account_id=acc.id, displaced_at=0.0)
             else:
                 try:
                     acc = app.state.account_store.push_token(
                         acc_id, token, display_email=body.get("display_email") or "",
                         substrate_account_id=substrate_account_id, activate=activate,
+                        personal_substrate_session=personal_session, expires_at=personal_expiry,
                     )
+                except PersonalSubstrateSubjectMismatch as exc:
+                    return _json_err(409, str(exc))
+                except PersonalSubstrateSessionError as exc:
+                    return _json_err(400, str(exc))
                 except ValueError as exc:
                     return _json_err(409, str(exc))
                 if k.displaced_at:
@@ -446,7 +483,10 @@ def register_user_routes(app: FastAPI, resolved_settings: Settings, tone_options
                 media_seed_url = candidate
         if not isinstance(cookies, list) or not cookies:
             return _json_err(400, "No cookies provided")
-        if not k.account_id or app.state.account_store.get(k.account_id) is None:
+        bound_account = app.state.account_store.get(k.account_id) if k.account_id else None
+        if bound_account is not None and is_valid_substrate_jwe(bound_account.token):
+            return _json_err(400, "Personal Substrate login state must be pushed with its JWE from copilot.com, not through M365 cookie injection")
+        if bound_account is None:
             acc = app.state.account_store.add(name=account_name or k.name or k.username or "user", token="", token_source="cdp")
             app.state.key_store.update(k.id, account_id=acc.id, displaced_at=0.0)
             k = app.state.key_store.get(k.id) or k

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ciallo Ms-365 Proxy
 // @namespace    https://m365.cloud.microsoft
-// @version      1.0.82
+// @version      1.0.83
 // @description  提取 M365 Copilot 完整 Cookie（含 httpOnly）推送到代理服务实现登录
 // @match        https://m365.cloud.microsoft/*
 // @match        https://microsoft365.com/*
@@ -33,7 +33,7 @@
 (function() {
     'use strict';
 
-    const SCRIPT_VERSION = '1.0.82';
+    const SCRIPT_VERSION = '1.0.83';
     const SUBSTRATE_WS_RE = /wss:\/\/substrate\.office\.com\/.*[?&]access_token=([^&]+)/;
     const M365_RT_CLIENT_ID = '4765445b-32c6-49b0-83e6-1d93765276ca';
     // Consumer (personal-account) Copilot puts its ChatAI token in the chat
@@ -168,6 +168,8 @@
             fetching: '获取中...',
             pushing: '推送中...',
             no_cookies: '未找到 Cookie。',
+            personal_session_pushed: '个人 Substrate 登录态已随 Token 加密保存，无需注入 M365 浏览器。',
+            personal_session_required: '个人 JWE 不使用 M365 Cookie 注入；请在 copilot.com 登录并重新推送以启用自动续期。',
             cookies_pushed: 'Cookie 已推送：',
             httponly_included: '（含 httpOnly：',
             error: '错误：',
@@ -262,6 +264,8 @@
             fetching: 'Fetching...',
             pushing: 'Pushing...',
             no_cookies: 'No cookies found.',
+            personal_session_pushed: 'Personal Substrate login state was saved with the token; no M365 browser injection is needed.',
+            personal_session_required: 'Personal JWEs do not use M365 cookie injection. Sign in at copilot.com and push again to enable renewal.',
             cookies_pushed: 'Cookies pushed: ',
             httponly_included: '(httpOnly included: ',
             error: 'Error: ',
@@ -625,10 +629,12 @@
         return { account_id: selectedId, email: getIdentityCookieEmail(identityCookies) };
     }
 
-    let capturedSubstrateIdentity = { token: '', account_id: '' };
+    let capturedSubstrateIdentity = { token: '', account_id: '', origin: '' };
     function captureSubstrateIdentity(token) {
         const identity = readSubstrateIdentity([], token);
-        capturedSubstrateIdentity = { token, account_id: identity.account_id };
+        let origin = '';
+        try { origin = new URL(location.href).origin; } catch (e) {}
+        capturedSubstrateIdentity = { token, account_id: identity.account_id, origin };
     }
 
     function getSubstrateIdentity(cookies, token) {
@@ -1237,14 +1243,15 @@
     }
 
     // Get ALL cookies (including httpOnly) via GM_cookie
-    async function getAllCookies() {
+    async function getAllCookies(validateIdentity = null) {
         const allCookies = [];
         const seen = new Set();
 
         function addCookie(c) {
-            const key = c.name + '@' + c.domain;
+            const key = JSON.stringify([c.name, c.domain, c.path || '/']);
             if (seen.has(key)) return;
             seen.add(key);
+            const sameSite = String(c.sameSite || '').toLowerCase().replace(/[_-]/g, '');
             allCookies.push({
                 name: c.name || '',
                 value: c.value || '',
@@ -1252,21 +1259,26 @@
                 path: c.path || '/',
                 secure: c.secure !== false,
                 httpOnly: !!c.httpOnly,
-                sameSite: (c.sameSite || '').charAt(0).toUpperCase() + (c.sameSite || '').slice(1).toLowerCase() || 'None',
+                sameSite: sameSite === 'lax' ? 'Lax' : sameSite === 'strict' ? 'Strict' : 'None',
                 expires: c.expirationDate || c.expires || undefined,
             });
         }
 
         function gmCookieList(details) {
-            return new Promise((resolve) => {
-                const timer = setTimeout(() => resolve([]), 1500);
+            return new Promise((resolve, reject) => {
+                const complete = (cookies) => {
+                    try {
+                        if (validateIdentity) validateIdentity();
+                        resolve(cookies);
+                    } catch (e) { reject(e); }
+                };
+                const timer = setTimeout(() => complete([]), 1500);
                 try {
                     GM_cookie.list(details, (c, err) => {
                         clearTimeout(timer);
-                        if (err) { resolve([]); }
-                        else { resolve(c || []); }
+                        complete(err ? [] : (c || []));
                     });
-                } catch(e) { clearTimeout(timer); resolve([]); }
+                } catch(e) { clearTimeout(timer); complete([]); }
             });
         }
 
@@ -1317,21 +1329,74 @@
     // cookie-only injected profile has an empty MSAL cache (NoAccountOnStart),
     // so silent SSO can't run and refresh dead-ends on an interactive popup.
     // Exporting these lets the server seed them back so refresh works headless.
-    function getMsalLocalStorage() {
-        const out = {};
-        try {
-            for (const k of Object.keys(localStorage)) {
-                const lk = k.toLowerCase();
-                if (lk.includes('login.windows') || lk.includes('login.microsoftonline.com') ||
-                    lk.includes('msal') || lk.includes('authority') || lk.includes('account') ||
-                    lk.includes('clientinfo') || lk.includes('appmetadata') ||
-                    lk.includes('accesstoken') || lk.includes('refreshtoken') || lk.includes('idtoken')) {
-                    const v = localStorage.getItem(k);
-                    if (v != null) out[k] = v;
+    function getMsalStorage(storage) {
+        const entries = getConsumerStorageEntries(storage);
+        const referencedKeys = new Set();
+        for (const [key, raw] of entries) {
+            if (!/^msal\..*keys$/i.test(key)) continue;
+            const parsed = parseConsumerStorageJson(raw);
+            if (Array.isArray(parsed)) {
+                for (const item of parsed) if (typeof item === 'string') referencedKeys.add(item);
+            } else if (parsed && typeof parsed === 'object') {
+                for (const items of Object.values(parsed)) {
+                    if (Array.isArray(items)) {
+                        for (const item of items) if (typeof item === 'string') referencedKeys.add(item);
+                    }
                 }
             }
-        } catch (e) {}
+        }
+        const out = Object.create(null);
+        for (const [key, raw] of entries) {
+            const lower = key.toLowerCase();
+            if (typeof raw === 'string' && (referencedKeys.has(key) ||
+                ['login.windows', 'login.microsoftonline.com', 'login.live.com', 'msal', 'authority',
+                    'account', 'clientinfo', 'appmetadata', 'accesstoken', 'refreshtoken', 'idtoken']
+                    .some(part => lower.includes(part)))) {
+                out[key] = raw;
+            }
+        }
         return out;
+    }
+
+    function getMsalLocalStorage() {
+        return getMsalStorage(localStorage);
+    }
+
+    function getPersonalSubstrateCookies(cookies, now = Date.now() / 1000) {
+        const roots = ['copilot.com', 'copilot.microsoft.com', 'live.com', 'microsoftonline.com'];
+        return (Array.isArray(cookies) ? cookies : []).filter(cookie => {
+            if (!cookie || typeof cookie.name !== 'string' || !cookie.name ||
+                typeof cookie.value !== 'string' || !cookie.value ||
+                typeof cookie.domain !== 'string' || typeof cookie.path !== 'string' ||
+                !cookie.path.startsWith('/')) return false;
+            const domain = cookie.domain.replace(/^\./, '').toLowerCase();
+            if (!roots.some(root => domain === root || domain.endsWith('.' + root))) return false;
+            if (cookie.expires !== undefined) {
+                if (typeof cookie.expires !== 'number' || !Number.isFinite(cookie.expires)) return false;
+                if (cookie.expires > 0 && cookie.expires <= now) return false;
+            }
+            return true;
+        });
+    }
+
+    function getPersonalSubstrateExpiry(token, accountId) {
+        const entries = getConsumerStorageEntries();
+        if (typeof sessionStorage !== 'undefined') entries.push(...getConsumerStorageEntries(sessionStorage));
+        const deadlines = new Set();
+        for (const [, raw] of entries) {
+            const record = parseConsumerStorageJson(raw);
+            if (!record || typeof record !== 'object' || Array.isArray(record)) continue;
+            const type = consumerRecordValue(record, ['credentialType', 'credential_type']);
+            const secret = consumerRecordValue(record, ['secret', 'accessToken', 'access_token']);
+            if (type.toLowerCase() !== 'accesstoken' || secret !== token) continue;
+            if (consumerAccountId(record, '') !== accountId) return 0;
+            const rawExpiry = record.expiresOn ?? record.expires_on;
+            if ((typeof rawExpiry !== 'string' && typeof rawExpiry !== 'number') || rawExpiry === '') return 0;
+            const expiry = Number(rawExpiry);
+            if (!Number.isFinite(expiry) || expiry <= 0) return 0;
+            deadlines.add(expiry);
+        }
+        return deadlines.size === 1 ? Array.from(deadlines)[0] : 0;
     }
 
     // Capture the CURRENT chat conversation URL so the server can navigate back
@@ -1358,20 +1423,56 @@
     async function pushUserToken(base, token, activate = pushActivation.m365) {
         const key = getUserApiKey();
         if (!key) throw new Error(tr('no_user_key'));
+        const personal = token.split('.').length === 5;
+        const captured = capturedSubstrateIdentity;
+        let identity = getSubstrateIdentity([], token);
+        if (personal && !identity.account_id) throw new Error(tr('no_substrate_identity'));
+        let origin = '';
+        try { origin = new URL(location.href).origin; } catch (e) {}
+        const captureSession = personal && origin === 'https://copilot.com';
+        if (captureSession && captured.origin !== origin) throw new Error(tr('no_substrate_identity'));
+        if (captureSession && !hasGMCookie()) throw new Error(tr('gm_unavailable_alert'));
         let cookies = [];
-        if (token.split('.').length === 5 && hasGMCookie()) {
-            try { cookies = await getAllCookies(); } catch (e) { /* Display metadata is optional. */ }
+        if (personal && hasGMCookie()) {
+            // Revalidate every asynchronous cookie result, not just the final
+            // batch, so an observed switch cannot be hidden by switching back.
+            const validateIdentity = () => {
+                const current = getSubstrateIdentity([], token);
+                if (!current.account_id || current.account_id !== captured.account_id) {
+                    throw new Error(tr('no_substrate_identity'));
+                }
+            };
+            cookies = await getAllCookies(validateIdentity);
+            identity = getSubstrateIdentity(cookies, token);
+            if (!identity.account_id || identity.account_id !== captured.account_id) {
+                throw new Error(tr('no_substrate_identity'));
+            }
         }
-        const identity = getSubstrateIdentity(cookies, token);
-        if (token.split('.').length === 5 && !identity.account_id) throw new Error(tr('no_substrate_identity'));
         const body = { token, activate, substrate_account_id: identity.account_id };
-        if (token.split('.').length === 5) body.display_email = identity.email;
+        if (personal) body.display_email = identity.email;
+        if (captureSession) {
+            const sessionCookies = getPersonalSubstrateCookies(cookies);
+            if (!sessionCookies.length) throw new Error(tr('no_cookies'));
+            body.personal_substrate_session = {
+                origin,
+                account_id: captured.account_id,
+                cookies: sessionCookies,
+                local_storage: getMsalLocalStorage(),
+                session_storage: typeof sessionStorage === 'undefined' ? {} : getMsalStorage(sessionStorage),
+            };
+            const expiresAt = getPersonalSubstrateExpiry(token, captured.account_id);
+            if (expiresAt > 0) body.expires_at = expiresAt;
+            identity = getSubstrateIdentity(cookies, token);
+            if (identity.account_id !== captured.account_id || new URL(location.href).origin !== origin) {
+                throw new Error(tr('no_substrate_identity'));
+            }
+        }
         const r = await gmFetch(base + '/user/account/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
             body: JSON.stringify(body)
         });
-        return { response: r, data: await r.json() };
+        return { response: r, data: await r.json(), personalSessionPushed: captureSession && r.ok };
     }
     async function pushUserCookies(base, cookies) {
         const key = getUserApiKey();
@@ -1562,6 +1663,10 @@
                     alert(tr('token_push_failed') + (ur.data.error?.message || ur.data.error));
                     return;
                 }
+                if (latestToken.split('.').length === 5) {
+                    alert(tr(ur.personalSessionPushed ? 'personal_session_pushed' : 'personal_session_required'));
+                    return;
+                }
             }
             const cookies = await getAllCookies();
             if (!cookies.length) { alert(tr('no_cookies')); return; }
@@ -1641,6 +1746,10 @@
             if (!ur.response.ok) {
                 const cookieLine = tr('cookie_push_status') + tr('status_skipped');
                 alert(tokenLine + '\n' + cookieLine + '\n' + mediaAuthSkippedStatus());
+                return;
+            }
+            if (latestToken.split('.').length === 5) {
+                alert(tokenLine + '\n' + tr(ur.personalSessionPushed ? 'personal_session_pushed' : 'personal_session_required') + '\n' + mediaAuthSkippedStatus());
                 return;
             }
             if (latestRefreshToken) {

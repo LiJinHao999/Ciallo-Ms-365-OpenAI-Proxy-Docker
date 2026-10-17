@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -13,6 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import websockets
 from python_socks import ProxyError as SocksProxyError
+from websockets.exceptions import InvalidStatus
 
 from .probe_conversations import probe_conversations
 from .reasoning import ReasoningDelta, ReasoningSnapshots, StreamChunk
@@ -687,6 +689,30 @@ class SubstrateCopilotClient:
             except Exception:
                 _log.warning("reasoning collector failed", exc_info=True)
 
+    @asynccontextmanager
+    async def _connect_for_turn(self, conv_id: str, session_id: str, req_id: str) -> AsyncIterator[Any]:
+        """Retry only a rejected HTTP upgrade, before any chat can be invoked."""
+        gate = getattr(self, "_personal_substrate_gate", None)
+        origin = "https://copilot.com" if getattr(self, "_is_consumer", False) else "https://m365.cloud.microsoft"
+        async with AsyncExitStack() as stack:
+            for attempt in range(2):
+                try:
+                    ws = await stack.enter_async_context(websockets.connect(
+                        self._ws_url(conv_id, session_id, req_id),
+                        additional_headers={"Origin": origin},
+                        open_timeout=_WS_OPEN_TIMEOUT,
+                        close_timeout=_WS_OPEN_TIMEOUT,
+                    ))
+                    break
+                except InvalidStatus as exc:
+                    if attempt or exc.response.status_code != 401 or gate is None or not is_valid_substrate_jwe(self._token):
+                        raise
+                    fresh_token = await gate(self._token)
+                    if not is_valid_substrate_jwe(fresh_token) or fresh_token == self._token:
+                        raise
+                    self._token = fresh_token
+            yield ws
+
     async def _chat_stream_for_turn(
         self,
         text: str,
@@ -697,17 +723,8 @@ class SubstrateCopilotClient:
     ) -> AsyncIterator[StreamChunk]:
         req_id = str(uuid.uuid4())
         probe = probe_conversations.get() if is_start_of_session else None
-        url = self._ws_url(conv_id, session_id, req_id)
-        origin = "https://copilot.com" if getattr(self, "_is_consumer", False) else "https://m365.cloud.microsoft"
         try:
-            async with websockets.connect(
-                url,
-                additional_headers={
-                    "Origin": origin,
-                },
-                open_timeout=_WS_OPEN_TIMEOUT,
-                close_timeout=_WS_OPEN_TIMEOUT,
-            ) as ws:
+            async with self._connect_for_turn(conv_id, session_id, req_id) as ws:
                 idle_timeout = getattr(self, "_idle_timeout", None) or _WS_IDLE_TIMEOUT
                 await ws.send(json.dumps({"protocol": "json", "version": 1}) + SIGNALR_SEP)
                 await asyncio.wait_for(ws.recv(), timeout=idle_timeout)
