@@ -1,0 +1,930 @@
+{
+  "date": "2026-10-18",
+  "change": "Admin compact protocol checks and subject-owned personal Substrate Cookie metadata",
+  "full_acceptance": false,
+  "scope": {
+    "production_service_replaced": false,
+    "production_source_overwritten": false,
+    "production_protocol_switched": false,
+    "production_keys_modified": false,
+    "production_credential_writes": "Two same-protocol personal JWE renewals; one validated Consumer RT rotation saved with activate=false. No account RT copied outside production.",
+    "isolated_candidate": "ciallo-account-status-c44bf843",
+    "isolated_image": "ciallo-account-status:c44bf843",
+    "production_image": "ghcr.io/murasamecyan/ciallo-ms-365-openai-proxy-docker:fox-camoufox",
+    "production_commit": "99bbb5320b4b82df9716925ff9c9670eeae0c422",
+    "display_fix_deployed_to_production": false,
+    "deployed_source_matches_local": true,
+    "source_sha256": {
+      "get_token.user.js": "5a257f3886bc10327a09cf6ee8ac923f22b21ccd3ece76680384fb437f3872b1",
+      "src/m365_copilot_openai_proxy/account_serializers.py": "e1030dd5479a63f2a5e70d1b3612deb6536ddd92e111c1d35c93b197ae755c27",
+      "src/m365_copilot_openai_proxy/template_admin_accounts.py": "30cb08bdb6befe9c20118feaa8ab5022b34cc11cc0543236cc391050b66d510f",
+      "tests/test_personal_substrate_session.py": "a97d1755588133b7b8a516fdd845ea4051814fd4497e005ca84c296a5eb0f667"
+    },
+    "copied_account_refresh_grants": 0,
+    "copied_browser_profiles": 0,
+    "independent_candidate_encryption_key": true,
+    "cloud_conversation_cleanup_disabled": true,
+    "existing_cloud_conversations_not_scanned_or_deleted": true
+  },
+  "regression": {
+    "command": [
+      "python",
+      "-m",
+      "pytest",
+      "-q",
+      "--tb=short"
+    ],
+    "source": "repository root src via explicit PYTHONPATH",
+    "exit": 0,
+    "tests": 2793,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 3,
+    "passed": 2790,
+    "summary": "2790 passed, 3 skipped, 11 warnings in 133.62s (0:02:13)",
+    "personal_cookie_binding_regression_variants": 8,
+    "personal_cookie_binding_regressions_all_passed": true
+  },
+  "root_cause": {
+    "personal": "Active personal JWE serializers used the legacy enterprise Cookie validity flag, timestamps and binding state, although a separate subject-pinned personal session already enabled browser renewal.",
+    "enterprise": "A working RT and token do not validate browser Cookies. The observed legacy Cookie deadline was unknown, not proven expired.",
+    "token_only_personal": "The older account has no usable subject-pinned personal session; manual renewal remains correct and was not relabelled automatic."
+  },
+  "ui": {
+    "surface": "Actual admin page in the production-before and deployed isolated candidate-after containers, not a mocked renderer",
+    "before": [
+      {
+        "row": 1,
+        "cookie": "无效",
+        "renewal": "自动",
+        "protocols": [
+          {
+            "protocol": "m365",
+            "text": "Substrate · 已保存 · 当前",
+            "color": "rgb(154, 167, 209)"
+          },
+          {
+            "protocol": "consumer",
+            "text": "ChatAI · 已保存",
+            "color": "rgb(154, 167, 209)"
+          }
+        ]
+      },
+      {
+        "row": 2,
+        "cookie": "无效",
+        "renewal": "自动",
+        "protocols": [
+          {
+            "protocol": "m365",
+            "text": "Substrate · 已保存 · 当前",
+            "color": "rgb(154, 167, 209)"
+          },
+          {
+            "protocol": "consumer",
+            "text": "ChatAI · 未保存",
+            "color": "rgb(154, 167, 209)"
+          }
+        ]
+      },
+      {
+        "row": 3,
+        "cookie": "无效",
+        "renewal": "手动",
+        "protocols": [
+          {
+            "protocol": "m365",
+            "text": "Substrate · 已保存 · 当前",
+            "color": "rgb(154, 167, 209)"
+          },
+          {
+            "protocol": "consumer",
+            "text": "ChatAI · 未保存",
+            "color": "rgb(154, 167, 209)"
+          }
+        ]
+      }
+    ],
+    "after": [
+      {
+        "row": 1,
+        "cookie": "已保存",
+        "cookieTitle": "Substrate · 已保存 · 当前协议使用浏览器续期 · 仅表示凭据存在，不保证上游可用。仅当前协议自动续期。",
+        "renewal": "自动",
+        "renewalTitle": "当前协议使用浏览器续期",
+        "protocols": [
+          {
+            "protocol": "m365",
+            "text": "Substrate √",
+            "color": "rgb(63, 185, 112)",
+            "title": "Substrate · 已保存 · 当前 · 当前协议使用浏览器续期 · 仅表示凭据存在，不保证上游可用。仅当前协议自动续期。"
+          },
+          {
+            "protocol": "consumer",
+            "text": "ChatAI √",
+            "color": "rgb(63, 185, 112)",
+            "title": "ChatAI · 已保存 · 仅表示凭据存在，不保证上游可用。仅当前协议自动续期。"
+          }
+        ]
+      },
+      {
+        "row": 2,
+        "cookie": "无效",
+        "cookieTitle": "",
+        "renewal": "手动",
+        "renewalTitle": "当前协议需手动重新推送",
+        "protocols": [
+          {
+            "protocol": "m365",
+            "text": "Substrate √",
+            "color": "rgb(63, 185, 112)",
+            "title": "Substrate · 已保存 · 当前 · 当前协议需手动重新推送 · 仅表示凭据存在，不保证上游可用。仅当前协议自动续期。"
+          },
+          {
+            "protocol": "consumer",
+            "text": "ChatAI —",
+            "color": "rgb(138, 151, 196)",
+            "title": "ChatAI · 未保存"
+          }
+        ]
+      },
+      {
+        "row": 3,
+        "cookie": "无效",
+        "cookieTitle": "",
+        "renewal": "手动",
+        "renewalTitle": "当前协议需手动重新推送",
+        "protocols": [
+          {
+            "protocol": "m365",
+            "text": "Substrate √",
+            "color": "rgb(63, 185, 112)",
+            "title": "Substrate · 已保存 · 当前 · 当前协议需手动重新推送 · 仅表示凭据存在，不保证上游可用。仅当前协议自动续期。"
+          },
+          {
+            "protocol": "consumer",
+            "text": "ChatAI —",
+            "color": "rgb(138, 151, 196)",
+            "title": "ChatAI · 未保存"
+          }
+        ]
+      }
+    ],
+    "latest_actual_screenshot_captured": true,
+    "screenshot_privacy": "Names, email and account IDs blurred; Cookie, renewal and protocol cells unchanged.",
+    "consumer_separation_observed": {
+      "active_provider": "consumer",
+      "retained_personal_session": true,
+      "cookie_label": "有效",
+      "cookie_tooltip_uses_consumer_refresh_timestamp": true,
+      "does_not_use_personal_substrate_saved_label": true
+    },
+    "candidate_explicitly_restored_to_substrate_after_consumer_probe": true,
+    "restoration_preserved_both_tokens_and_pinned_personal_session": true,
+    "enterprise_manual_in_candidate_is_expected": "The isolated seed deliberately removes all account RTs; production retains enterprise RT renewal."
+  },
+  "before_cookie_diagnosis": [
+    {
+      "account_ref": "a1e54221",
+      "provider": "m365",
+      "personal_jwe": true,
+      "legacy_cookie_present": true,
+      "legacy_cookie_valid_flag": false,
+      "legacy_cookie_expiry_known": false,
+      "legacy_cookie_expired": false,
+      "public_cookie_valid": false,
+      "public_cookie_updated_at": 0.0,
+      "public_cookie_expires_at": 0.0,
+      "has_personal_session": true,
+      "public_binding_state": "token_only",
+      "active_renewal_mode": "browser",
+      "token_valid": true
+    },
+    {
+      "account_ref": "8ef568ca",
+      "provider": "m365",
+      "personal_jwe": false,
+      "legacy_cookie_present": true,
+      "legacy_cookie_valid_flag": false,
+      "legacy_cookie_expiry_known": false,
+      "legacy_cookie_expired": false,
+      "public_cookie_valid": false,
+      "public_cookie_updated_at": 0.0,
+      "public_cookie_expires_at": 0.0,
+      "has_personal_session": false,
+      "public_binding_state": "token_only",
+      "active_renewal_mode": "rt",
+      "token_valid": true
+    },
+    {
+      "account_ref": "84f9595e",
+      "provider": "m365",
+      "personal_jwe": true,
+      "legacy_cookie_present": true,
+      "legacy_cookie_valid_flag": false,
+      "legacy_cookie_expiry_known": false,
+      "legacy_cookie_expired": false,
+      "public_cookie_valid": false,
+      "public_cookie_updated_at": 0.0,
+      "public_cookie_expires_at": 0.0,
+      "has_personal_session": false,
+      "public_binding_state": "token_only",
+      "active_renewal_mode": "manual",
+      "token_valid": false
+    }
+  ],
+  "final_public_state": {
+    "production": {
+      "runtime_uid": 997,
+      "git_commit": "99bbb5320b4b82df9716925ff9c9670eeae0c422",
+      "source_sha256": {
+        "account_serializers.py": "ab536804facf002e13cf0ad59fda0fce337fd563c575432c90c865ad735471bc",
+        "template_admin_accounts.py": "1b146bbaaf03a6aa14c086bb25d33532929d384db2e324a639f282776d6fc3c5"
+      },
+      "personal_temporary_profiles_remaining": 0,
+      "saved_personal_sessions_encrypted": true,
+      "public_session_blob_absent": true,
+      "accounts": [
+        {
+          "account_ref": "a1e54221",
+          "provider": "m365",
+          "has_personal_session": true,
+          "legacy_cookie_valid_flag": false,
+          "public_cookie_valid": false,
+          "public_cookie_updated_at": 0.0,
+          "public_cookie_expires_at": 0.0,
+          "binding_state": "token_only",
+          "active_renewal_mode": "browser",
+          "account_refresh_grant_present": true
+        },
+        {
+          "account_ref": "8ef568ca",
+          "provider": "m365",
+          "has_personal_session": false,
+          "legacy_cookie_valid_flag": false,
+          "public_cookie_valid": false,
+          "public_cookie_updated_at": 0.0,
+          "public_cookie_expires_at": 0.0,
+          "binding_state": "token_only",
+          "active_renewal_mode": "rt",
+          "account_refresh_grant_present": true
+        },
+        {
+          "account_ref": "84f9595e",
+          "provider": "m365",
+          "has_personal_session": false,
+          "legacy_cookie_valid_flag": false,
+          "public_cookie_valid": false,
+          "public_cookie_updated_at": 0.0,
+          "public_cookie_expires_at": 0.0,
+          "binding_state": "token_only",
+          "active_renewal_mode": "manual",
+          "account_refresh_grant_present": false
+        }
+      ]
+    },
+    "candidate": {
+      "runtime_uid": 997,
+      "git_commit": "account-status-candidate",
+      "source_sha256": {
+        "account_serializers.py": "e1030dd5479a63f2a5e70d1b3612deb6536ddd92e111c1d35c93b197ae755c27",
+        "template_admin_accounts.py": "30cb08bdb6befe9c20118feaa8ab5022b34cc11cc0543236cc391050b66d510f"
+      },
+      "personal_temporary_profiles_remaining": 0,
+      "saved_personal_sessions_encrypted": true,
+      "public_session_blob_absent": true,
+      "accounts": [
+        {
+          "account_ref": "a1e54221",
+          "provider": "m365",
+          "has_personal_session": true,
+          "legacy_cookie_valid_flag": false,
+          "public_cookie_valid": true,
+          "public_cookie_updated_at": 0.0,
+          "public_cookie_expires_at": 0.0,
+          "binding_state": "cookie",
+          "active_renewal_mode": "browser",
+          "account_refresh_grant_present": false
+        },
+        {
+          "account_ref": "8ef568ca",
+          "provider": "m365",
+          "has_personal_session": false,
+          "legacy_cookie_valid_flag": false,
+          "public_cookie_valid": false,
+          "public_cookie_updated_at": 0.0,
+          "public_cookie_expires_at": 0.0,
+          "binding_state": "token_only",
+          "active_renewal_mode": "manual",
+          "account_refresh_grant_present": false
+        },
+        {
+          "account_ref": "84f9595e",
+          "provider": "m365",
+          "has_personal_session": false,
+          "legacy_cookie_valid_flag": false,
+          "public_cookie_valid": false,
+          "public_cookie_updated_at": 0.0,
+          "public_cookie_expires_at": 0.0,
+          "binding_state": "token_only",
+          "active_renewal_mode": "manual",
+          "account_refresh_grant_present": false
+        }
+      ]
+    }
+  },
+  "userscript_capture_lineage": {
+    "evidence": "docs/evidence/personal-substrate-renewal-2026-10-17.json",
+    "version": "1.0.83",
+    "raw_sha256": "5a257f3886bc10327a09cf6ee8ac923f22b21ccd3ece76680384fb437f3872b1",
+    "source_unchanged": true,
+    "origin": "https://copilot.com",
+    "baseline_signed_in": true,
+    "baseline_push_http": 200,
+    "new_browser_login_or_userscript_push_repeated_in_this_run": false,
+    "limitation": "This UI-only acceptance reused the previously userscript-captured, same-subject SSO session; it does not claim a new Tampermonkey installation or fresh userscript UI push."
+  },
+  "production_no_chat_renewals": {
+    "scope": "current deployed account, same-protocol refresh only",
+    "business_invocations_sent": 0,
+    "rounds": [
+      {
+        "round": 1,
+        "http": 200,
+        "refreshed": true,
+        "new_jwe": true,
+        "token_sha256": "26d17b1310371d7f",
+        "subject_preserved": true,
+        "epoch_preserved": true,
+        "provider_preserved": true,
+        "expiry_source": "issuer",
+        "seconds_remaining": 28798,
+        "refresh_error": "",
+        "elapsed_seconds": 31.315,
+        "handshake": {
+          "http": 101,
+          "signalr_handshake": true,
+          "business_invocations_sent": 0
+        }
+      },
+      {
+        "round": 2,
+        "http": 200,
+        "refreshed": true,
+        "new_jwe": true,
+        "token_sha256": "71d358d397bcf532",
+        "subject_preserved": true,
+        "epoch_preserved": true,
+        "provider_preserved": true,
+        "expiry_source": "issuer",
+        "seconds_remaining": 28798,
+        "refresh_error": "",
+        "elapsed_seconds": 28.681,
+        "handshake": {
+          "http": 101,
+          "signalr_handshake": true,
+          "business_invocations_sent": 0
+        }
+      }
+    ],
+    "session_encrypted_at_rest": true,
+    "new_temporary_profiles_remaining": 0,
+    "public_session_blob_absent": true,
+    "status": "pass"
+  },
+  "candidate_no_chat_renewals": {
+    "scope": "isolated deployed candidate, same-protocol refresh only",
+    "business_invocations_sent": 0,
+    "rounds": [
+      {
+        "round": 1,
+        "http": 200,
+        "refreshed": true,
+        "new_jwe": true,
+        "token_sha256": "1784789cf9ce28c6",
+        "subject_preserved": true,
+        "epoch_preserved": true,
+        "provider_preserved": true,
+        "expiry_source": "issuer",
+        "seconds_remaining": 28798,
+        "refresh_error": "",
+        "elapsed_seconds": 30.372,
+        "handshake": {
+          "http": 101,
+          "signalr_handshake": true,
+          "business_invocations_sent": 0
+        }
+      },
+      {
+        "round": 2,
+        "http": 200,
+        "refreshed": true,
+        "new_jwe": true,
+        "token_sha256": "4279c82d03b053a9",
+        "subject_preserved": true,
+        "epoch_preserved": true,
+        "provider_preserved": true,
+        "expiry_source": "issuer",
+        "seconds_remaining": 28798,
+        "refresh_error": "",
+        "elapsed_seconds": 27.857,
+        "handshake": {
+          "http": 101,
+          "signalr_handshake": true,
+          "business_invocations_sent": 0
+        }
+      }
+    ],
+    "session_encrypted_at_rest": true,
+    "new_temporary_profiles_remaining": 0,
+    "public_session_blob_absent": true,
+    "status": "pass"
+  },
+  "candidate_latest_restart": {
+    "started_at_utc": "2026-10-17T16:25:13.541155778Z",
+    "post_restart_probe": {
+      "scope": "isolated candidate after container restart, same-protocol refresh only",
+      "business_invocations_sent": 0,
+      "rounds": [
+        {
+          "round": 1,
+          "http": 200,
+          "refreshed": true,
+          "new_jwe": true,
+          "token_sha256": "8885c5202c6f4ca5",
+          "subject_preserved": true,
+          "epoch_preserved": true,
+          "provider_preserved": true,
+          "expiry_source": "issuer",
+          "seconds_remaining": 28798,
+          "refresh_error": "",
+          "elapsed_seconds": 27.273,
+          "handshake": {
+            "http": 101,
+            "signalr_handshake": true,
+            "business_invocations_sent": 0
+          }
+        }
+      ],
+      "session_encrypted_at_rest": true,
+      "new_temporary_profiles_remaining": 0,
+      "public_session_blob_absent": true,
+      "status": "pass"
+    }
+  },
+  "consumer_rt_save_only": {
+    "evidence_source": "actual probe result preserved in this conversation history",
+    "probe": "consumer_rt_save_only",
+    "network": [
+      {
+        "http": 200
+      }
+    ],
+    "rt_left_production_container": false,
+    "production_protocol_changed": false,
+    "refreshed": true,
+    "disabled_reason": "",
+    "new_access_token": true,
+    "rotated_grant": true,
+    "pinned_identity_preserved": true,
+    "save_only_http": 200,
+    "provider_preserved": true,
+    "epoch_preserved": true,
+    "substrate_jwe_preserved": true,
+    "personal_session_preserved": true,
+    "rotated_consumer_grant_persisted": true,
+    "consumer_access_token_persisted": true,
+    "keys_unchanged": true,
+    "status": "pass"
+  },
+  "live_cases": [
+    {
+      "case": "enterprise_native_stream_and_previous_response_id",
+      "streaming": true,
+      "first_http": 200,
+      "first_completed": true,
+      "first_marker_observed": true,
+      "second_http": 200,
+      "second_completed": true,
+      "previous_response_id_only": true,
+      "previous_marker_recalled": true,
+      "request_count": 2,
+      "status": "pass",
+      "elapsed_seconds": 10.076
+    },
+    {
+      "case": "personal_native_stream_and_previous_response_id",
+      "streaming": true,
+      "first_http": 200,
+      "first_completed": true,
+      "first_marker_observed": true,
+      "second_http": 200,
+      "second_completed": true,
+      "previous_response_id_only": true,
+      "previous_marker_recalled": true,
+      "request_count": 2,
+      "status": "pass",
+      "elapsed_seconds": 11.051
+    },
+    {
+      "case": "Studio planning/tool path",
+      "status": "blocked",
+      "blocker": "No subject-bound published Studio agent is configured; router fallback is not Studio acceptance."
+    },
+    {
+      "case": "Router streaming Chat Completions tool loop",
+      "first": {
+        "http": 200,
+        "streaming": true,
+        "done": true,
+        "event_types": [
+          "chat.chunk"
+        ],
+        "elapsed_seconds": 5.595
+      },
+      "second": {
+        "http": 200,
+        "streaming": true,
+        "done": true,
+        "event_types": [
+          "chat.chunk"
+        ],
+        "elapsed_seconds": 8.966
+      },
+      "tool_calls": 1,
+      "final_marker_observed": true,
+      "sum_observed": true,
+      "finish_reason": "stop",
+      "status": "pass",
+      "elapsed_seconds": 14.561
+    },
+    {
+      "case": "Anthropic Messages streaming tool loop across real upgrade 401",
+      "first": {
+        "http": 200,
+        "streaming": true,
+        "done": false,
+        "event_types": [
+          "content_block_delta",
+          "content_block_start",
+          "content_block_stop",
+          "message_delta",
+          "message_start",
+          "message_stop",
+          "ping"
+        ],
+        "elapsed_seconds": 6.297
+      },
+      "first_stop_reason": "tool_use",
+      "second": {
+        "http": 200,
+        "streaming": true,
+        "done": false,
+        "event_types": [
+          "content_block_delta",
+          "content_block_start",
+          "content_block_stop",
+          "message_delta",
+          "message_start",
+          "message_stop",
+          "ping"
+        ],
+        "elapsed_seconds": 34.248
+      },
+      "stop_reason": "end_turn",
+      "final_marker_observed": true,
+      "sum_observed": true,
+      "recovery": {
+        "fixture": "one authentication-tag bit flipped in isolated captured JWE; HTTP is not mocked",
+        "upgrade_401_count": 1,
+        "upgrade_101_count": 1,
+        "new_issuer_jwe": true,
+        "subject_preserved": true,
+        "epoch_preserved": true,
+        "provider_preserved": true,
+        "expiry_source": "issuer",
+        "token_sha256": "6a210d88118b8cee",
+        "session_encrypted_at_rest": true,
+        "pass": true
+      },
+      "status": "pass",
+      "elapsed_seconds": 40.593
+    },
+    {
+      "case": "OpenAI Responses streaming previous_response_id tool loop across real upgrade 401",
+      "first": {
+        "http": 200,
+        "streaming": true,
+        "done": false,
+        "event_types": [
+          "response.completed",
+          "response.created",
+          "response.function_call_arguments.delta",
+          "response.function_call_arguments.done",
+          "response.in_progress",
+          "response.output_item.added",
+          "response.output_item.done"
+        ],
+        "elapsed_seconds": 5.719
+      },
+      "second": {
+        "http": 200,
+        "streaming": true,
+        "done": false,
+        "event_types": [
+          "response.completed",
+          "response.content_part.added",
+          "response.content_part.done",
+          "response.created",
+          "response.in_progress",
+          "response.output_item.added",
+          "response.output_item.done",
+          "response.output_text.delta",
+          "response.output_text.done"
+        ],
+        "elapsed_seconds": 34.043
+      },
+      "response_status": "completed",
+      "previous_response_id_only": true,
+      "final_marker_observed": true,
+      "sum_observed": true,
+      "recovery": {
+        "fixture": "one authentication-tag bit flipped in isolated captured JWE; HTTP is not mocked",
+        "upgrade_401_count": 1,
+        "upgrade_101_count": 1,
+        "new_issuer_jwe": true,
+        "subject_preserved": true,
+        "epoch_preserved": true,
+        "provider_preserved": true,
+        "expiry_source": "issuer",
+        "token_sha256": "2c5708e70fda6822",
+        "session_encrypted_at_rest": true,
+        "pass": true
+      },
+      "status": "pass",
+      "elapsed_seconds": 39.81
+    },
+    {
+      "case": "Consumer ChatAI browser renewal, streaming and history continuation",
+      "switch_http": 200,
+      "refresh_http": 502,
+      "refreshed": null,
+      "provider": "consumer",
+      "fresh_consumer_token": false,
+      "identity_preserved": true,
+      "status": "fail",
+      "error_type": "AssertionError",
+      "elapsed_seconds": 55.551
+    },
+    {
+      "case": "Consumer ChatAI streaming/history with real RT-issued access token",
+      "model": "copilot-smart",
+      "already_active_consumer": true,
+      "provider": "consumer",
+      "credential_source": "real bound RT exchange in production; only short token copied",
+      "refresh_grants_copied": 0,
+      "identity_preserved": true,
+      "first": {
+        "http": 200,
+        "streaming": true,
+        "done": true,
+        "event_types": [
+          "chat.chunk"
+        ],
+        "elapsed_seconds": 4.452
+      },
+      "second": {
+        "http": 200,
+        "streaming": true,
+        "done": true,
+        "event_types": [
+          "chat.chunk"
+        ],
+        "elapsed_seconds": 4.083
+      },
+      "previous_marker_recalled": true,
+      "status": "pass",
+      "elapsed_seconds": 8.55
+    }
+  ],
+  "handshakes": [
+    {
+      "at": 1792251422.1539092,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792251430.7841852,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792251701.6544743,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792251710.290601,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792252176.6520243,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792252181.6904306,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792252186.567874,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792252191.9276893,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792253023.927502,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792253032.5671747,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792253183.597897,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792253189.2487466,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792253196.7791631,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792253203.067605,
+      "stage": "websocket_upgrade",
+      "http": 401
+    },
+    {
+      "at": 1792253230.9573975,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792253237.4056263,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792253243.23974,
+      "stage": "websocket_upgrade",
+      "http": 401
+    },
+    {
+      "at": 1792253272.1595366,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792254315.3980117,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792254324.1414125,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792254326.5068483,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792254374.0696332,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792254374.112871,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792256176.4953578,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792256185.145568,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792256187.5522084,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792256235.0250545,
+      "stage": "websocket_upgrade",
+      "http": 101
+    },
+    {
+      "at": 1792256235.0672655,
+      "stage": "websocket_upgrade",
+      "http": 101
+    }
+  ],
+  "streaming_terminal_checks": "Messages requires message_stop/end_turn; Responses requires response.completed. These APIs do not use Chat Completions [DONE].",
+  "mandatory_matrix": [
+    {
+      "item": 1,
+      "name": "M365 direct/native",
+      "status": "partial",
+      "observed": "Enterprise and personal native streaming and previous_response_id-only continuation each passed with HTTP 200.",
+      "limitation": "Prior native-tool limitations remain: Gpt_5_6_Reasoning ignored tools and Claude_Sonnet returned upstream InternalError. No new native-tool success is claimed.",
+      "prior_evidence": "docs/evidence/personal-substrate-renewal-2026-10-17.json"
+    },
+    {
+      "item": 2,
+      "name": "Router planning/tool",
+      "status": "pass",
+      "observed": "Real streaming Chat Completions tool loop: one valid call, tool result with independent marker and sum 54, terminal stop."
+    },
+    {
+      "item": 3,
+      "name": "Studio planning/tool",
+      "status": "blocked",
+      "blocker": "No subject-bound published Studio agent is configured. Router fallback is not Studio acceptance."
+    },
+    {
+      "item": 4,
+      "name": "Anthropic Messages API",
+      "status": "pass",
+      "observed": "Real streaming tool loop crossed one upstream pre-invocation WebSocket 401 and recovered with a freshly issued JWE; final tool-result marker and sum matched, end_turn/message_stop observed."
+    },
+    {
+      "item": 5,
+      "name": "OpenAI Responses API",
+      "status": "pass",
+      "observed": "Real streaming tool loop using previous_response_id-only tool output crossed one upstream pre-invocation WebSocket 401 and recovered with a freshly issued JWE; response.completed and final tool-result marker/sum observed."
+    },
+    {
+      "item": 6,
+      "name": "Consumer and userscript-pushed personal Substrate",
+      "status": "partial",
+      "observed": "Consumer bound-RT exchange and save-only rotation passed in production without changing active Substrate. Only the short token entered the isolated candidate; Consumer streaming and history continuation passed using advertised copilot-smart. Personal Substrate native streaming passed.",
+      "limitations": [
+        "The intentionally RT-free Consumer browser fallback returned HTTP 502 after timing out waiting for a ChatAI credential. This is not a failed production RT exchange.",
+        "Fresh userscript login/push was not repeated in this UI-only run; its exact unchanged-script capture lineage is linked separately."
+      ]
+    },
+    {
+      "item": 7,
+      "name": "Personal Substrate unattended browser-renewal runtime",
+      "status": "pass",
+      "observed": "Two different issuer JWEs in production and two in the isolated candidate, plus a new issuer JWE after the latest container restart; zero business invocations during issuance, pinned subject/provider/epoch preserved, real 101/SignalR handshakes, encrypted session persistence and zero final temporary profiles. Messages and Responses real-401 tool continuations passed.",
+      "epoch_comparison": "Within each same-protocol renewal; explicit Consumer/Substrate test switches were confined to the isolated candidate."
+    }
+  ],
+  "privacy_check": {
+    "method": "Compared all report string values inside each container against live credential, Cookie, storage, API-key and full-identity values; no secret values exported for scanning.",
+    "production": {
+      "checked_credential_and_identity_values": 163,
+      "leak_count": 0
+    },
+    "candidate": {
+      "checked_credential_and_identity_values": 165,
+      "leak_count": 0
+    }
+  },
+  "cleanup": {
+    "completed": true,
+    "candidate_container_removed": true,
+    "candidate_named_state_volume_removed": true,
+    "candidate_anonymous_profile_volume_removed": true,
+    "candidate_image_tag_removed": true,
+    "owned_regression_directory_removed": true,
+    "owned_ssh_tunnels_stopped": true,
+    "owned_browser_tabs_absent": true,
+    "temporary_acceptance_runners_removed": 7,
+    "owned_browser_processes_before_teardown": 0,
+    "production_service_replaced": false,
+    "production_image_unchanged": true,
+    "production_health": "healthy"
+  }
+}

@@ -290,6 +290,14 @@ docker compose up -d
 
 `/` 与 `/admin` 都会显示账户的 Token 剩余有效期、Cookie 状态、`refresh_token` 是否入库。个人版 ChatAI token 不是可解码的 JWT，但油猴脚本或 RT 响应提供的有效期可用于显示剩余时间；缺少有效期时只按凭据是否存在显示。已知过期会标为失效；恢复方式见[凭据过期后手动重推](#3-凭据过期后手动重推)。
 
+管理页协议列以绿色 `Substrate √`、`ChatAI √` 表示该协议凭据已保存，缺失时显示灰色 `—`；勾选不保证上游可用。当前协议和续期方式保留在悬浮说明中，「自动／手动」仍按当前协议实际具备的续期材料判定。
+
+**Cookie 列与 Token 有效性分开判断：**
+
+- **个人 Substrate JWE**：读取本账户主体绑定的个人登录态，显示「已保存」，不再读取旧企业 Cookie 标记或借用其刷新／过期时间。这里只表示本地存在通过校验的续期材料，不等于实时通过微软鉴权；缺失、过期或主体不匹配时仍不可用。
+- **企业 M365 JWT**：保留浏览器 Cookie 登录验证结果。RT 换出有效 Token 不会同时验证或更新 Cookie，所以「Token 有效、自动续期、Cookie 无效」可以同时成立。Cookie 全部注入成功也不代表登录成功；若微软仍重定向登录页，需要重新登录并推送新的 Cookie。
+- **Consumer ChatAI**：仍读取该协议自己的 Cookie，不借用已保存的个人 Substrate 登录态。
+
 > **Check Login / Auto Capture / Cookie 注入依赖共享 admin Chromium（9222），仅在 `ENABLE_ADMIN_CDP=true` 时可用**。默认多租户部署下这些按钮对应的端点未注册；请改用 `/` 用户自助页推送账户 Token / Cookie，刷新由每账户独立 Chromium 或 RT 承担。
 
 ## API 端点
@@ -765,6 +773,10 @@ userscript `1.0.83` 在 `https://copilot.com` 推送个人 JWE 时，同时采�
 2026-10-01 的部署验收记录见 [双协议证据](docs/evidence/dual-protocol-2026-10-01.json)：2646 项回归通过；ChatAI 重启后刷新、原生 M365/个人 Substrate 流式输出、Router 和 Messages/Responses 工具闭环已观察。Studio 实际回退 Router，不能算通过；ChatAI smart 模式的 Messages/Responses 续轮仍受真实 429 阻塞。该次完整矩阵未通过，源码覆盖也未发布为镜像。
 
 2026-10-17 个人 Substrate 自动续期在新分支隔离容器中实测：`1.0.83` 脚本推送返回 200，连续重签两枚不同 JWE，均通过 101／SignalR 握手；加密登录态重启后可用，Messages 与 Responses 均完成跨真实握手 401 的流式工具续接。全量回归 2782 passed、3 skipped。Studio 仍以 `not_ready` 回退 Router；`Gpt_5_6_Reasoning` 忽略 native 工具，`Claude_Sonnet` 返回上游 `InternalError`，因此**完整矩阵仍未通过**。本次未替换生产服务或推送镜像。见[个人续期验收证据](docs/evidence/personal-substrate-renewal-2026-10-17.json)。
+
+2026-10-18 账户状态显示修正的隔离验收：全量回归 **2790 passed、3 skipped**，含 8 个个人登录态归属／过期回归变体。实际管理页已验证绿色 `Substrate √`／`ChatAI √`、个人 Substrate Cookie「已保存」及缺少匹配登录态时仍显示「手动」。原生流式与 `previous_response_id` 续接、Router 工具闭环、Messages／Responses 跨真实握手 401 的工具续轮通过；无聊天重签及最新容器重启后再重签均取得新 JWE，主体与续期内协议 epoch 保持不变，临时个人 profile 最终为零。
+
+**完整矩阵仍未通过**：Studio 缺少主体绑定的已发布 agent，前述 native 工具限制未解除；刻意不复制 RT 的 Consumer 副本浏览器回退超时返回 502，但真实 RT 交换／仅保存轮换成功，所签短期 Token 在副本完成了流式对话及历史续轮。脚本采集沿用 10-17 相同 `1.0.83` 代码的实测登录态，本轮未重做浏览器登录／油猴推送。生产仍运行 `fox-camoufox` 的 `99bbb5320b4b`，本次显示修正未替换生产容器。详见[账户状态验收证据](docs/evidence/account-protocol-status-2026-10-18.json)。
 
 同一个已绑定账户切换到另一个 Microsoft 个人主体前，需要先在用户页「登出 Microsoft」或解绑；不同账户不会共用 Consumer profile。隔离单位是账户，不是 Key：如果管理员故意把多个 Key 绑定到同一个账户，这些 Key 会共享该账户的凭据、代理、profile 和保活状态；要做到一人一号，应给每人创建并绑定独立账户。这里的“移出 M365 刷新链路”只表示 provider 刷新实现不同，不表示个人版失去多租户隔离或账户级保活。
 

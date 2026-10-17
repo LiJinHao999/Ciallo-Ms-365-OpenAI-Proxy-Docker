@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from jwe_helpers import make_jwe
+from m365_copilot_openai_proxy.account_serializers import account_public, user_account_public
 from m365_copilot_openai_proxy.account_store import AccountStore
 from m365_copilot_openai_proxy.app import create_app
 from m365_copilot_openai_proxy.config import Settings
@@ -384,7 +385,6 @@ def test_malformed_browser_cookie_metadata_cannot_escape_validation(api, mutate)
 
 
 def test_both_public_serializers_expose_presence_not_session_secrets():
-    from m365_copilot_openai_proxy.account_serializers import account_public, user_account_public
 
     account = AccountStore().add(token=make_jwe(), substrate_account_id=SUBJECT,
                                  personal_substrate_session=session_for())
@@ -403,6 +403,44 @@ def test_expired_session_never_advertises_usable_browser_renewal():
     account.personal_substrate_session["cookies"][0]["expires"] = 1
     assert not account.has_personal_substrate_session
     assert account.protocol_states()["m365"]["refresh_mode"] == "manual"
+
+
+@pytest.mark.parametrize("serialize", [account_public, user_account_public], ids=["admin", "user"])
+def test_personal_cookie_binding_uses_owned_session_not_legacy_cookie_expiry(serialize):
+    account = AccountStore().add(token=make_jwe(), substrate_account_id=SUBJECT,
+                                 personal_substrate_session=session_for())
+    account.cookie_updated_at = 1
+    account.cookie_expires_at = 2
+
+    public = serialize(account)
+
+    assert public["cookie_valid"] is True
+    assert public["binding_state"] == "cookie"
+    assert public["cookie_updated_at"] == 0
+    assert public["cookie_expires_at"] == 0
+    assert account.cookie_valid is False
+    assert account.cookie_expires_at == 2
+
+
+@pytest.mark.parametrize("serialize", [account_public, user_account_public], ids=["admin", "user"])
+@pytest.mark.parametrize("unusable_session", ["missing", "expired", "other_account"])
+def test_personal_cookie_binding_never_borrows_legacy_enterprise_cookie_status(serialize, unusable_session):
+    account = AccountStore().add(token=make_jwe(), substrate_account_id=SUBJECT,
+                                 personal_substrate_session=session_for())
+    account.cookie_valid = True
+    if unusable_session == "missing":
+        account.personal_substrate_session = {}
+    elif unusable_session == "expired":
+        account.personal_substrate_session["cookies"][0]["expires"] = 1
+    else:
+        account.personal_substrate_session = session_for("home:other-account")
+
+    public = serialize(account)
+
+    assert public["cookie_valid"] is False
+    assert public["binding_state"] == "token_only"
+    assert public["protocols"]["m365"]["refresh_mode"] == "manual"
+    assert account.cookie_valid is True
 
 
 def test_nonpersistable_storage_unicode_is_rejected_before_store_mutation(tmp_path):
