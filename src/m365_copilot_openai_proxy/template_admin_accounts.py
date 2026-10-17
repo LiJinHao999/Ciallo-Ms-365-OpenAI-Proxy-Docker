@@ -190,7 +190,7 @@ async function refreshAccountCookie(id){
     const d=await r.json().catch(()=>({}));
     const fallback=t('btn_cookie_refresh')+': '+t('cookie_invalid_short');
     if(!r.ok)await adminAlert(refreshResponseError(r,d,fallback));
-    else if(d.cookie_valid!==true)await adminAlert(fallback);
+    else if(d.refreshed!==true&&d.cookie_valid!==true)await adminAlert(fallback);
     else await adminAlert(t('refresh_ok'));
   }catch(e){await adminAlert(t('network_error'))}
   finally{endAccountRefresh(id)}

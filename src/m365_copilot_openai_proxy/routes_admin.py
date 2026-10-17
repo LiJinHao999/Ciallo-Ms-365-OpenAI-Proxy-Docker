@@ -12,7 +12,7 @@ from .key_store import ApiKey
 from .response_helpers import _json_err
 from .routes_api_common import effective_run_permission
 from .runtime_settings import _RUN_PERMISSIONS
-from .token_store import decode_jwt_payload, is_substrate_token_claims
+from .token_store import decode_jwt_payload, is_substrate_token_claims, is_valid_substrate_jwe
 
 
 def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Request], object | None], tone_values: set[str]) -> None:
@@ -188,6 +188,8 @@ def register_admin_account_key_routes(app: FastAPI, require_admin: Callable[[Req
                 "cookie_valid": bool(total),
                 "account": _account_public(acc) if acc else None,
             }
+        if is_valid_substrate_jwe(acc.token):
+            return await refresh_account(acc_id, request)
         # Re-inject the LAST pushed cookies. ensure_fresh() no-ops for manual
         # accounts (it only drives the CDP token-refresh path), so the cookie
         # button must replay the stored cookie set through inject_cookies to

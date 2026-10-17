@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .account_store import Account
 from .key_store import ApiKey
+from .personal_substrate_session import normalize_personal_substrate_error
 
 
 def account_binding_state(acc: Account | None) -> str:
@@ -30,6 +31,9 @@ def _provider_fields(acc: Account) -> dict:
         "throttled_at": acc.throttled_at if acc.provider == "consumer" else 0.0,
         "has_token": bool(acc.token) if acc.provider == "m365" else False,
         "has_consumer_token": bool(getattr(acc, "consumer_token", "")),
+        "has_personal_substrate_session": acc.has_personal_substrate_session,
+        "personal_substrate_refresh_error": normalize_personal_substrate_error(acc.personal_substrate_refresh_error),
+        "substrate_token_expires_at": acc.substrate_token_expires_at,
         "consumer_updated_at": getattr(acc, "consumer_updated_at", 0.0),
         # Presence only, never the value: this is a long-lived bearer credential.
         # Surfaced because it is what decides whether renewal costs ~1.4s of HTTP

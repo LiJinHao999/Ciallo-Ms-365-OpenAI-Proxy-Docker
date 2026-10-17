@@ -31,14 +31,14 @@
 
 ## 功能概览
 
-- **多账户池** — M365 与 Consumer 共用同一账户池；每个账户独立保存对应 provider 的凭据和刷新状态。M365 使用账户专属 Chromium profile，Consumer 在 `-camoufox` 镜像中使用账户专属 Camoufox profile，并可配置账户级出站代理
+- **多账户池** — M365 与 Consumer 共用同一账户池；每个账户独立保存对应 provider 的凭据和刷新状态。企业 M365 使用账户专属 Chromium profile，Consumer 使用账户专属 Camoufox profile；个人 Substrate JWE 从本账户保存的登录态启动临时 Camoufox profile，退出后删除。均支持账户级出站代理
 - **多 API Key** — 每个 Key 绑定一个账户，可单独设置对话模式 / 提示词，随时启用停用
 - **模型即模式** — `GET /v1/models` 按 API Key 绑定的账户类型返回目录：M365 为对话模式（含「-持续」变体），个人版为可配置的 `model → mode` 别名
-- **非驻留串行刷新** — 按 provider 分流：M365 优先 RT 纯 HTTP 换 Token，失败再拉起账户专属 Chromium；Consumer 使用独立的 MSA RT 续期，缺失或失败时回退到账户专属 Camoufox。浏览器路径共享全局锁，峰值内存接近单租户
+- **非驻留串行刷新** — 企业 M365 优先 RT 纯 HTTP 换 Token，失败再拉起账户专属 Chromium；Consumer 使用独立 MSA RT，缺失或失败时回退 Camoufox；个人 Substrate JWE 使用独立 Camoufox 登录态重签，不借用企业 RT 或 Consumer 授权。三条浏览器路径共享全局锁
 - **分层界面** — `/admin` 运营总控台（账户池 + Key 管理），`/` 用户自助页（用自己的 Key 管理对话模式、提示词和对应 provider 的账户凭据）
 - **运行概览面板** — `/admin` 首页四个环形图：账户有效 / 过期、用户启用 / 停用、用户绑定 / 未绑定、累计用量。累计用量按**调用次数**分份额（环心是 Token 总量），份额小到画不成弧形（短于环的厚度）或排不进图例六行的模型合并成灰色 `other`；图例一行一个模型、只显示百分比并统一右对齐到上方 KPI 卡片的右边框，原始次数仍在 `GET /admin/stats` 的 `usage.model_counts` 里
-- **请求前凭据检查** — 每个 `/v1/` 请求先检查绑定账户；M365 临近到期时自动续期，Consumer 在已知有效期进入 5 分钟安全窗口时主动续期，并保留明确认证失败后的单次恢复重试
-- **油猴脚本** — Tampermonkey 一键推送 Token + Cookie（及 media / designer 凭据），M365 与个人版共用同一个脚本
+- **请求前凭据检查** — 每个 `/v1/` 请求先检查绑定账户；企业 M365 临期自动续期，Consumer 在已知有效期进入 5 分钟安全窗口时主动续期，个人 Substrate 按签发有效期或本地重检窗口续期。个人 Substrate 仅在业务调用尚未发送的明确握手 401 上单次恢复重试
+- **油猴脚本** — Tampermonkey 一键推送 Token + Cookie（及 media / designer 凭据），M365 与个人版共用同一个脚本；`1.0.83` 可为个人 Substrate 同时推送主体绑定的 Cookie 与 MSAL 登录态
 - **M365 授权登录** — `/` 与 `/admin` 均可走 OAuth2 授权码 + PKCE 登录（native client，滑动 `refresh_token`），不装扩展、不抓包，登录后续期纯 HTTP
 - **M365 增量上下文** — 复用会话时只发送新增内容，不重发完整历史
 - **M365 会话持久化** — 容器重启后旧对话仍可正确续接
@@ -471,17 +471,17 @@ Codex 本次使用 `web_search="disabled"`。原生 Windows 的隔离配置中�
 
 ## 多账户刷新与保活
 
-应用启动时会一直运行账户池保活调度器，逐账户检查并按 `provider` 分流；它不因 API 空闲而暂停。Docker 入口只有在 `ENABLE_ADMIN_CDP=true` 且 `AUTO_REFRESH=true` 时才启动旧的共享 admin Chromium（9222），否则会关闭这条共享浏览器路径。独立运行 CLI 时，`--no-auto-refresh` 只停旧自动刷新线程，浏览器启动另由 `--no-launch-edge` 控制。**这些共享路径开关都不会关闭每账户 M365 保活，也不会关闭 Consumer Camoufox 保活**。
+应用启动时会一直运行账户池保活调度器，逐账户检查并按当前协议分流；它不因 API 空闲而暂停。Docker 入口只有在 `ENABLE_ADMIN_CDP=true` 且 `AUTO_REFRESH=true` 时才启动旧的共享 admin Chromium（9222），否则会关闭这条共享浏览器路径。独立运行 CLI 时，`--no-auto-refresh` 只停旧自动刷新线程，浏览器启动另由 `--no-launch-edge` 控制。**这些共享路径开关都不会关闭每账户 M365、Consumer 或个人 Substrate 保活**。
 
-1. **请求前检查** — 每个 `/v1/` 请求先由 API Key 找到绑定账户，再调用 `ensure_fresh(account.id)`。M365 Token 有效时是廉价 no-op；临期时先尝试 RT，失败再回退到账户专属 Chromium。Consumer 已知有效期进入 5 分钟安全窗口时也主动续期，遵守既有失败退避；未知有效期仍直接使用现有凭据。明确认证失败后的单次恢复重试保持不变。
-2. **后台逐账户保活** — 调度器按配置间隔扫描整个账户池。M365 的 CDP 账户在 Cookie 临近过期时刷新，Cookie 已失效但仍有快照时尝试自愈；Consumer 在已知有效期进入安全窗口或凭据达到年龄阈值时，先尝试 MSA RT，再回退到账户专属 Camoufox。轮换后的凭据和有效期一起持久化；同一账户已排队的并发刷新共享一次尝试结果。
-3. **账户级隔离** — M365 与 Consumer 都有独立账户锁、凭据快照和失败退避。Consumer profile 还包含 Microsoft 主体哈希，重铸结果只有在账户主体及快照仍匹配时才会写回。
-4. **全局串行浏览器锁** — M365 Chromium 与 Consumer Camoufox 共用一把浏览器锁，避免多个账户同时拉起浏览器；串行的是资源占用，不是凭据或 profile。
-5. **手动刷新** — `/admin` 的账户刷新按钮同样按 provider 分派：Consumer 也按 RT → Camoufox 顺序尝试，显式刷新不受被动请求的浏览器退避限制。
+1. **请求前检查** — 每个 `/v1/` 请求先由 API Key 找到绑定账户，再调用 `ensure_fresh(account.id)`。企业 M365 Token 有效时是廉价 no-op，临期时先尝试 RT，再回退 Chromium；Consumer 已知有效期进入 5 分钟安全窗口时主动续期。个人 Substrate JWE 有匹配登录态时，按自身签发有效期或未知有效期的本地重检窗口启动 Camoufox 重签，不转用另一协议的凭据。
+2. **后台逐账户保活** — 调度器按配置间隔扫描账户池。企业 M365 的 CDP 账户在 Cookie 临期或失效但仍有快照时刷新；Consumer 临期或满龄后尝试 MSA RT → Camoufox；个人 Substrate 的浏览器续期与请求前检查共用账户锁及失败退避。同一账户已排队的并发刷新共享一次尝试结果。
+3. **账户级隔离** — 三条续期路径都有独立账户锁、凭据快照和主体校验。个人 Substrate 只在 Token、登录态、主体和协议 epoch 仍匹配时原子写回；同主体换新 JWE 不递增 epoch，保留工具续接。切换协议或较新的推送使旧刷新结果失效。
+4. **全局串行浏览器锁** — 企业 Chromium、Consumer Camoufox 与个人 Substrate 临时 Camoufox 共用一把浏览器锁；串行的是资源占用，不是凭据或 profile。
+5. **手动刷新** — `/admin` 的账户刷新按钮同样按当前协议分派，显式刷新不受被动请求的浏览器退避限制。个人 Substrate 的 Cookie 刷新入口也走专属登录态重签，不把个人 Cookie 注入旧企业 Chromium。
 
 ### M365 两级刷新链路：RT 优先 → CDP 回退
 
-刷新到期（或强制刷新）时，按以下顺序取新 Token：
+以下两级链路仅适用于企业版 JWT；个人 Substrate JWE 使用下文的独立浏览器续期。企业账户刷新到期（或强制刷新）时，按以下顺序取新 Token：
 
 1. **RT 快速刷新（首选，无浏览器）** — 账户若持有已验证签发上下文的 OAuth2 `refresh_token`，直接向原 AAD authority 做纯 HTTP 交换，换回新的 substrate access token。**不拉起 Chromium、不消耗 Copilot 配额**，速度快、开销低。油猴脚本只接收目标 M365 client + substrate scope 的响应，并把 authority、tenant、object id 一并推送；服务端与当前账户主体匹配后才入库。
 2. **CDP 刷新（长期保活与回退）** — SPA refresh token 通常有约 24 小时绝对寿命，轮换不会延长原始到期时间，因此 RT 只是短期快速路径。RT 明确过期/撤销时会停用；`AADSTS40016`、HTTP 失败等会进入退避。两者都立即回退到该账户专属 Chromium profile（独立 CDP 端口 9322+），由顶层登录会话续期 Token 与 Cookie。
@@ -492,15 +492,18 @@ Codex 本次使用 `web_search="disabled"`。原生 Windows 的隔离配置中�
 
 ```
 /v1/ 请求 → API Key → 绑定账户 → provider 分流
-                                ├─ M365 → Token 有效：直接请求
-                                │          Token 到期：RT → 失败则账户专属 Chromium/CDP
+                                ├─ 企业 M365 → Token 有效：直接请求
+                                │              Token 到期：RT → 失败则账户专属 Chromium/CDP
+                                ├─ 个人 Substrate JWE → 有匹配登录态：临期/重检时临时 Camoufox 重签
+                                │                        业务发送前握手 401：续期一次并续接
                                 └─ Consumer → 已知临期先续期，否则先用账户 Token/Cookie
-                                             明确认证失败时：该账户 Camoufox 重铸一次并重试
+                                             明确认证失败时：该账户续期并单次重试
 
 后台保活 → 扫描账户池
-           ├─ M365：Cookie 临期刷新 / 无效快照自愈
+           ├─ 企业 M365：Cookie 临期刷新 / 无效快照自愈
+           ├─ 个人 Substrate：按自身有效期/重检窗口从保存的登录态重签 JWE
            └─ Consumer：临期或满龄后续期，RT → Camoufox
-                        两种浏览器刷新由全局锁串行
+                        三条浏览器路径由全局锁串行
 ```
 
 ## 环境变量
@@ -751,13 +754,17 @@ curl -H "x-api-key: YOUR_SECRET_KEY" -H "anthropic-version: 2023-06-01" \
 
 userscript `1.0.82` 将推送选项改为各自 Substrate / ChatAI 标题右侧的「推送后使用」开关：开启表示保存并使用，关闭表示仅保存。两套开关独立，默认开启，切换语言时保留选择；拨动开关本身不会推送凭据或立即切换账户协议。
 
+userscript `1.0.83` 在 `https://copilot.com` 推送个人 JWE 时，同时采集与捕获主体绑定的 Cookie、localStorage/sessionStorage MSAL 登录态。需要可读取 HttpOnly Cookie 的脚本权限；没有可复用 Cookie、无法读取 Cookie 或采集期间主体变化时，拒绝推送且不覆盖已有凭据。不会把 Consumer Cookie 推入旧的企业 Cookie 刷新链路。
+
 **发送消息不保证同时捕获两种协议。** 当页面只建立 Substrate WebSocket 时，ChatAI 区域保持「未捕获此协议」是正常状态；换开关或继续发消息不会把 JWE 转成 ChatAI。服务端「已保存 ChatAI」与当前浏览器「已捕获 ChatAI」也是两件事：旧 profile 中保留的同主体 MSA RT 可以续出服务端 ChatAI 凭据，但无痕窗口不会因此拥有这份浏览器捕获。不要将 M365 RT、JWE 或展示邮箱拼成 ChatAI 凭据。
 
-用户页分别显示两套凭据是否已保存、当前协议及续期方式。ChatAI 的完整 RT/client/scope/主体绑定支持容器重启后的 HTTP 续期；没有 RT 时，浏览器回退仍取决于有效登录态和 Camoufox。个人 Substrate JWE 不因此获得 RT 冷启动能力，界面显示「手动重新推送」时仍需重新捕获。非活动 Substrate JWT 的匹配 RT 可以单独保存；显式激活时可初始化其保存的 Cookie 会话。
+用户页分别显示两套凭据是否已保存、当前协议及续期方式。ChatAI 的完整 RT/client/scope/主体绑定支持容器重启后的 HTTP 续期；没有 RT 时，浏览器回退仍取决于有效登录态和 Camoufox。个人 Substrate JWE 不借用该 RT；保存匹配个人登录态后显示浏览器续期，缺失时仍显示手动重推。浏览器续期需要含 Camoufox/Firefox 的镜像及有效 Microsoft 登录会话。非活动 Substrate JWT 的匹配 RT 可以单独保存；显式激活时可初始化其保存的 Cookie 会话。
 
 2026-10-02 M365 RT 复查：部署实例强制刷新返回 200／`refreshed=true`，日志确认 `RT refresh succeeded`，Substrate Token 已更新，随后实际聊天返回 200 且标记正确。个人网页检查则只观察到 Substrate ChatHub，旧入口也将该账户重定向到 `copilot.com/chat`，未观察到 ChatAI 连接或可读取的 ChatAI 缓存授权。见 [RT 与捕获诊断](docs/evidence/rt-and-chatai-capture-2026-10-02.json)。
 
-本轮部署验收记录见 [双协议证据](docs/evidence/dual-protocol-2026-10-01.json)：2646 项回归通过；ChatAI 重启后刷新、原生 M365/个人 Substrate 流式输出、Router 和 Messages/Responses 工具闭环已观察。Studio 实际回退 Router，不能算通过；ChatAI smart 模式的 Messages/Responses 续轮仍受真实 429 阻塞。完整矩阵未通过。部署采用容器源码覆盖，重建容器会丢失覆盖，未发布新镜像。
+2026-10-01 的部署验收记录见 [双协议证据](docs/evidence/dual-protocol-2026-10-01.json)：2646 项回归通过；ChatAI 重启后刷新、原生 M365/个人 Substrate 流式输出、Router 和 Messages/Responses 工具闭环已观察。Studio 实际回退 Router，不能算通过；ChatAI smart 模式的 Messages/Responses 续轮仍受真实 429 阻塞。该次完整矩阵未通过，源码覆盖也未发布为镜像。
+
+2026-10-17 个人 Substrate 自动续期在新分支隔离容器中实测：`1.0.83` 脚本推送返回 200，连续重签两枚不同 JWE，均通过 101／SignalR 握手；加密登录态重启后可用，Messages 与 Responses 均完成跨真实握手 401 的流式工具续接。全量回归 2782 passed、3 skipped。Studio 仍以 `not_ready` 回退 Router；`Gpt_5_6_Reasoning` 忽略 native 工具，`Claude_Sonnet` 返回上游 `InternalError`，因此**完整矩阵仍未通过**。本次未替换生产服务或推送镜像。见[个人续期验收证据](docs/evidence/personal-substrate-renewal-2026-10-17.json)。
 
 同一个已绑定账户切换到另一个 Microsoft 个人主体前，需要先在用户页「登出 Microsoft」或解绑；不同账户不会共用 Consumer profile。隔离单位是账户，不是 Key：如果管理员故意把多个 Key 绑定到同一个账户，这些 Key 会共享该账户的凭据、代理、profile 和保活状态；要做到一人一号，应给每人创建并绑定独立账户。这里的“移出 M365 刷新链路”只表示 provider 刷新实现不同，不表示个人版失去多租户隔离或账户级保活。
 
@@ -845,11 +852,16 @@ Consumer refresh for <account-id>: re-minted <N> cookies
 | 图片输入 | ✅ | 图片经 `POST /c/api/attachments` 上传（需聊天 Token，仅 Cookie 会 403），返回的相对 URL 排在文字之前发给上游，与网页版同形；纯图片消息也能识图。`png`/`jpeg`/`webp` 直接接受，`gif`/`bmp` 改标为 `image/png` 后再试（尽力而为），单轮上限 10 张，上传失败只丢该图并记 WARNING |
 | 图片生成 | ✅ | 让它画图会返回 Markdown 图片链接。个人版不需要企业版那套「媒体授权」——链接是匿名可取的（实测无 Cookie、无 token 直接 200） |
 | 持续会话 | ⚠️ | 每轮开新对话，完整历史每轮重发，因此上下文不丢；但上游侧不存在长期会话 |
-| Token / Cookie 自动保活 | 有条件 | ChatAI 完整 MSA RT 绑定支持 HTTP 续期；浏览器回退需要有效登录态与 Camoufox。个人 Substrate JWE 的手动重推与 ChatAI 续期是两条独立链路 |
+| Token / Cookie 自动保活 | 有条件 | ChatAI 完整 MSA RT 绑定支持 HTTP 续期；浏览器回退需要有效登录态与 Camoufox。个人 Substrate JWE 使用独立、主体绑定的登录态经临时 Camoufox 重签，不借用 ChatAI 或企业授权 |
 
 ### 个人版 Substrate JWE 专线
 
-在 `copilot.com` 登录个人 Microsoft 账号并发送一条消息后，使用油猴脚本面板中的 **Copilot Substrate Route** 一键推送 Substrate JWE；账户随后走个人版 Substrate 专线，而非 Consumer ChatAI Token 路径。JWE 不提供常规 JWT 的 `exp` 声明，本地采用 **3600 秒保守重检策略**，到时重新检查/推送凭据；这只是本地重检间隔，不代表上游 Token 的实际有效期。
+在 `copilot.com` 登录个人 Microsoft 账号并发送一条消息后，使用油猴脚本面板中的 **Copilot Substrate Route** 一键推送 Substrate JWE 与个人登录态；账户随后走个人版 Substrate 专线，而非 Consumer ChatAI Token 路径。自动续期需要含 Camoufox/Firefox 的 `-camoufox` 镜像，以及尚可复用的个人 Microsoft 登录会话。
+
+- **真实重签，不是延长本地时间**：从加密保存的本账户 Cookie 与主体元数据启动临时浏览器，由 `copilot.com` 自身完成静默登录并签发新 JWE；不发送聊天消息、不使用猜测的企业/Consumer RT 授权。只接收匹配当前主体及目标资源的签发响应；成功后原子保存新 Token、登录态和该响应的有效期，关闭浏览器并删除临时 profile。容器重启后可从保存的登录态恢复。
+- **有效期来源可区分**：JWE 不能按普通 JWT 读取 `exp`。捕获时能从同一 Token、同一主体的 MSAL 缓存确认有效期，或自动重签获得真实签发有效期时，状态显示 `expiry_source=issuer`。否则保持 `expires_at=null`、`expiry_source=capture_age`，采用 **3600 秒本地重检窗口**；`recheck_at` 不是上游失效时间，也不承诺 Token 仍被微软接受。
+- **保持续接，避免重复业务**：同主体换新 JWE 保持协议 epoch；业务调用尚未发送的 WebSocket 握手 401 可触发一次续期并恢复原请求，包括 Responses 工具结果续轮。业务已发送后的错误不自动重放；身份变化、协议切换或较新的推送使旧刷新失效。
+- **缺失登录态不伪装成功**：公开 API 仅返回登录态是否存在及安全错误码，不返回 Cookie 或 storage 内容。登录会话失效时需重新登录并推送；没有保存的匹配会话或缺少浏览器运行依赖时，不借用另一协议的凭据，也不退回旧企业 Chromium Cookie 注入。
 
 接收时只做**结构校验与公开受众冲突检查**，不解密，也不证明微软资源权限或主体身份：支持 `alg=dir/RSA-OAEP/RSA-OAEP-256`；`A128GCM/A192GCM/A256GCM` 要求 12 字节 IV、16 字节 tag；`A128CBC-HS256/A192CBC-HS384/A256CBC-HS512` 要求 16 字节 IV、分别 16/24/32 字节 tag，且非空密文按 16 字节块对齐。各段必须是规范 Base64url，仅 `dir` 的 encrypted_key 可以为空。公开 `aud` 若存在，必须是 Substrate 资源字符串或全部指向 Substrate 的非空数组；明确其他资源或畸形结构会在保存前拒绝，不覆盖旧凭据。没有公开 `aud` 的合法结构仍可接收，但其真实用途与可用性必须由可信采集来源及上游鉴权确认；本地 `valid` 不等于上游已认证。JWE 的密钥段不用于推断邮箱、账户去重或 Studio 主体。
 
@@ -857,7 +869,7 @@ Consumer refresh for <account-id>: re-minted <N> cookies
 
 ## 企业版与个人版的差异
 
-本项目同时支持 **`substrate.office.com`（M365 企业版）** 与 **`copilot.microsoft.com`（个人微软账号）** 两条 provider 路径。两者上游协议不同，因此约束差别很大；下表均以本项目当前实现与部署实测为准：
+下表比较 **`substrate.office.com`（M365 企业 JWT）** 与 **`copilot.microsoft.com`（Consumer ChatAI）** 两条上游协议。个人 Substrate JWE 共用 Substrate 聊天上游，但使用前述独立个人登录态和临时 Camoufox 续期，不应套用表中 ChatAI 的刷新方式。
 
 | | 本项目（M365 企业版） | 个人版（消费者版 Copilot） |
 |---|---|---|
@@ -872,7 +884,7 @@ Consumer refresh for <account-id>: re-minted <N> cookies
 
 **共同的短板**：两边都没有原生 tool-calling 通道，都靠提示词约定 + 解析文本实现，因此都受模型依从性限制。这不是实现选择，而是两个上游协议都没提供该能力。
 
-**对使用者的实际影响**：个人版不需要 M365 订阅，但每个个人账号都需要维护自己的浏览器登录态；本项目用各账户独立的 Camoufox 持久 profile 承载，并由每次续期自动焐热，只有该账号的登录态真失效时才需要人工介入一次。普通 HTTP/WebSocket 重放同一组 Cookie 仍可能被拒。个人版代理常见的 8000 字符历史上限和串行限制属于具体实现约束，不是消费者协议本身的保证。两种 provider 都支持多账户绑定与隔离；M365 额外提供已经验证的长上下文和真并发。
+**对使用者的实际影响**：个人版不需要 M365 订阅，但每个个人账号都需要维护自己的浏览器登录态。ChatAI 使用账户专属 Camoufox 持久 profile；个人 Substrate 从独立保存的登录态启动临时 profile，续期后关闭并删除。登录态真正失效时才需要人工重新登录。普通 HTTP/WebSocket 重放同一组 Cookie 仍可能被拒。个人版代理常见的 8000 字符历史上限和串行限制属于具体实现约束，不是消费者协议本身的保证。两种 provider 都支持多账户绑定与隔离；M365 额外提供已经验证的长上下文和真并发。
 
 ## 架构
 
@@ -892,9 +904,10 @@ Consumer refresh for <account-id>: re-minted <N> cookies
       ├─ /admin — 运营总控台页面（管理密码登录）
       ├─ / — 用户自助页面（API Key 登录）
       └─ 账户刷新与保活（按账户隔离、按 provider 分流）
-          ├─ M365：RT 优先 → 账户专属 Chromium（CDP 9322+）
-          └─ Consumer：账户专属 Camoufox profile → ChatAI Token + Cookie
-              两条路径共享全局浏览器锁，同一时刻最多一个浏览器，峰值内存接近单租户
+          ├─ 企业 M365：RT 优先 → 账户专属 Chromium（CDP 9322+）
+          ├─ 个人 Substrate JWE：加密保存的主体绑定登录态 → 临时 Camoufox → 新 JWE
+          └─ Consumer：MSA RT → 失败则账户专属 Camoufox profile → ChatAI Token + Cookie
+              三条路径共享全局浏览器锁，同一时刻最多一个浏览器，峰值内存接近单租户
 ```
 
 

@@ -6,12 +6,20 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from .account_crypto import SENSITIVE_FIELDS, AccountCipher, load_or_create_key
 from .atomic_write import write_text_atomic
+from .personal_substrate_session import (
+    PersonalSubstrateSessionError,
+    has_usable_personal_substrate_session,
+    normalize_personal_substrate_error,
+    normalize_personal_substrate_expiry,
+    normalize_personal_substrate_session,
+)
 from .token_store import decode_jwt_payload, is_substrate_token_claims, is_valid_substrate_jwe
 
 
@@ -136,6 +144,9 @@ class Account:
     # Browser-supplied display metadata only; never an identity/deduplication key.
     substrate_display_email: str = ""
     substrate_account_id: str = ""
+    personal_substrate_session: dict[str, Any] = field(default_factory=dict)
+    substrate_token_expires_at: float = 0.0
+    personal_substrate_refresh_error: str = ""
     token: str = ""
     token_updated_at: float = 0.0
     cookie_valid: bool = False
@@ -273,6 +284,12 @@ class Account:
             and object_id == self.studio_agent_object_id
         )
 
+    @property
+    def has_personal_substrate_session(self) -> bool:
+        return has_usable_personal_substrate_session(
+            self.token, self.substrate_account_id, self.personal_substrate_session,
+        )
+
     def protocol_states(self) -> dict[str, dict[str, Any]]:
         paired = bool(self.token and self.consumer_token)
         matching = bool(
@@ -285,7 +302,13 @@ class Account:
                 "stored": bool(self.token), "active": self.provider == "m365",
                 "can_activate": bool(self.token) and (not paired or matching),
                 "identity_ready": bool(self.substrate_account_id or _studio_subject(self.token)[0]),
-                "refresh_mode": "rt" if self.refresh_token else "browser" if self.token_source == "cdp" and self.cookie_valid else "manual",
+                "refresh_mode": (
+                    "browser" if is_valid_substrate_jwe(self.token) and self.has_personal_substrate_session
+                    else "manual" if is_valid_substrate_jwe(self.token)
+                    else "rt" if self.refresh_token
+                    else "browser" if self.token_source == "cdp" and self.cookie_valid
+                    else "manual"
+                ),
             },
             "consumer": {
                 "stored": bool(self.consumer_token), "active": self.provider == "consumer",
@@ -344,15 +367,29 @@ class Account:
             expires_at = int(claims["exp"])
         except Exception as exc:  # noqa: BLE001 - report any decode failure to the UI
             if is_valid_substrate_jwe(token):
-                token_updated = float(getattr(self, "token_updated_at", 0.0) or 0.0)
-                if token_updated <= 0:
+                issuer_expiry = _normalize_consumer_token_expiry(self.substrate_token_expires_at)
+                if issuer_expiry:
+                    from datetime import datetime, timezone
+
+                    remaining = max(0, int(issuer_expiry - now))
                     return {
-                        "valid": False,
-                        "error": "JWE token has no valid capture timestamp",
-                        "expires_at": None,
-                        "seconds_remaining": 0,
+                        "valid": issuer_expiry > now,
+                        "expires_at": datetime.fromtimestamp(issuer_expiry, tz=timezone.utc).isoformat(),
+                        "seconds_remaining": remaining,
+                        "expiry_source": "issuer",
                     }
-                expires_at = int(token_updated + 3600)
+                token_updated = float(self.token_updated_at or 0.0)
+                recheck_at = token_updated + 3600 if math.isfinite(token_updated) and token_updated > 0 else 0.0
+                status = {
+                    "valid": recheck_at > now,
+                    "expires_at": None,
+                    "seconds_remaining": max(0, int(recheck_at - now)),
+                    "expiry_source": "capture_age",
+                    "recheck_at": recheck_at or None,
+                }
+                if not status["valid"]:
+                    status["error"] = "JWE token requires a fresh capture" if recheck_at else "JWE token has no valid capture timestamp"
+                return status
             else:
                 return {"valid": False, "error": f"Cannot decode token: {exc}", "expires_at": None, "seconds_remaining": 0}
         seconds_remaining = max(0, expires_at - int(now))
@@ -425,6 +462,21 @@ class AccountStore:
                 raw["cookie_updated_at"] = 0.0
                 raw["cookie_expires_at"] = 0.0
                 changed = True
+            personal_session = {}
+            personal_expiry = 0.0
+            if is_valid_substrate_jwe(raw.get("token", "")):
+                try:
+                    personal_expiry = normalize_personal_substrate_expiry(raw.get("substrate_token_expires_at", 0.0))
+                except PersonalSubstrateSessionError:
+                    changed = True
+                if raw.get("personal_substrate_session"):
+                    try:
+                        personal_session = normalize_personal_substrate_session(
+                            raw["personal_substrate_session"],
+                            _normalize_consumer_account_id(raw.get("substrate_account_id", "")),
+                        )
+                    except (ValueError, TypeError, OverflowError):
+                        changed = True
             try:
                 loaded_port = int(raw.get("cdp_port", _CDP_PORT_BASE))
                 if loaded_port in _RESERVED_CDP_PORTS:
@@ -438,6 +490,9 @@ class AccountStore:
                         raw.get("token", ""), raw.get("substrate_display_email", ""),
                     ),
                     substrate_account_id=_normalize_consumer_account_id(raw.get("substrate_account_id", "")),
+                    personal_substrate_session=personal_session,
+                    substrate_token_expires_at=personal_expiry,
+                    personal_substrate_refresh_error=normalize_personal_substrate_error(raw.get("personal_substrate_refresh_error", "")),
                     protocol_epoch=max(0, int(raw.get("protocol_epoch", 0) or 0)),
                     consumer_cookies=[dict(c) for c in raw.get("consumer_cookies", []) if isinstance(c, dict)] if isinstance(raw.get("consumer_cookies", []), list) else [],
                     consumer_email=str(raw.get("consumer_email", "") or ""),
@@ -579,10 +634,10 @@ class AccountStore:
             return list(self._accounts.values())
 
     def get_request_snapshot(self, acc_id: str) -> Account | None:
-        """Freeze scalar credential/provider fields under the account lock."""
+        """Freeze credentials and detach the captured personal browser session."""
         with self._lock:
             account = self._accounts.get(acc_id)
-            return replace(account) if account is not None else None
+            return replace(account, personal_substrate_session=deepcopy(account.personal_substrate_session)) if account is not None else None
 
     def is_protocol_current(self, acc_id: str, epoch: int, provider: str) -> bool:
         with self._lock:
@@ -647,15 +702,32 @@ class AccountStore:
         return port
 
     # -------------------------------------------------------------- mutations
-    def add(self, name: str = "", token: str = "", token_source: str = "manual", *, display_email: object = "", substrate_account_id: object = "") -> Account:
+    @staticmethod
+    def _validate_personal_material(token: str, subject: str, session: object) -> dict:
+        if session is None:
+            return {}
+        if not is_valid_substrate_jwe(token):
+            raise PersonalSubstrateSessionError("Personal Substrate session requires a supported personal JWE")
+        return normalize_personal_substrate_session(session, subject)
+
+    def add(
+        self, name: str = "", token: str = "", token_source: str = "manual", *,
+        display_email: object = "", substrate_account_id: object = "",
+        personal_substrate_session: object = None, expires_at: object = None,
+    ) -> Account:
         with self._lock:
+            subject = _normalize_consumer_account_id(substrate_account_id)
+            session = self._validate_personal_material(token, subject, personal_substrate_session)
+            expiry = normalize_personal_substrate_expiry(expires_at) if is_valid_substrate_jwe(token) else 0.0
             ident_name, email = extract_identity(token)
             now = time.time()
             acc = Account(
                 name=ident_name or name,
                 email=email,
                 substrate_display_email=_substrate_display_email(token, display_email),
-                substrate_account_id=_normalize_consumer_account_id(substrate_account_id),
+                substrate_account_id=subject,
+                personal_substrate_session=session,
+                substrate_token_expires_at=expiry,
                 token=token,
                 token_updated_at=now if token else 0.0,
                 cdp_port=self._next_cdp_port(),
@@ -669,6 +741,7 @@ class AccountStore:
         self, acc_id: str, token: str, token_source: str | None = None, *,
         display_email: object = None, substrate_account_id: object = None,
         activate: bool = True, expected_epoch: int | None = None,
+        personal_substrate_session: object = None, expires_at: object = None,
     ) -> Account | None:
         with self._lock:
             acc = self._accounts.get(acc_id)
@@ -683,15 +756,33 @@ class AccountStore:
                 previous_subject = _studio_subject(acc.token)
                 if not previous_subject[0] or previous_subject != _studio_subject(token):
                     subject = ""
+            session = self._validate_personal_material(token, subject, personal_substrate_session)
+            personal = is_valid_substrate_jwe(token)
+            expiry = normalize_personal_substrate_expiry(expires_at) if personal else 0.0
+            same_token = token == acc.token
+            same_subject = bool(subject and subject == acc.substrate_account_id)
             self._validate_protocol_pair(acc, "m365", subject, token)
             if acc.token and acc.substrate_account_id != subject:
                 acc.protocol_epoch += 1
             acc.substrate_account_id = subject
+            if not same_subject or not personal:
+                acc.personal_substrate_session = {}
+                acc.substrate_token_expires_at = 0.0
+                acc.personal_substrate_refresh_error = ""
+            if personal_substrate_session is not None:
+                acc.personal_substrate_session = session
+            if personal:
+                if not same_token:
+                    acc.substrate_token_expires_at = expiry
+                    acc.personal_substrate_refresh_error = ""
+                elif expiry and (not acc.substrate_token_expires_at or expiry < acc.substrate_token_expires_at):
+                    acc.substrate_token_expires_at = expiry
             if token != acc.token or display_email is not None:
                 acc.substrate_display_email = _substrate_display_email(token, display_email)
             acc.token = token
             now = time.time()
-            acc.token_updated_at = now
+            if not same_token or not personal:
+                acc.token_updated_at = now
             if activate and acc.provider != "m365":
                 acc.provider = "m365"
                 acc.protocol_epoch += 1
@@ -707,7 +798,11 @@ class AccountStore:
             self._save()
             return acc
 
-    def push_token(self, acc_id: str, token: str, *, display_email: object = "", substrate_account_id: object = "", activate: bool = True) -> Account | None:
+    def push_token(
+        self, acc_id: str, token: str, *, display_email: object = "",
+        substrate_account_id: object = "", activate: bool = True,
+        personal_substrate_session: object = None, expires_at: object = None,
+    ) -> Account | None:
         """Apply a user/admin-pushed token WITHOUT disabling on-demand refresh.
 
         A plain update_token(token_source="manual") permanently downgrades an
@@ -722,10 +817,69 @@ class AccountStore:
             if acc is None:
                 return None
             keep_cdp = acc.token_source == "cdp" and acc.cookie_valid
-        return self.update_token(
-            acc_id, token, token_source=None if keep_cdp else "manual", display_email=display_email,
-            substrate_account_id=substrate_account_id, activate=activate,
-        )
+            return self.update_token(
+                acc_id, token, token_source=None if keep_cdp else "manual", display_email=display_email,
+                substrate_account_id=substrate_account_id, activate=activate,
+                personal_substrate_session=personal_substrate_session, expires_at=expires_at,
+            )
+
+    def apply_personal_substrate_refresh_result(
+        self, acc_id: str, *, expected_token: str, expected_epoch: int,
+        expected_session: dict, token: str, account_id: str, session: dict,
+        expires_at: float = 0.0,
+    ) -> Account | None:
+        """Commit a fresh, pinned JWE only while its entire snapshot is current."""
+        with self._lock:
+            acc = self._accounts.get(acc_id)
+            if (
+                acc is None or acc.provider != "m365"
+                or acc.protocol_epoch != expected_epoch
+                or acc.token != expected_token
+                or acc.personal_substrate_session != expected_session
+                or not is_valid_substrate_jwe(expected_token)
+                or not is_valid_substrate_jwe(token)
+                or token == expected_token
+                or not acc.substrate_account_id
+                or account_id != acc.substrate_account_id
+            ):
+                return None
+            try:
+                fresh_session = normalize_personal_substrate_session(session, account_id)
+                expiry = normalize_personal_substrate_expiry(expires_at)
+                self._validate_protocol_pair(acc, "m365", account_id, token)
+            except (ValueError, TypeError, OverflowError):
+                return None
+            acc.token = token
+            acc.token_updated_at = time.time()
+            acc.personal_substrate_session = fresh_session
+            acc.substrate_token_expires_at = expiry
+            acc.personal_substrate_refresh_error = ""
+            acc.updated_at = acc.token_updated_at
+            self._save()
+            return acc
+
+    def set_personal_substrate_refresh_error(
+        self, acc_id: str, code: str, *, expected_token: str,
+        expected_epoch: int, expected_session: dict,
+    ) -> Account | None:
+        """Persist a safe failure code without modifying a newer capture."""
+        safe_code = normalize_personal_substrate_error(code)
+        if not safe_code:
+            return None
+        with self._lock:
+            acc = self._accounts.get(acc_id)
+            if (
+                acc is None or acc.provider != "m365"
+                or acc.protocol_epoch != expected_epoch
+                or acc.token != expected_token
+                or acc.personal_substrate_session != expected_session
+                or not is_valid_substrate_jwe(acc.token)
+            ):
+                return None
+            acc.personal_substrate_refresh_error = safe_code
+            acc.updated_at = time.time()
+            self._save()
+            return acc
 
     def clear_token(self, acc_id: str) -> Account | None:
         """Wipe a bound account's token while keeping the account record."""
@@ -737,6 +891,9 @@ class AccountStore:
             acc.token_updated_at = 0.0
             acc.substrate_display_email = ""
             acc.substrate_account_id = ""
+            acc.personal_substrate_session = {}
+            acc.substrate_token_expires_at = 0.0
+            acc.personal_substrate_refresh_error = ""
             acc.protocol_epoch += 1
             _clear_studio_agent_binding(acc)
             acc.updated_at = time.time()
@@ -1135,6 +1292,9 @@ class AccountStore:
             acc.refresh_token_retry_after = 0.0
             acc.token = access_token
             acc.token_updated_at = now
+            acc.personal_substrate_session = {}
+            acc.substrate_token_expires_at = 0.0
+            acc.personal_substrate_refresh_error = ""
             _clear_studio_binding_if_subject_changed(acc, access_token)
             ident_name, email = extract_identity(access_token)
             if email:
@@ -1267,6 +1427,9 @@ class AccountStore:
             acc.token_updated_at = 0.0
             acc.substrate_display_email = ""
             acc.substrate_account_id = ""
+            acc.personal_substrate_session = {}
+            acc.substrate_token_expires_at = 0.0
+            acc.personal_substrate_refresh_error = ""
             acc.protocol_epoch += 1
             acc.consumer_token = ""
             acc.consumer_identity_type = ""

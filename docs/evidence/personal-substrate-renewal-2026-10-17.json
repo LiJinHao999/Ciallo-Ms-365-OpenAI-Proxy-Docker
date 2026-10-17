@@ -1,0 +1,707 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-10-17T13:46:25.688Z",
+  "branch": "feat/personal-substrate-renewal",
+  "worktree": ".claude/worktrees/personal-jwe",
+  "scope": {
+    "surface": "isolated deployed candidate container",
+    "production_service_replaced": false,
+    "production_write_operations_performed": 0,
+    "cloud_conversation_cleanup_disabled": true,
+    "image_id": "sha256:d84b9fb5821e86194538655d4089ed01d8ee6b5a834efc152dc3b52f9a78c970",
+    "deployed_source_hashes_match_worktree": true,
+    "checked_source_files": 15,
+    "source_sha256": {
+      "get_token.user.js": "5a257f3886bc10327a09cf6ee8ac923f22b21ccd3ece76680384fb437f3872b1",
+      "src/m365_copilot_openai_proxy/account_crypto.py": "36bc2c3ff39cfa90fec266726feaf93f5feeef2993ac5a9c7fdc3671d6db2e04",
+      "src/m365_copilot_openai_proxy/account_serializers.py": "e989acc62c15355a3f4e89a0b4b12d4dd35811b58e4d75347aca899e9b06e461",
+      "src/m365_copilot_openai_proxy/account_store.py": "5e9a97a7b512775f8d6d37a82cb125659fd1d5b825fb0c3d2a354d6dcd35d7f7",
+      "src/m365_copilot_openai_proxy/dependencies.py": "60846e343fba69e9901e6a776c3be97de9b6280bfedbc51f44641dfdd5e761ce",
+      "src/m365_copilot_openai_proxy/personal_substrate_refresh.py": "bfa6e97f061d5a1524d80bb7dd20e285fc287633a94c22a9eab64c04deb4b276",
+      "src/m365_copilot_openai_proxy/personal_substrate_session.py": "c90443945baa080b2c6e124aa3a35836ea6211d91a81847f691d61a59ee648fa",
+      "src/m365_copilot_openai_proxy/refresh_scheduler.py": "74c9f7ed0465c8b3b7d275715bfea50daa521fabf7334b5c60c5ec230777faa3",
+      "src/m365_copilot_openai_proxy/routes_user.py": "93e5290bcfb88a2ecae0fecec29838b7fe1776de14377cb26305123d74af165e",
+      "src/m365_copilot_openai_proxy/routes_admin.py": "a8a7e0914c5abe9cb137cc7b1b2198de773ff5f297dd12b4e650b46c2df4c246",
+      "src/m365_copilot_openai_proxy/substrate_client.py": "92aee3553bb9ea58b26043d3887e59a7ebd69b17564b21c171867a995a894ac5",
+      "src/m365_copilot_openai_proxy/template_admin_accounts.py": "1540245f602a9325155e67b1c2a6fafec4113d739d6896da6a1b7aaa7b544e6d",
+      "src/m365_copilot_openai_proxy/template_admin_i18n.py": "6da4015f4e6abff8fbfa77eebf6171e3eb4b3f8c654e2b50207c2102d082903e",
+      "src/m365_copilot_openai_proxy/template_user_account_js.py": "5124293947d2a8d717a84d0f692108ec87dd8f2e7bdefd0cc53db4cd8f1476e0",
+      "src/m365_copilot_openai_proxy/template_user_i18n.py": "a6c408153012767ab48cb332b8bee75f43a60a55509df9cbd38e26a0614f5cb0"
+    }
+  },
+  "regression": {
+    "argv": [
+      "S:/AIWorker/M365_Copilot_Proxy/docker-multi/.venv/Scripts/python.exe",
+      "-m",
+      "pytest",
+      "-q",
+      "--tb=short"
+    ],
+    "cwd": "S:/AIWorker/M365_Copilot_Proxy/docker-multi/.claude/worktrees/personal-jwe",
+    "pythonpath": "S:/AIWorker/M365_Copilot_Proxy/docker-multi/.claude/worktrees/personal-jwe/src",
+    "exit": 0,
+    "passed": 2782,
+    "skipped": 3,
+    "warnings": 11,
+    "seconds": 96.78,
+    "summary": "2782 passed, 3 skipped, 11 warnings in 96.78s (0:01:36)"
+  },
+  "review": {
+    "credential_review": {
+      "status": "no_blocking_findings",
+      "scope": "session validator, storage, encrypted fields, public serializers, routes and userscript cookie cutover",
+      "reviewer": "RenewalCredentialReview"
+    },
+    "runtime_review": {
+      "finding": "pending response observers can block browser teardown",
+      "severity": "P2",
+      "status": "resolved_and_reviewer_acknowledged",
+      "fix": "cancel unfinished observer tasks before gathering and closing the browser",
+      "regressions": {
+        "failing_before": 2,
+        "targeted_passed_after": 34
+      },
+      "reviewer": "RenewalRuntimeReview",
+      "additional_findings": 0
+    }
+  },
+  "userscript_capture": {
+    "surface": "isolated deployed candidate container",
+    "browser_origin": "https://copilot.com",
+    "browser_login": "restore existing authenticated personal cookies",
+    "userscript": "unmodified get_token.user.js 1.0.83 with real browser-cookie and HTTP GM API bridge",
+    "userscript_sha256": "1543a1016cccf1f64a7dc1e7b10140b5be5db7d27e44aa588be4757e2ba4aec8",
+    "renewals": [
+      {
+        "http": 200,
+        "refreshed": true,
+        "elapsed_seconds": 26.109,
+        "new_jwe": true,
+        "token_sha256": "11d811ca26085fff",
+        "subject_preserved": true,
+        "protocol_epoch_preserved": true,
+        "provider": "m365",
+        "expiry_source": "issuer",
+        "issuer_seconds_remaining": 28798,
+        "refresh_error": "",
+        "handshake": {
+          "http": 101,
+          "signalr": "{}\u001e",
+          "business_invocation_sent": false
+        }
+      },
+      {
+        "http": 200,
+        "refreshed": true,
+        "elapsed_seconds": 34.54,
+        "new_jwe": true,
+        "token_sha256": "367a0f2fe3bf45e2",
+        "subject_preserved": true,
+        "protocol_epoch_preserved": true,
+        "provider": "m365",
+        "expiry_source": "issuer",
+        "issuer_seconds_remaining": 28798,
+        "refresh_error": "",
+        "handshake": {
+          "http": 101,
+          "signalr": "{}\u001e",
+          "business_invocation_sent": false
+        }
+      }
+    ],
+    "browser_signed_in": true,
+    "captured_subject_matches": true,
+    "captured_token_api_handshake": {
+      "http": 101,
+      "signalr": "{}\u001e",
+      "business_invocation_sent": false
+    },
+    "browser_substrate_handshake": {
+      "opened": true,
+      "signalr": "{}\u001e",
+      "business_invocation_sent": false
+    },
+    "browser_path": "/chat",
+    "push_button_surface": {
+      "display": "flex",
+      "visibility": "visible",
+      "x": 1406,
+      "y": 248,
+      "width": 480,
+      "height": 39,
+      "viewport": {
+        "width": 1920,
+        "height": 1004
+      }
+    },
+    "activation_context": {
+      "visibility": "visible",
+      "focused": true
+    },
+    "push_activation": "focused_button_enter",
+    "gm_requests": [
+      {
+        "path": "/user/account/token",
+        "http": 200,
+        "personal_session_present": true,
+        "subject_matches": true,
+        "token_parts": 5,
+        "status": "ok"
+      }
+    ],
+    "push_result": {
+      "provider": "m365",
+      "has_personal_substrate_session": true,
+      "refresh_mode": "browser",
+      "expiry_source": "capture_age"
+    },
+    "capture_browser_closed": true,
+    "capture_profile_removed": true,
+    "status": "pass"
+  },
+  "userscript_capture_limits": {
+    "execution": "Unmodified userscript in the real signed-in browser, using real browser cookies and HTTP-backed GM API bridge; a Tampermonkey extension installation was not exercised.",
+    "activation": "Focused visible button and native Enter input; earlier mouse-actionability automation timed out before activation.",
+    "userscript_sha256_kind": "UTF-8 re-encoded text after universal-newline normalization",
+    "raw_file_sha256": "5a257f3886bc10327a09cf6ee8ac923f22b21ccd3ece76680384fb437f3872b1"
+  },
+  "restart_renewal_and_secrecy": {
+    "after_container_restart": true,
+    "session_reloaded": true,
+    "rounds": [
+      {
+        "http": 200,
+        "refreshed": true,
+        "new_jwe": true,
+        "token_sha256": "4555537f8642bf8b",
+        "subject_preserved": true,
+        "epoch_preserved": true,
+        "seconds_remaining": 28798,
+        "expiry_source": "issuer",
+        "elapsed_seconds": 27.572
+      },
+      {
+        "http": 200,
+        "refreshed": true,
+        "new_jwe": true,
+        "token_sha256": "9f2a1b8ed6784135",
+        "subject_preserved": true,
+        "epoch_preserved": true,
+        "seconds_remaining": 28798,
+        "expiry_source": "issuer",
+        "elapsed_seconds": 23.727
+      }
+    ],
+    "session_encrypted_at_rest": true,
+    "no_public_session_blob": true,
+    "temporary_profiles_removed": true
+  },
+  "admin_cookie_button": {
+    "http": 200,
+    "path": "/admin/accounts/[ACCOUNT]/cookie-refresh",
+    "refreshed": true,
+    "response_keys": [
+      "status",
+      "refreshed",
+      "account"
+    ],
+    "visual_result": "刷新成功"
+  },
+  "mandatory_matrix": [
+    {
+      "item": 1,
+      "name": "M365 direct/native",
+      "status": "partial",
+      "evidence_cases": [
+        "M365 direct/native",
+        "M365 Claude Sonnet native tool loop"
+      ],
+      "observed": "Native streaming text and previous_response_id continuation passed.",
+      "limitation": "Gpt_5_6_Reasoning ignored native tools; Claude_Sonnet returned upstream InternalError."
+    },
+    {
+      "item": 2,
+      "name": "Router planning/tool",
+      "status": "pass",
+      "evidence_cases": [
+        "Router planning/tool"
+      ]
+    },
+    {
+      "item": 3,
+      "name": "Studio planning/tool",
+      "status": "blocked",
+      "evidence_cases": [
+        "Studio planning/tool"
+      ],
+      "blocker": "tool_planning=router and studio_fallback=not_ready; no usable published Studio planner was observed."
+    },
+    {
+      "item": 4,
+      "name": "Anthropic Messages API",
+      "status": "pass",
+      "evidence_cases": [
+        "Anthropic Messages API tool loop",
+        "Personal Substrate Messages tool loop across real upgrade 401"
+      ]
+    },
+    {
+      "item": 5,
+      "name": "OpenAI Responses API",
+      "status": "pass",
+      "evidence_cases": [
+        "OpenAI Responses API tool loop",
+        "Personal Substrate Responses tool loop across real upgrade 401"
+      ]
+    },
+    {
+      "item": 6,
+      "name": "Consumer and userscript-pushed personal Substrate",
+      "status": "pass",
+      "evidence_cases": [
+        "Consumer provider streaming/tool loop",
+        "Personal Substrate native streaming"
+      ],
+      "userscript_push_http": 200
+    },
+    {
+      "item": 7,
+      "name": "Personal Substrate unattended browser-renewal runtime",
+      "status": "pass",
+      "evidence_sections": [
+        "userscript_capture.renewals",
+        "restart_renewal_and_secrecy",
+        "admin_cookie_button"
+      ],
+      "evidence_cases": [
+        "Personal Substrate Messages tool loop across real upgrade 401",
+        "Personal Substrate Responses tool loop across real upgrade 401"
+      ]
+    }
+  ],
+  "live_api_cases": [
+    {
+      "case": "M365 direct/native",
+      "status": "partial",
+      "native_text": true,
+      "streaming": true,
+      "previous_response_id_continuation": true,
+      "native_tools_error": "I can’t access caller-side files through the requested `Read` action in this chat. Please upload `/tmp/personal-renewal-tool-fixture.txt`, and I’ll return only its exact contents.\n\n⚠️ 模型 'Gpt_5_6_Reasoning'（tone=Gpt_5_6_Reasoning）不支持本地工具调用：本轮声明的 1 个工具被忽略了。实测支持工具调用的模型：claude-sonnet-4-6, claude-sonnet-4-5。",
+      "elapsed_ms": 23714,
+      "requests": [
+        {
+          "path": "/v1/responses",
+          "http": 200,
+          "elapsed_ms": 7935,
+          "events": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed"
+          ]
+        },
+        {
+          "path": "/v1/responses",
+          "http": 200,
+          "elapsed_ms": 5466,
+          "events": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed"
+          ]
+        },
+        {
+          "path": "/v1/chat/completions",
+          "http": 200,
+          "elapsed_ms": 10297,
+          "events": [
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.done"
+          ]
+        }
+      ]
+    },
+    {
+      "case": "Router planning/tool",
+      "status": "pass",
+      "tool_calls": [
+        "Read"
+      ],
+      "steps": 2,
+      "final_marker": true,
+      "elapsed_ms": 14302,
+      "requests": [
+        {
+          "path": "/v1/chat/completions",
+          "http": 200,
+          "elapsed_ms": 6663,
+          "events": [
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.done"
+          ]
+        },
+        {
+          "path": "/v1/chat/completions",
+          "http": 200,
+          "elapsed_ms": 7632,
+          "events": [
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.done"
+          ]
+        }
+      ]
+    },
+    {
+      "case": "Anthropic Messages API tool loop",
+      "status": "pass",
+      "tool_calls": [
+        "Read"
+      ],
+      "steps": 2,
+      "final_marker": true,
+      "streaming": true,
+      "elapsed_ms": 11818,
+      "requests": [
+        {
+          "path": "/v1/messages",
+          "http": 200,
+          "elapsed_ms": 6093,
+          "events": [
+            "message_start",
+            "ping",
+            "content_block_start",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+          ]
+        },
+        {
+          "path": "/v1/messages",
+          "http": 200,
+          "elapsed_ms": 5718,
+          "events": [
+            "message_start",
+            "ping",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+          ]
+        }
+      ]
+    },
+    {
+      "case": "OpenAI Responses API tool loop",
+      "status": "pass",
+      "tool_calls": [
+        "Read"
+      ],
+      "steps": 2,
+      "final_marker": true,
+      "streaming": true,
+      "previous_response_id_continuation": true,
+      "elapsed_ms": 11463,
+      "requests": [
+        {
+          "path": "/v1/responses",
+          "http": 200,
+          "elapsed_ms": 5961,
+          "events": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.completed"
+          ]
+        },
+        {
+          "path": "/v1/responses",
+          "http": 200,
+          "elapsed_ms": 5495,
+          "events": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.output_item.done",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed"
+          ]
+        }
+      ]
+    },
+    {
+      "case": "Personal Substrate native streaming",
+      "status": "pass",
+      "personal_substrate_native_text": true,
+      "streaming": true,
+      "provider": "m365",
+      "elapsed_ms": 6001,
+      "requests": [
+        {
+          "path": "/v1/chat/completions",
+          "http": 200,
+          "elapsed_ms": 5992,
+          "events": [
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.done"
+          ]
+        }
+      ]
+    },
+    {
+      "case": "Personal Substrate Responses tool loop across real upgrade 401",
+      "status": "pass",
+      "tool_calls": [
+        "Read"
+      ],
+      "steps": 2,
+      "final_marker": true,
+      "streaming": true,
+      "previous_response_id_continuation": true,
+      "live_upgrade_401_recovery": {
+        "old_credential_upgrade_http": 401,
+        "epoch_before": 3,
+        "repushed_capture_age_valid": true,
+        "credential_rotated": true,
+        "protocol_epoch_preserved": true,
+        "expiry_source": "issuer"
+      },
+      "elapsed_ms": 38855,
+      "requests": [
+        {
+          "path": "/v1/responses",
+          "http": 200,
+          "elapsed_ms": 5186,
+          "events": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.completed"
+          ]
+        },
+        {
+          "path": "/v1/responses",
+          "http": 200,
+          "elapsed_ms": 32288,
+          "events": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed"
+          ]
+        }
+      ]
+    },
+    {
+      "case": "Consumer provider streaming/tool loop",
+      "status": "pass",
+      "tool_calls": [
+        "Read"
+      ],
+      "steps": 2,
+      "final_marker": true,
+      "provider": "consumer",
+      "refresh_http": 200,
+      "streaming": true,
+      "elapsed_ms": 11253,
+      "requests": [
+        {
+          "path": "/v1/chat/completions",
+          "http": 200,
+          "elapsed_ms": 4999,
+          "events": [
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.done"
+          ]
+        },
+        {
+          "path": "/v1/chat/completions",
+          "http": 200,
+          "elapsed_ms": 4616,
+          "events": [
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.done"
+          ]
+        }
+      ]
+    },
+    {
+      "case": "M365 Claude Sonnet native tool loop",
+      "status": "fail",
+      "error_type": "AssertionError",
+      "error": "⚠️ 上游错误：M365 Copilot refused this turn instead of answering (conversation mode 'Claude_Sonnet') (upstream result: InternalError). If every request in this mode does this, the mode is not available for this account -- switch to another mode.",
+      "elapsed_ms": 2789,
+      "requests": [
+        {
+          "path": "/v1/chat/completions",
+          "http": 200,
+          "elapsed_ms": 2782,
+          "events": [
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.done"
+          ]
+        }
+      ]
+    },
+    {
+      "case": "Studio planning/tool",
+      "status": "blocked",
+      "tool_calls": [
+        "Read"
+      ],
+      "steps": 2,
+      "final_marker": true,
+      "configured_planner": "studio",
+      "actual_planners": [
+        "router"
+      ],
+      "studio_fallback": true,
+      "studio_fallback_reasons": [
+        "not_ready"
+      ],
+      "reason": "No ready published Studio planner was observed; a successful Router fallback is not Studio acceptance.",
+      "elapsed_ms": 14659,
+      "requests": [
+        {
+          "path": "/v1/chat/completions",
+          "http": 200,
+          "elapsed_ms": 5974,
+          "events": [
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.done"
+          ]
+        },
+        {
+          "path": "/v1/chat/completions",
+          "http": 200,
+          "elapsed_ms": 8672,
+          "events": [
+            "chat.chunk",
+            "chat.chunk",
+            "chat.chunk",
+            "chat.done"
+          ]
+        }
+      ]
+    },
+    {
+      "case": "Personal Substrate Messages tool loop across real upgrade 401",
+      "status": "pass",
+      "tool_calls": [
+        "Read"
+      ],
+      "steps": 2,
+      "final_marker": true,
+      "streaming": true,
+      "live_upgrade_401_recovery": {
+        "old_credential_upgrade_http": 401,
+        "epoch_before": 5,
+        "repushed_capture_age_valid": true,
+        "credential_rotated": true,
+        "protocol_epoch_preserved": true,
+        "subject_preserved": true,
+        "expiry_source": "issuer"
+      },
+      "elapsed_ms": 40721,
+      "requests": [
+        {
+          "path": "/v1/messages",
+          "http": 200,
+          "elapsed_ms": 8513,
+          "events": [
+            "message_start",
+            "ping",
+            "content_block_start",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+          ]
+        },
+        {
+          "path": "/v1/messages",
+          "http": 200,
+          "elapsed_ms": 30831,
+          "events": [
+            "message_start",
+            "ping",
+            "ping",
+            "ping",
+            "ping",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop"
+          ]
+        }
+      ]
+    }
+  ],
+  "full_acceptance": false,
+  "cleanup": {
+    "candidate_container_removed": true,
+    "owned_private_token_snapshot_removed": true,
+    "owned_remote_build_directory_removed": true,
+    "candidate_image_tag_removed": true,
+    "previous_owned_source_image_ids_removed": [
+      "bb1f6b015f8c"
+    ],
+    "production_service_replaced": false,
+    "owned_ssh_tunnel_stopped": true,
+    "temporary_acceptance_runners_removed": true
+  }
+}
