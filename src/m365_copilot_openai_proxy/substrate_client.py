@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -537,7 +538,6 @@ class SubstrateCopilotClient:
             if annotation:
                 annotations.append(annotation)
         return annotations
-
     async def chat_stream(
         self,
         prompt: str,
@@ -948,10 +948,33 @@ class SubstrateCopilotClient:
         additional_context: list[str],
         session: PersistentSession | None = None,
         images: list | None = None,
+        *,
+        sources_out: list[dict] | None = None,
     ) -> str:
         chunks: list[str] = []
-        async with closing_stream(self.chat_stream(prompt, additional_context, session, images)) as owned_stream:
+        async with closing_stream(self.chat_stream(
+            prompt, additional_context, session, images,
+            sources_out=sources_out,
+        )) as owned_stream:
             async for chunk in owned_stream:
                 if isinstance(chunk, str):
                     chunks.append(chunk)
         return "".join(chunks)
+
+
+
+def filter_client_method_kwargs(client: object, method_name: str, extra: dict) -> dict:
+    """Keep only kwargs the client's method accepts (unwrap throttle wrappers)."""
+    target = client
+    for attr in ("_throttle_target", "_client"):
+        inner = getattr(target, attr, None)
+        if inner is not None and hasattr(inner, method_name):
+            target = inner
+    func = getattr(target, method_name, None)
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return extra
+    return {key: value for key, value in extra.items() if key in sig.parameters}
