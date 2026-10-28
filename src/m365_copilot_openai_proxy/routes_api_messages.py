@@ -768,12 +768,18 @@ async def _anthropic_stream_with_tools(
     content_stream = AnthropicContentStream()
     yield sse("message_start", {"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model_alias, "stop_reason": None, "stop_sequence": None, "usage": anthropic_usage(usage_for_record(call_record))}})
     yield sse("ping", {"type": "ping"})
+    # Declaring a tool must not cost the answer its sources: every request with a
+    # non-empty `tools` list lands here, called or not.
+    collected_sources: list[dict] = []
     try:
         chunks: list[str] = []
 
         async def inline_stream() -> AsyncIterator[StreamChunk]:
             async with closing_stream(client.chat_stream(
-                prompt, additional_context, session, images
+                prompt, additional_context, session, images,
+                **filter_client_method_kwargs(
+                    client, "chat_stream", {"sources_out": collected_sources}
+                ),
             )) as owned_stream:
                 async for item in owned_stream:
                     yield item
@@ -789,6 +795,7 @@ async def _anthropic_stream_with_tools(
                 should_fallback=should_fallback,
                 fallback_turn=fallback_turn,
                 on_router_fallback=on_router_fallback,
+                sources_out=collected_sources,
             )) as owned_stream:
                 async for item in owned_stream:
                     yield item
@@ -802,6 +809,7 @@ async def _anthropic_stream_with_tools(
             on_stage=on_stage,
             on_studio_fallback=on_studio_fallback,
             skip_router_fallback=skip_router_fallback,
+            sources_out=collected_sources,
         )
 
         async with closing_stream(stream) as owned_stream:
@@ -912,6 +920,16 @@ async def _anthropic_stream_with_tools(
 
     for event in content_stream.text(text_out):
         yield event
+    # Same contract as the no-tools stream in response_helpers: declaring a tool
+    # must not cost the answer its sources. The text block is still open (the
+    # close below emits its content_block_stop), so the citations_delta events
+    # have to be emitted now, against that same block index.
+    for citation in anthropic_web_citations_from_sources(text_out, collected_sources):
+        yield sse("content_block_delta", {
+            "type": "content_block_delta",
+            "index": content_stream._index,
+            "delta": {"type": "citations_delta", "citation": citation},
+        })
     for event in content_stream.close():
         yield event
 

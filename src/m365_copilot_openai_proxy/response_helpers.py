@@ -651,6 +651,10 @@ async def _responses_stream_with_tools(
     yield _responses_event({"type": "response.in_progress", "response": in_progress}, sequence)
     sequence += 1
 
+    # Declaring a tool must not cost the answer its sources: this path is what
+    # every request with a non-empty `tools` list takes, whether or not the
+    # model ends up calling anything.
+    collected_sources: list[dict] = []
     try:
         router_decided = False
 
@@ -659,8 +663,9 @@ async def _responses_stream_with_tools(
             router_decided = True
 
         async def inline_stream() -> AsyncIterator[StreamChunk]:
-            async with closing_stream(client.chat_stream(
-                prompt, additional_context, session, images
+            async with closing_stream(_compat_chat_stream(
+                client, prompt, additional_context, session, images,
+                sources_out=collected_sources,
             )) as owned_stream:
                 async for delta in owned_stream:
                     yield delta
@@ -677,6 +682,7 @@ async def _responses_stream_with_tools(
                 should_fallback=should_fallback,
                 fallback_turn=fallback_turn,
                 on_router_fallback=on_router_fallback,
+                sources_out=collected_sources,
             )) as owned_stream:
                 async for delta in owned_stream:
                     yield delta
@@ -690,6 +696,7 @@ async def _responses_stream_with_tools(
             on_stage=on_stage,
             on_studio_fallback=on_studio_fallback,
             skip_router_fallback=skip_router_fallback,
+            sources_out=collected_sources,
         )
         async with closing_stream(stream) as owned_stream:
             async for delta in owned_stream:
@@ -884,10 +891,14 @@ async def _responses_stream_with_tools(
     for payload in reasoning.finish():
         yield _responses_event(payload, sequence)
         sequence += 1
+    # Without tools a request takes `_responses_stream`, which annotates its
+    # text; this path must do the same or merely DECLARING a tool silently
+    # drops every source URL.
+    annotations = openai_url_citations_from_sources(text_out, collected_sources)
     output = reasoning.output()
     answer_output: list[dict] = []
     if text_out or not tool_calls:
-        answer_output.append(_responses_message_item(text_out))
+        answer_output.append(_responses_message_item(text_out, annotations=annotations))
     answer_output.extend(_responses_function_call_items(tool_calls))
     output.extend(answer_output)
     issued_call_ids = [
@@ -927,6 +938,17 @@ async def _responses_stream_with_tools(
                     "content_index": 0,
                     "delta": text_out,
                     "logprobs": [],
+                }, sequence)
+                sequence += 1
+            # Annotations belong to the assistant message block only.
+            for annotation_index, annotation in enumerate(annotations):
+                yield _responses_event({
+                    "type": "response.output_text.annotation.added",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "annotation_index": annotation_index,
+                    "annotation": annotation,
                 }, sequence)
                 sequence += 1
             yield _responses_event({
