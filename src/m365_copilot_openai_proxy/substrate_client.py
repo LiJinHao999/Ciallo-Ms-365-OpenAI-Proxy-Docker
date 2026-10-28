@@ -757,6 +757,12 @@ class SubstrateCopilotClient:
 
                 def _note_sources(payload: object) -> None:
                     for source in extract_source_attributions(payload):
+                        # Teach the tracker that this source's 【n-id】 and
+                        # turnN… renderings are ONE source, before either
+                        # rendering is numbered. Without it the same source
+                        # takes two numbers, the snapshot and the delta stop
+                        # sharing a prefix, and the opening is sent twice.
+                        cite_tracker.note_source(source)
                         key = (
                             (source.get("url") or "").lower()
                             or (source.get("ref_key") or "").lower()
@@ -904,6 +910,15 @@ class SubstrateCopilotClient:
                                 yielded_images.add(image_url)
                                 yielded_any = True
                         if t == 3:
+                            # The tracker may still be holding a tail: a delta
+                            # ended inside a marker and the final frame never
+                            # completed it. Release it BEFORE reconciling, or
+                            # the reconciliation counts the hold as text the
+                            # reader does not have yet and re-sends it -- the
+                            # reader saw "A[3]B[4][4]".
+                            held = cite_tracker.flush()
+                            if held:
+                                streamed_text += held
                             remaining = _final_fallback_remainder(streamed_text, fallback_text)
                             # Nothing streamed and the turn was marked failed (or its
                             # whole answer is the canned refusal) => report it as an
@@ -919,15 +934,22 @@ class SubstrateCopilotClient:
                                 if (turn_failure or "").strip().casefold() == "throttled":
                                     raise SubstrateThrottled(message)
                                 raise SubstrateCopilotError(message)
+                            # The held tail precedes the reconciled run: it is
+                            # what the deltas had already reached.
+                            if held:
+                                yield held
                             if remaining:
                                 remaining = clean_m365_citations(remaining, cite_tracker)
                                 if remaining:
                                     yield remaining
                                     streamed_text += remaining
-                            held = cite_tracker.flush()
-                            if held:
-                                yield held
-                                streamed_text += held
+                            # Cleaning `remaining` can leave a fresh incomplete
+                            # tail behind; nothing follows this frame, so give
+                            # it back now.
+                            trailing = cite_tracker.flush()
+                            if trailing:
+                                yield trailing
+                                streamed_text += trailing
                             aligned = aligned_url_sources_for_stream(
                                 collected_sources, cite_tracker
                             )

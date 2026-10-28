@@ -70,6 +70,38 @@ _SRC_PUA = "\ue000-\uf8ff"
 _SRC_ID_WORDS = "search|file|news|image|video|base|knowledge|gpt|cid|doc"
 _SRC_TURN_ID = rf"turn\d+(?:{_SRC_ID_WORDS})\d+"
 
+
+def _prefix_alternation(words: list[str]) -> str:
+    """Regex matching every NON-EMPTY prefix of any of ``words``.
+
+    A streamed marker arrives one character at a time, so the tail in hand is
+    usually a prefix of an id (``turn1se``) rather than the whole id. Built
+    from the word list instead of spelled out, so adding an id word cannot
+    silently leave the partial matcher behind.
+    """
+    alternatives = []
+    for word in words:
+        chain = word[-1]
+        for char in reversed(word[:-1]):
+            chain = f"{char}(?:{chain})?"
+        alternatives.append(chain)
+    return "(?:" + "|".join(alternatives) + ")"
+
+
+_SRC_ID_WORD_PARTIAL = _prefix_alternation(_SRC_ID_WORDS.split("|"))
+# A PREFIX of a turn id, digits included: turn1 / turn1s / turn1search7.
+# The version WITHOUT digits (``turn``, ``tur``, ``t``) still has to be held --
+# the stream can stop there and continue next delta -- but it is not yet
+# evidence that the tag is a citation: ``<cite>Turn</cite>`` is a book title.
+_SRC_TURN_ID_PARTIAL = (
+    rf"turn\d+(?:{_SRC_ID_WORD_PARTIAL})?\d*"
+)
+# What the HOLD patterns accept, digits or not. Holding is free of consequence:
+# `_release` gives the text back verbatim unless the evidence rule above is met.
+_SRC_CITE_ID_PARTIAL = (
+    rf"t(?:u(?:r(?:n(?:\d*(?:{_SRC_ID_WORD_PARTIAL})?\d*)?)?)?)?"
+)
+
 _SRC_MARKDOWN_CITE_RE = re.compile(
     rf"\[([^\]]*)\]\(\s*([{_SRC_PUA}]*cite[{_SRC_PUA}][^)]*)\)",
     re.IGNORECASE,
@@ -127,12 +159,28 @@ _SRC_HOLD_TAIL_RES = (
     # A lone private-use byte: the marker's first half.
     re.compile(rf"[{_SRC_PUA}]$"),
     # <cite>turn1s / <cite>turn1search7< / <cite>turn1search7</ -- an open
-    # literal cite tag, including its own closing half.
-    re.compile(r"<cite>[A-Za-z0-9_,\-]*(?:<\/?(?:c(?:i(?:t(?:e)?)?)?)?>?)?$", re.IGNORECASE),
-    # < / <c / <cite / <cite> / </cite -- the opening halves of such a tag.
+    # literal cite tag, including its own closing half. Bounded to a PREFIX of a
+    # turn id, never to "anything alphanumeric": the same element name is real
+    # HTML (<cite>Moby Dick</cite>), and holding a title delayed it one delta and
+    # then let _release() cut it at the tag ("quote: <cite>Some Book").
+    re.compile(
+        rf"<cite>\s*{_SRC_CITE_ID_PARTIAL}"
+        rf"(?:\s*,\s*(?:{_SRC_CITE_ID_PARTIAL})?)*"
+        rf"\s*(?:<\s*/?\s*(?:c(?:i(?:t(?:e)?)?)?)?\s*>?)?$",
+        re.IGNORECASE,
+    ),
+    # A bare <cite> closing a delta: the id it will carry is not in hand yet,
+    # so it is held for one delta. _release() gives it back VERBATIM when no
+    # citation id follows -- an HTML title must never lose its closing half.
+    re.compile(r"<cite>\s*$", re.IGNORECASE),
+    # < / <c / <cite / <cite> -- the opening halves of such a tag.
     # A lone "<" is held for one delta so a tag split right after it is still
     # recognized; a real "a < b" costs one delta of delay, never content.
-    re.compile(r"<(?:/)?c?(?:i(?:t(?:e)?)?)?>?$", re.IGNORECASE),
+    #
+    # Closing halves (</, </c, </cite) are deliberately NOT held: they can only
+    # complete a tag whose <cite> half is still buffered, and buffering them on
+    # their own only parked the tail of a real HTML </cite> for one delta.
+    re.compile(r"<(?:c(?:i(?:t(?:e)?)?)?)?>?$", re.IGNORECASE),
     # 【1- -- an open chinese-bracket cite. Bounded to a citation's own digits
     # so ordinary 【emphasis】 punctuation is never held.
     re.compile(r"【\s*(?:\d{0,3}(?:[-–—]\s*[0-9a-fA-F]{0,16})?)?$"),
@@ -157,11 +205,18 @@ _SRC_MARKDOWN_CITE_OPEN_RE = re.compile(
 _SRC_MARKDOWN_CITE_TAG_RE = re.compile(
     rf"\[([^\]\n]*)\]\(\s*<cite>([^<]*)</cite>\s*\)", re.IGNORECASE
 )
+# Where a citation tag actually STARTS: <cite> followed by (a prefix of) a turn
+# id. The element name on its own is not enough -- HTML uses it for the title of
+# a work, and a delta that happens to end right after "<cite>" would otherwise
+# be remembered as marker syntax and have its title deleted on release.
+_SRC_CITE_TAG_START_RE = re.compile(
+    f"<cite>\\s*{_SRC_TURN_ID_PARTIAL}", re.IGNORECASE
+)
 # Only a private-use byte or a cite/turnN id proves a held tail really was a
 # marker. Without that evidence the tail is replayed VERBATIM: it is real
 # text that happened to end where a marker could have started.
 _SRC_MARKER_EVIDENCE_RE = re.compile(
-    rf"[{_SRC_PUA}]|<cite>|\bcite\b|\b{_SRC_TURN_ID}\b", re.IGNORECASE
+    rf"[{_SRC_PUA}]|<cite>\s*{_SRC_TURN_ID_PARTIAL}|\b{_SRC_TURN_ID}\b", re.IGNORECASE
 )
 
 
@@ -226,8 +281,11 @@ def _marker_start(text: str) -> int | None:
     here on is it safe to drop characters.
     """
     candidates = [position for position in (text.find(marker) for marker in ("\ue200", "\ue201", "\ue202")) if position >= 0]
+    # <cite> only counts as a marker when a citation id follows it. The element
+    # is real HTML elsewhere (<cite>Moby Dick</cite>), and treating that as a
+    # marker start deleted the title together with the rest of the held tail.
     for pattern in (
-        re.compile(r"<cite>", re.IGNORECASE),
+        _SRC_CITE_TAG_START_RE,
         re.compile(r"【\s*\d"),
         re.compile(r"\[\^\d"),
     ):
@@ -235,6 +293,22 @@ def _marker_start(text: str) -> int | None:
         if match:
             candidates.append(match.start())
     return min(candidates) if candidates else None
+
+
+def _source_footnote_number(source: dict) -> int | None:
+    """The footnote number a source states for itself, or ``None``.
+
+    ``label`` is what upstream prints ("4" for ``【4-6f710b】``); ``ref_key``
+    repeats it as its leading digits. Reading both means a payload that drops
+    one of them still numbers the source where the body puts it.
+    """
+    for value in (source.get("label"), source.get("ref_key")):
+        match = re.match(r"\s*(\d{1,3})", str(value or ""))
+        if match:
+            number = int(match.group(1))
+            if number > 0:
+                return number
+    return None
 
 
 class CitationTracker:
@@ -254,9 +328,88 @@ class CitationTracker:
         self._key_to_num: dict[str, int] = {}
         self._order: list[str] = []
         self._hold = ""
+        # Alternate keys for a source already numbered under its first
+        # rendering, e.g. turn1search4 -> bracket4-6f710b. See note_source().
+        self._aliases: dict[str, str] = {}
+        # The footnote number upstream states for a key, when it states one.
+        # 【4-6f710b】 carries its own 4; the same source's turn1search4
+        # rendering does not, and has to inherit it through the alias.
+        self._preferred: dict[str, int] = {}
+
+    def _canonical(self, key: str) -> str:
+        """Follow an alias chain to the key that owns the number."""
+        seen: set[str] = set()
+        while key in self._aliases and key not in seen:
+            seen.add(key)
+            key = self._aliases[key]
+        return key
+
+    def alias(self, left: str, right: str) -> None:
+        """Declare that two marker keys name the SAME source.
+
+        M365 renders one source more than one way inside a single turn:
+        ``【4-6f710b】`` in the cumulative snapshot and
+        ``<cite>turn1search4</cite>`` in the streamed deltas. The two
+        renderings produce unrelated keys, so without this the same source
+        was numbered twice -- the snapshot said ``[4]``, the deltas said
+        ``[1]``, ``_split_snapshot_lead`` no longer saw a prefix, and the
+        opening of the answer was delivered to the reader twice.
+
+        Only ever merges when at most ONE of the keys has a number: once
+        both are numbered their text is already out, and renumbering cannot
+        retract it.
+        """
+        first = self._canonical((left or "").lower())
+        second = self._canonical((right or "").lower())
+        if not first or not second or first == second:
+            return
+        num_first = self._key_to_num.get(first)
+        num_second = self._key_to_num.get(second)
+        if num_first is not None and num_second is not None:
+            return
+        if num_second is not None:
+            self._aliases[first] = second
+        else:
+            self._aliases[second] = first
+
+    def note_source(self, source: dict) -> None:
+        """Register the marker keys ONE source can be cited by as one key.
+
+        Called as upstream reference metadata arrives, so the very frame
+        that carries a snapshot's ``【n-id】`` markers also teaches the
+        tracker which ``turnN…`` id that number belongs to.
+        """
+        if not isinstance(source, dict):
+            return
+        ref_key = str(source.get("ref_key") or "").strip().lower()
+        ref_id = _normalize_cite_key(str(source.get("ref_id") or ""))
+        label = str(source.get("label") or "").strip()
+        keys: list[str] = []
+        if ref_key:
+            keys.append(f"bracket{ref_key}")
+        if label:
+            keys.append(f"bracket{label}")
+        if ref_id:
+            keys.append(ref_id)
+        if not keys:
+            return
+        # The number the body will use for this source, when upstream states
+        # it. A turn id names a source without numbering it, so the id
+        # rendering inherits the label's number through the alias below.
+        preferred = _source_footnote_number(source)
+        if preferred:
+            for key in keys:
+                self._preferred.setdefault(key, preferred)
+        for other in keys[1:]:
+            self.alias(keys[0], other)
 
     def _num_for(self, key: str, preferred: int | None = None) -> int:
-        normalized = key or f"anon{len(self._order)}"
+        if key:
+            normalized = self._canonical(key)
+            if preferred is None:
+                preferred = self._preferred.get(normalized)
+        else:
+            normalized = f"anon{len(self._order)}"
         if normalized in self._key_to_num:
             return self._key_to_num[normalized]
         if preferred is not None and preferred > 0 and preferred not in self._key_to_num.values():
@@ -274,15 +427,29 @@ class CitationTracker:
 
     @property
     def count(self) -> int:
-        return len([k for k in self._order if not k.startswith("pad")])
+        return len(self.keys_in_order)
 
     @property
     def keys_in_order(self) -> list[str]:
-        return [k for k in self._order if not k.startswith("pad")]
+        """Numbered keys, one per source, in the order they were first cited.
+
+        Aliases are folded in: a source cited as 【4-6f710b】 and as
+        ``turn1search4`` is ONE entry, or a consumer that walks this list
+        would emit the same URL twice.
+        """
+        ordered: list[str] = []
+        for key in self._order:
+            if key.startswith("pad"):
+                continue
+            canonical = self._canonical(key)
+            if canonical != key:
+                continue
+            ordered.append(key)
+        return ordered
 
     def number_of(self, key: str) -> int | None:
         """The in-body footnote number of ``key``, or ``None`` when uncited."""
-        return self._key_to_num.get((key or "").lower())
+        return self._key_to_num.get(self._canonical((key or "").lower()))
 
     def _split_incomplete(self, text: str) -> tuple[str, str]:
         """Return (safe_prefix, hold_suffix) for cite openers still in progress."""
@@ -616,6 +783,53 @@ def _cumulative_catchup(streamed_text: str, cumulative_text: str) -> str:
     return ""
 
 
+# The footnote shapes the two views of a turn can disagree about.
+_SRC_FOOTNOTE_TOKEN_RE = re.compile(r"\[(\d+)\]|\[\^(\d+)\^\]")
+
+
+def _footnote_flex_prefix(left: str, right: str) -> tuple[int, int] | None:
+    """Align two views of one answer, allowing their footnote NUMBERS to differ.
+
+    The snapshot and the deltas of a single turn render the same citation in
+    different ways -- ``【4-6f710b】`` against ``<cite>turn1search4</cite>`` --
+    and when the upstream reference metadata cannot link the two renderings
+    of a source, the tracker numbers them separately. The prose is identical
+    character for character; only the digits inside ``[n]`` are not.
+
+    Returns the offsets just past the longest aligned prefix, but ONLY when
+    that prefix reaches the end of at least one side and at least one
+    footnote number actually differed. Exact agreement is not this
+    function's business -- the callers already test ``startswith`` -- and a
+    mid-text divergence is never aligned, because guessing there emits a run
+    the reader already has.
+    """
+    if not left or not right:
+        return None
+    left_index = right_index = 0
+    number_differs = False
+    while True:
+        left_token = _SRC_FOOTNOTE_TOKEN_RE.match(left, left_index)
+        right_token = _SRC_FOOTNOTE_TOKEN_RE.match(right, right_index)
+        if left_token and right_token:
+            left_number = left_token.group(1) or left_token.group(2)
+            right_number = right_token.group(1) or right_token.group(2)
+            if left_number != right_number:
+                number_differs = True
+            left_index = left_token.end()
+            right_index = right_token.end()
+            continue
+        if left_index < len(left) and right_index < len(right) and left[left_index] == right[right_index]:
+            left_index += 1
+            right_index += 1
+            continue
+        break
+    if not number_differs:
+        return None
+    if left_index >= len(left) or right_index >= len(right):
+        return left_index, right_index
+    return None
+
+
 def _split_snapshot_lead(lead: str, delta: str) -> tuple[str, str] | None:
     """Reconcile an incoming delta against text already delivered from a snapshot.
 
@@ -630,10 +844,12 @@ def _split_snapshot_lead(lead: str, delta: str) -> tuple[str, str] | None:
     * delta inside the lead   -> consumed, emit nothing, shrink the lead
     * delta reaches past it   -> lead consumed, emit only the new remainder
 
-    Only exact matches count. This is safe against the "repeated fragment" trap
-    that ``_dedupe_repeated_delta`` warns about (a formula's ``2a_1``, a closing
-    ``}``) because the lead is non-empty only in the brief window after a snapshot
-    ran ahead of the deltas, and every character it covers has provably been sent.
+    Only exact matches count -- except for the footnote NUMBER, which the two
+    renderings of one turn do not always agree on (see
+    ``_footnote_flex_prefix``). Everything else has to match character for
+    character, and the lead is non-empty only in the brief window after a
+    snapshot ran ahead of the deltas, so every character it covers has
+    provably been sent already.
     """
     if not lead or not delta:
         return None
@@ -641,7 +857,13 @@ def _split_snapshot_lead(lead: str, delta: str) -> tuple[str, str] | None:
         return lead[len(delta):], ""
     if delta.startswith(lead):
         return "", delta[len(lead):]
-    return None
+    flex = _footnote_flex_prefix(lead, delta)
+    if flex is None:
+        return None
+    lead_index, delta_index = flex
+    if lead_index >= len(lead):
+        return "", delta[delta_index:]
+    return lead[lead_index:], ""
 
 
 def _final_fallback_remainder(streamed_text: str, fallback_text: str) -> str:
@@ -1261,7 +1483,24 @@ def aligned_url_sources_for_stream(
 
 
 def _footnote_span(text: str, index: int) -> tuple[int, int] | None:
-    """Return ``[start, end)`` for the first ``[index]`` (or legacy ``[^index]``) marker."""
+    """Return ``[start, end)`` for the first ``[index]`` (or legacy ``[^index]``) marker.
+
+    ``None`` means the body never emitted that number. The callers turn that
+    into a ZERO-WIDTH span at end-of-text, and that is deliberate rather than
+    a gap left for later:
+
+    * the numbers are upstream's. ``【3-aa11bb】`` followed by ``【1-cc22dd】``
+      legitimately delivers ``A[3] B[4]`` -- the body never says ``[2]`` -- and
+      a source may carry a footnote the prose does not show at all;
+    * there is nothing better to point at. Guessing (nearest marker, or the
+      position in the filtered list) is exactly what put a URL on somebody
+      else's ``[n]`` in review #4;
+    * an EOF span still carries the url and the title, so the protocol-native
+      citation stays usable instead of being dropped.
+
+    A consumer that highlights ranges therefore sees an empty range at the end
+    of the text -- no highlight, rather than a wrong one.
+    """
     if index <= 0 or not text:
         return None
     for marker in (f"[{index}]", f"[^{index}]"):
