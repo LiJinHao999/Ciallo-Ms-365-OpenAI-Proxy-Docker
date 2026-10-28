@@ -907,16 +907,22 @@ async def _complete_nonstream_response(
             retry_session = (
                 studio_turn.session if retry_client is not client else session
             )
-            collected_sources.clear()
-            raw_text = await retry_client.chat(
+            # A retry is a SEPARATE turn. Its sources are collected on their
+            # own and adopted only once its text is adopted, so a retry that
+            # raises cannot leave the kept reply annotated with the wrong URLs
+            # (or with none at all). Same reason as the corrective retry below.
+            retry_sources: list[dict] = []
+            retry_text = await retry_client.chat(
                 required_tool_retry_prompt,
                 retry_context,
                 retry_session,
                 translated.images,
                 **filter_client_method_kwargs(
-                    retry_client, "chat", {"sources_out": collected_sources}
+                    retry_client, "chat", {"sources_out": retry_sources}
                 ),
             )
+            raw_text = retry_text
+            collected_sources[:] = retry_sources
         except SubstrateCopilotError as exc:
             finish_continuation(False)
             call_record["retried"] = True
@@ -972,14 +978,17 @@ async def _complete_nonstream_response(
             retry_session = (
                 studio_turn.session if retry_client is not client else session
             )
-            collected_sources.clear()
+            # Separate list, adopted only if the retry's calls are adopted: the
+            # kept reply must never cite the retry's sources, and a thrown-away
+            # retry must not take the kept reply's sources with it.
+            retry_sources: list[dict] = []
             retry_text = await retry_client.chat(
                 retry_prompt,
                 retry_context,
                 retry_session,
                 translated.images,
                 **filter_client_method_kwargs(
-                    retry_client, "chat", {"sources_out": collected_sources}
+                    retry_client, "chat", {"sources_out": retry_sources}
                 ),
             )
             retry_calls = _resolve_responses_tool_calls(
@@ -992,6 +1001,7 @@ async def _complete_nonstream_response(
             )
             if retry_calls:
                 raw_text, tool_calls = retry_text, retry_calls
+                collected_sources[:] = retry_sources
                 call_record["retried"] = True
         except SubstrateCopilotError:
             pass

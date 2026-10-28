@@ -739,8 +739,11 @@ async def _responses_stream_with_tools(
                 studio_turn.session if retry_client is not client else session
             )
             full_text = ""
-            async with closing_stream(retry_client.chat_stream(
-                required_tool_retry_prompt, retry_context, retry_session, images
+            retry_sources: list[dict] = []
+            async with closing_stream(_compat_chat_stream(
+                retry_client, required_tool_retry_prompt, retry_context,
+                retry_session, images,
+                sources_out=retry_sources,
             )) as owned_stream:
                 async for delta in owned_stream:
                     if isinstance(delta, ReasoningDelta):
@@ -750,6 +753,9 @@ async def _responses_stream_with_tools(
                     else:
                         full_text += _dedupe_repeated_delta(full_text, delta)
             full_text, declined = split_no_tool_marker(full_text)
+            # The retry REPLACED the text, so its sources replace the old ones
+            # in the same step; the two must never come from different turns.
+            collected_sources[:] = retry_sources
             tool_calls = _resolve_responses_tool_calls(
                 full_text,
                 names,
@@ -788,8 +794,12 @@ async def _responses_stream_with_tools(
                 studio_turn.session if retry_client is not client else session
             )
             retry_text = ""
-            async with closing_stream(retry_client.chat_stream(
-                retry_prompt, retry_context, retry_session, images
+            # A corrective retry owns its own sources; they are adopted only if
+            # its text is adopted, so the kept reply never cites another turn.
+            retry_sources: list[dict] = []
+            async with closing_stream(_compat_chat_stream(
+                retry_client, retry_prompt, retry_context, retry_session, images,
+                sources_out=retry_sources,
             )) as owned_stream:
                 async for delta in owned_stream:
                     if isinstance(delta, ReasoningDelta):
@@ -808,6 +818,7 @@ async def _responses_stream_with_tools(
             )
             if retry_calls:
                 full_text, tool_calls = retry_text, retry_calls
+                collected_sources[:] = retry_sources
                 if call_record is not None:
                     call_record["retried"] = True
     except SubstrateCopilotError as exc:

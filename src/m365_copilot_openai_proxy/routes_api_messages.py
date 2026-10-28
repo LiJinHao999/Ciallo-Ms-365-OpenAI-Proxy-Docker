@@ -593,7 +593,11 @@ def register_messages_routes(
                     studio_client is not None and actual_planning == "studio"
                 )
                 retry_client = studio_client if retry_uses_studio else client
-                collected_sources.clear()
+                # The retry is a SEPARATE turn: its sources belong to its own
+                # text. Sharing one list meant a retry that was thrown away still
+                # re-pointed the kept reply's [n] at the retry's URLs, and a retry
+                # that raised left the kept reply with no sources at all.
+                retry_sources: list[dict] = []
                 retry_text = await retry_client.chat(
                     _RETRY_INSTRUCTION,
                     (
@@ -603,12 +607,15 @@ def register_messages_routes(
                     ),
                     studio_session if retry_uses_studio else session,
                     **filter_client_method_kwargs(
-                        retry_client, "chat", {"sources_out": collected_sources}
+                        retry_client, "chat", {"sources_out": retry_sources}
                     ),
                 )
                 retry_calls = _resolve_tool_calls(retry_text, tool_names, read_only_guard)
                 if retry_calls:
                     raw_text, tool_calls = retry_text, retry_calls
+                    # Only now, together with the text, do the sources change
+                    # hands: the reply and its citations stay from one turn.
+                    collected_sources[:] = retry_sources
                     call_record["retried"] = True
             except SubstrateCopilotError:
                 pass  # Keep original response if retry fails
@@ -830,6 +837,9 @@ async def _anthropic_stream_with_tools(
         if not tool_calls and tool_names and not read_only_guard and not declined and not allow_final_answer and _looks_like_fake_file_claim(full_text):
             _log.info("  fake file claim detected, forcing corrective retry")
             retry_chunks: list[str] = []
+            # A corrective retry owns its own sources; adopting them only when
+            # its text is adopted keeps the reply and its citations one turn.
+            retry_sources: list[dict] = []
             retry_uses_studio = (
                 studio_turn is not None
                 and (
@@ -845,7 +855,10 @@ async def _anthropic_stream_with_tools(
             )
             retry_session = studio_turn.session if retry_uses_studio else session
             async with closing_stream(retry_client.chat_stream(
-                _RETRY_INSTRUCTION, retry_context, retry_session
+                _RETRY_INSTRUCTION, retry_context, retry_session,
+                **filter_client_method_kwargs(
+                    retry_client, "chat_stream", {"sources_out": retry_sources}
+                ),
             )) as owned_stream:
                 async for delta in owned_stream:
                     if isinstance(delta, ReasoningDelta):
@@ -857,6 +870,7 @@ async def _anthropic_stream_with_tools(
             retry_calls = _resolve_tool_calls(retry_text, tool_names or set(), read_only_guard)
             if retry_calls:
                 full_text, tool_calls = retry_text, retry_calls
+                collected_sources[:] = retry_sources
                 if call_record is not None:
                     call_record["retried"] = True
         rejected: list[str] = []
