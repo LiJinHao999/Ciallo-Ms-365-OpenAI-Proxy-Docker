@@ -1175,16 +1175,26 @@ def match_sources_for_tracker(
 
     Body markers are rewritten to ``[n]`` from, in priority order:
       * ``【1-1e0595】`` -> tracker key ``bracket1-1e0595`` / raw ``1-1e0595``
-      * ``citeturn1search10`` -> tracker key ``turn1search10``
+      * ``\ue200cite\ue202turn1search10\ue201`` -> tracker key ``turn1search10``
     Upstream ``references`` carry both ``ref_key`` (1-1e0595) and ``ref_id``
     (turn1search10). Match them so footnote 1 points at the right URL.
+
+    Every returned source carries the ``footnote`` number the BODY used for it,
+    which is the only thing that survives filtering: a later consumer that
+    drops or reorders sources (an internal reference has no URL) must not
+    renumber by list position, or the URL lands on the wrong ``[n]``.
     """
     usable = [s for s in sources if isinstance(s, dict) and (s.get("title") or s.get("url") or s.get("ref_key"))]
     if not usable:
         return []
     if tracker is None or not tracker.keys_in_order:
         # No body footnotes recorded — keep upstream order, drop URL-less noise.
-        return [s for s in usable if s.get("url") or s.get("title")]
+        # Numbers fall back to position; nothing in the body refers to them.
+        kept = [s for s in usable if s.get("url") or s.get("title")]
+        return [
+            {**source, "footnote": position}
+            for position, source in enumerate(kept, 1)
+        ]
 
     by_ref_key: dict[str, dict] = {}
     by_ref_id: dict[str, dict] = {}
@@ -1220,16 +1230,22 @@ def match_sources_for_tracker(
             # direct ref_key form
             hit = by_ref_key.get(k) or by_ref_key.get(k.split("bracket", 1)[-1])
         if hit is not None and id(hit) not in used:
-            ordered.append(hit)
+            ordered.append({**hit, "footnote": tracker.number_of(k) or 0})
             used.add(id(hit))
 
     # Append any remaining sources with real URLs that were not cited inline.
+    # They get numbers AFTER every body footnote, so adding one can never
+    # renumber a marker the body already emitted.
+    next_number = max(
+        (source["footnote"] for source in ordered),
+        default=0,
+    )
     for s in usable:
         if id(s) not in used and s.get("url"):
-            ordered.append(s)
+            next_number += 1
+            ordered.append({**s, "footnote": next_number})
             used.add(id(s))
     return ordered
-
 
 def aligned_url_sources_for_stream(
     sources: list[dict],
@@ -1261,17 +1277,23 @@ def openai_url_citations_from_sources(text: str, sources: list[dict]) -> list[di
     ``start_index`` / ``end_index`` prefer the in-body ``[n]`` marker span so
     clients can highlight the cite marker. When a marker is missing the span is
     placed at EOF (zero-width) so the annotation still carries url/title.
+
+    The span is located from the source's OWN ``footnote`` number, never from
+    its position in ``sources``: dropping a URL-less source would otherwise
+    shift every later URL onto the previous marker. See
+    :func:`match_sources_for_tracker`.
     """
     body = text or ""
     annotations: list[dict] = []
-    for index, source in enumerate(sources, 1):
+    for position, source in enumerate(sources, 1):
         if not isinstance(source, dict):
             continue
         url = str(source.get("url") or "").strip()
         if not url:
             continue
         title = str(source.get("title") or url).strip() or url
-        span = _footnote_span(body, index)
+        number = int(source.get("footnote") or 0) or position
+        span = _footnote_span(body, number)
         if span is None:
             start = end = len(body)
         else:
@@ -1294,10 +1316,14 @@ def anthropic_web_citations_from_sources(text: str, sources: list[dict]) -> list
     These hang on a text content block's ``citations`` array (and as streaming
     ``citations_delta`` events). ``encrypted_index`` is an opaque required field
     in the official SDK; we emit a stable synthetic token per source.
+
+    Like the OpenAI mapper, the cited span comes from the source's own
+    ``footnote`` number, so filtering a URL-less source cannot move a URL onto
+    somebody else's ``[n]``.
     """
     body = text or ""
     citations: list[dict] = []
-    for index, source in enumerate(sources, 1):
+    for position, source in enumerate(sources, 1):
         if not isinstance(source, dict):
             continue
         url = str(source.get("url") or "").strip()
@@ -1305,7 +1331,8 @@ def anthropic_web_citations_from_sources(text: str, sources: list[dict]) -> list
             continue
         title = str(source.get("title") or url).strip() or url
         snippet = str(source.get("snippet") or "").strip()
-        span = _footnote_span(body, index)
+        number = int(source.get("footnote") or 0) or position
+        span = _footnote_span(body, number)
         if span is not None:
             cited_text = body[span[0]:span[1]]
         elif snippet:
@@ -1319,7 +1346,7 @@ def anthropic_web_citations_from_sources(text: str, sources: list[dict]) -> list
                 "title": title,
                 "cited_text": cited_text,
                 # Opaque per Anthropic SDK; not a real encrypted payload.
-                "encrypted_index": f"m365_{index}",
+                "encrypted_index": f"m365_{number}",
             }
         )
     return citations
