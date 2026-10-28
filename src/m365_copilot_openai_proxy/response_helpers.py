@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import time
@@ -25,6 +24,7 @@ from .substrate_client import (
     SubstrateNetworkError,
     SubstrateThrottled,
     _dedupe_repeated_delta,
+    filter_client_method_kwargs,
 )
 from .substrate_parse import (
     anthropic_web_citations_from_sources,
@@ -54,24 +54,6 @@ def _transform_complete_text(full_text: str, text_transform: Callable[[str], str
 
 
 
-def _chat_stream_extra_kwargs(client: object, extra: dict) -> dict:
-    """Keep sources/reasoning kwargs only when the inner client accepts them."""
-    target = client
-    for attr in ("_throttle_target", "_client"):
-        inner = getattr(target, attr, None)
-        if inner is not None and hasattr(inner, "chat_stream"):
-            target = inner
-    func = getattr(target, "chat_stream", None)
-    try:
-        sig = inspect.signature(func)
-    except (TypeError, ValueError):
-        return {}
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-        return extra
-    return {key: value for key, value in extra.items() if key in sig.parameters}
-
-
-
 async def _compat_chat_stream(
     client: SubstrateCopilotClient,
     prompt: str,
@@ -80,14 +62,19 @@ async def _compat_chat_stream(
     images: list | None,
     **extra,
 ) -> AsyncIterator[str]:
-    """Call chat_stream, ignoring extra kwargs older/test clients reject."""
-    filtered = _chat_stream_extra_kwargs(client, extra)
-    stream = client.chat_stream(
-        prompt, additional_context, session, images, **filtered
-    )
-    async for delta in stream:
-        yield delta
+    """Call chat_stream, ignoring extra kwargs older/test clients reject.
 
+    The inner iterator is OWNED here and closed before this wrapper returns.
+    A plain ``async for ...: yield`` would make the caller's ``aclosing``
+    close only this wrapper, leaving the upstream socket open and the
+    session lock and account slot held past the client's disconnect.
+    """
+    filtered = filter_client_method_kwargs(client, "chat_stream", extra)
+    async with closing_stream(client.chat_stream(
+        prompt, additional_context, session, images, **filtered
+    )) as owned_stream:
+        async for delta in owned_stream:
+            yield delta
 
 def _json_err(status: int, message: str, error_type: str = "error") -> JSONResponse:
     return JSONResponse(
