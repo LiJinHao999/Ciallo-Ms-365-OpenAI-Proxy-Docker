@@ -861,7 +861,7 @@ class SubstrateCopilotClient:
                                         continue
                                     if not _is_answer_entry(entry):
                                         continue
-                                    fallback_text = _message_content(entry)
+                                    fallback_text = _message_content(entry, cite_tracker)
                                     break
                                 # The snapshot is cumulative. When it runs ahead of
                                 # the deltas it holds the only copy of the skipped
@@ -888,7 +888,7 @@ class SubstrateCopilotClient:
                                     continue
                                 if not _is_answer_entry(entry):
                                     continue
-                                fallback_text = _message_content(entry)
+                                fallback_text = _message_content(entry, cite_tracker)
                                 break
                             # The completion frame states the verdict for the whole
                             # turn; a rejected tone lands here as Failed/InternalError.

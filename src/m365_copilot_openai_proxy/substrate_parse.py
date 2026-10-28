@@ -64,19 +64,40 @@ _LITERAL_CITE_TAG_RE = re.compile(r"<cite>[A-Za-z0-9_,\-]*</cite>", re.IGNORECAS
 _BRACKET_CITE_RE = re.compile(r"【\d+-[0-9a-z]{3,}】", re.IGNORECASE)
 
 # --- fork: citation tracker + source attributions ---
-_SRC_PUA = "-"
+_SRC_PUA = "\ue000-\uf8ff"
+
+# A turn-scoped citation id, e.g. turn1search6 / turn2file0.
+_SRC_ID_WORDS = "search|file|news|image|video|base|knowledge|gpt|cid|doc"
+_SRC_TURN_ID = rf"turn\d+(?:{_SRC_ID_WORDS})\d+"
+
 _SRC_MARKDOWN_CITE_RE = re.compile(
     rf"\[([^\]]*)\]\(\s*([{_SRC_PUA}]*cite[{_SRC_PUA}][^)]*)\)",
     re.IGNORECASE,
 )
-# Require a non-empty ascii id so "cite" alone is NOT consumed (held instead).
+# The marker is STRUCTURED, not "PUA followed by a word": the opener, the word
+# "cite", then one separator per id, then a closer. Treating any private-use
+# byte as a separator let the CLOSER start a new id and swallowed the word
+# after the marker ("\ue201Cloudflare" -> footnote 2 pointing at prose).
+_SRC_OPEN = "\ue200"
+_SRC_SEP = "\ue202"
+_SRC_CLOSE = "\ue201"
+
+# One marker may carry several ids: \ue200cite\ue202turn4search10\ue202turn4search12\ue201
 _SRC_BARE_PUA_CITE_RE = re.compile(
-    rf"[{_SRC_PUA}]cite[{_SRC_PUA}]([A-Za-z0-9_]+)[{_SRC_PUA}]?",
+    rf"{_SRC_OPEN}\s*cite\s*((?:{_SRC_SEP}\s*[A-Za-z0-9_]+)+)\s*{_SRC_CLOSE}?",
     re.IGNORECASE,
 )
-# Leftover after a split ate the cite opener: "turn1search6" or plain "turn1search6".
-_SRC_LOOSE_TURN_CITE_RE = re.compile(
-    rf"(?:[{_SRC_PUA}])?(turn\d+(?:search|file|news|image|video|base|knowledge|gpt|cid|doc)\d+)(?:[{_SRC_PUA}])?",
+# The ids inside such a run, once the separators are what split them.
+_SRC_PUA_ID_RE = re.compile(rf"{_SRC_SEP}\s*([A-Za-z0-9_]+)")
+# The other rendering of the same marker, seen in the very same live turn.
+_SRC_LITERAL_CITE_TAG_RE = re.compile(
+    rf"<cite>\s*({_SRC_TURN_ID}(?:\s*,\s*{_SRC_TURN_ID})*)\s*</cite>",
+    re.IGNORECASE,
+)
+# An id whose PUA half was already consumed. Only a PUA neighbour makes it a
+# marker: prose that merely names an id (a bug report, these docs) keeps it.
+_SRC_ORPHAN_TURN_CITE_RE = re.compile(
+    rf"(?:[{_SRC_PUA}]+({_SRC_TURN_ID})(?:[{_SRC_PUA}]*)|({_SRC_TURN_ID})[{_SRC_PUA}]+)",
     re.IGNORECASE,
 )
 # Chinese-bracket web cites used by some M365 answers: 【1-1fd57a】 or 【3】.
@@ -86,17 +107,61 @@ _SRC_BRACKET_CITE_RE = re.compile(
 _SRC_SYDNEY_FOOTNOTE_RE = re.compile(r"\[\^(\d+)\^\]")
 _SRC_CITE_KEY_NOISE_RE = re.compile(rf"[{_SRC_PUA}]+")
 
-# Incomplete tails we must HOLD across stream deltas (not emit raw).
-_SRC_INCOMPLETE_CITE_TAIL_RE = re.compile(
-    rf"(?:"
-    rf"\[[^\]]*\]\(\s*[{_SRC_PUA}]*cite[{_SRC_PUA}][^)]*$"  # open markdown cite
-    rf"|[{_SRC_PUA}]cite[{_SRC_PUA}][A-Za-z0-9_]*$"          # open bare PUA cite
-    rf"|[{_SRC_PUA}]cite$"
-    rf"|[{_SRC_PUA}]$"                                    # lone PUA starter
-    rf"|\[$"                                          # lone "["
-    rf"|\[[^\]]*$"                                    # open "[" label
-    rf")",
-    re.IGNORECASE,
+# Tails a delta may END inside a citation marker. Only these are held; anything
+# else goes straight through. A marker that split mid-way used to leak its
+# halves, but holding more than the marker costs text: an earlier version held
+# every open "[" and DELETED the tail at flush, which truncated a legal
+# tool-call argument that merely contained a bracket.
+#
+# Every pattern is anchored at the end and describes the marker's OWN grammar,
+# so a tail that has already failed to be a marker ("[']") stops matching and
+# is released verbatim on the next delta.
+_SRC_HOLD_TAIL_RES = (
+    # [label](<pua>cite... -- a markdown citation whose target is arriving
+    re.compile(rf"\[[^\]\n]*\]\(\s*[{_SRC_PUA}]*(?:cite[{_SRC_PUA}]|c(?:i(?:t(?:e)?)?)?)?[^)\n]*$", re.IGNORECASE),
+    # \ue200cite\ue202turn1s -- an open marker run, ids still arriving
+    re.compile(rf"{_SRC_OPEN}\s*c(?:i(?:t(?:e)?)?)?(?:{_SRC_SEP}\s*[A-Za-z0-9_]*)*\s*{_SRC_CLOSE}?$", re.IGNORECASE),
+    # \ue202turn1se -- a separator plus the id that follows it, the opener
+    # having gone out in an earlier delta.
+    re.compile(rf"{_SRC_SEP}\s*[A-Za-z0-9_]*$"),
+    # A lone private-use byte: the marker's first half.
+    re.compile(rf"[{_SRC_PUA}]$"),
+    # <cite>turn1s / <cite>turn1search7< / <cite>turn1search7</ -- an open
+    # literal cite tag, including its own closing half.
+    re.compile(r"<cite>[A-Za-z0-9_,\-]*(?:<\/?(?:c(?:i(?:t(?:e)?)?)?)?>?)?$", re.IGNORECASE),
+    # < / <c / <cite / <cite> / </cite -- the opening halves of such a tag.
+    # A lone "<" is held for one delta so a tag split right after it is still
+    # recognized; a real "a < b" costs one delta of delay, never content.
+    re.compile(r"<(?:/)?c?(?:i(?:t(?:e)?)?)?>?$", re.IGNORECASE),
+    # 【1- -- an open chinese-bracket cite. Bounded to a citation's own digits
+    # so ordinary 【emphasis】 punctuation is never held.
+    re.compile(r"【\s*(?:\d{0,3}(?:[-–—]\s*[0-9a-fA-F]{0,16})?)?$"),
+    # [label] or [label -- an open or closed markdown citation label. Held so
+    # the label and the marker that may follow it are rewritten together; a
+    # tail that never became a citation is given back VERBATIM by flush(), so a
+    # bracket in ordinary text (a tool argument writing "print('[')") is
+    # delayed by one delta at worst, never lost.
+    re.compile(r"\[[^\]\n]*\]?$"),
+    re.compile(r"\[\^\d{0,4}\^?$"),
+)
+# A hold above this size is released as-is: real markers are short, and an
+# unbounded hold would delay the rest of the answer to the end of the stream.
+_SRC_MAX_HOLD = 160
+
+# A markdown citation cut off before its target closed. flush() keeps the
+# label, which is real text, and drops the marker.
+_SRC_MARKDOWN_CITE_OPEN_RE = re.compile(
+    rf"\[([^\]\n]*)\]\(\s*[{_SRC_PUA}]*(?:c(?:i(?:t(?:e)?)?)?)?\s*$", re.IGNORECASE
+)
+# The link form of the literal tag: [label](<cite>turn1search7</cite>)
+_SRC_MARKDOWN_CITE_TAG_RE = re.compile(
+    rf"\[([^\]\n]*)\]\(\s*<cite>([^<]*)</cite>\s*\)", re.IGNORECASE
+)
+# Only a private-use byte or a cite/turnN id proves a held tail really was a
+# marker. Without that evidence the tail is replayed VERBATIM: it is real
+# text that happened to end where a marker could have started.
+_SRC_MARKER_EVIDENCE_RE = re.compile(
+    rf"[{_SRC_PUA}]|<cite>|\bcite\b|\b{_SRC_TURN_ID}\b", re.IGNORECASE
 )
 
 
@@ -144,15 +209,32 @@ def _normalize_cite_key(raw: str) -> str:
 
 
 def _has_cite_noise(text: str) -> bool:
+    """Whether ``text`` holds anything a citation rule could act on."""
     if not text:
         return False
-    lower = text.lower()
-    if "cite" in lower or "turn" in lower and "search" in lower:
-        return True
-    if "[^" in text or "【" in text:
-        return True
-    return any("" <= c <= "" for c in text)
+    return bool(
+        _SRC_MARKER_EVIDENCE_RE.search(text)
+        or _SRC_BRACKET_CITE_RE.search(text)
+        or _SRC_SYDNEY_FOOTNOTE_RE.search(text)
+    )
 
+
+def _marker_start(text: str) -> int | None:
+    """Offset where citation-marker syntax begins, or ``None`` when absent.
+
+    Everything before it is real text that must survive verbatim; only from
+    here on is it safe to drop characters.
+    """
+    candidates = [position for position in (text.find(marker) for marker in ("\ue200", "\ue201", "\ue202")) if position >= 0]
+    for pattern in (
+        re.compile(r"<cite>", re.IGNORECASE),
+        re.compile(r"【\s*\d"),
+        re.compile(r"\[\^\d"),
+    ):
+        match = pattern.search(text)
+        if match:
+            candidates.append(match.start())
+    return min(candidates) if candidates else None
 
 
 class CitationTracker:
@@ -160,6 +242,12 @@ class CitationTracker:
 
     Holds incomplete openers across ``clean()`` calls so split deltas cannot
     leak raw ``turn1search6`` / lone PUA bytes / bare ``cite`` to the client.
+
+    Only text that is ALREADY citation syntax is held, and ``flush()`` gives
+    back everything it held that turned out not to be a citation. Holding any
+    ``[`` and deleting the tail at flush is what truncated a legal tool-call
+    argument that merely contained a bracket, and what turned a plain
+    ``turn3search5`` in prose into a footnote.
     """
 
     def __init__(self) -> None:
@@ -192,42 +280,75 @@ class CitationTracker:
     def keys_in_order(self) -> list[str]:
         return [k for k in self._order if not k.startswith("pad")]
 
+    def number_of(self, key: str) -> int | None:
+        """The in-body footnote number of ``key``, or ``None`` when uncited."""
+        return self._key_to_num.get((key or "").lower())
+
     def _split_incomplete(self, text: str) -> tuple[str, str]:
         """Return (safe_prefix, hold_suffix) for cite openers still in progress."""
         if not text:
             return "", ""
-        # Longest incomplete tails first. MUST hold partial turn/search tokens
-        # like "turn1s" / "turn1search" mid-id, otherwise chunked streams leak them.
-        patterns = [
-            r"\[[^\]]*\]\(\s*[-]*cite[-][^)]*$",
-            r"\[[^\]]*\]\(\s*$",
-            r"[-]cite[-][A-Za-z0-9_]*$",
-            r"[-]+cite$",
-            r"(?:^|[^A-Za-z])cite$",
-            # full or partial sydney turn ids, optionally after a footnote
-            r"(?:\[\^?\d+\^?\])?turn\d*(?:search|file|news|image|video|base|knowledge|gpt|cid|doc)?[A-Za-z0-9_]*$",
-            r"turn\d*[A-Za-z0-9_]*$",
-            r"【[^】]*$",
-            r"\[\^[^\]]*$",
-            r"\[[^\]]*$",
-            r"[-]+$",
-        ]
-        for pat in patterns:
-            match = re.search(pat, text, re.IGNORECASE)
-            if match and match.end() == len(text):
-                start = match.start()
-                if pat.startswith("(?:^|[^A-Za-z])"):
-                    if start < len(text) and text[start].lower() != "c":
-                        start += 1
-                # Keep a completed footnote in the safe prefix when the hold is
-                # only the trailing turn residual: "[1]turn1s" → ("[1]", "turn1s").
-                held = text[start:]
-                if held.startswith("[") and "turn" in held.lower():
-                    foot = re.match(r"\[\^?\d+\^?\]", held)
-                    if foot:
-                        start += foot.end()
-                return text[:start], text[start:]
+        for pattern in _SRC_HOLD_TAIL_RES:
+            match = pattern.search(text)
+            if match and match.end() == len(text) and match.start() < len(text):
+                # An over-long "marker" is prose that merely looks like one:
+                # release it rather than delay the rest of the answer.
+                if len(text) - match.start() > _SRC_MAX_HOLD:
+                    return text, ""
+                return text[: match.start()], text[match.start():]
         return text, ""
+
+    def _substitute(self, text: str) -> str:
+        """Rewrite every COMPLETE marker in ``text`` as ``label + [n]``."""
+
+        def md_repl(match: re.Match[str]) -> str:
+            label = (match.group(1) or "").strip()
+            key = _normalize_cite_key(match.group(2) or "")
+            num = self._num_for(key)
+            return f"{label}[{num}]" if label else f"[{num}]"
+
+        def pua_repl(match: re.Match[str]) -> str:
+            """One marker run may carry several ids; each gets its own number."""
+            run = match.group(0) or ""
+            keys = [_normalize_cite_key(part) for part in _SRC_PUA_ID_RE.findall(run)]
+            keys = [key for key in keys if key and key != "cite"]
+            if not keys:
+                return ""
+            return "".join(f"[{self._num_for(key)}]" for key in keys)
+
+        def tag_repl(match: re.Match[str]) -> str:
+            ids = [part.strip() for part in (match.group(1) or "").split(",")]
+            ids = [_normalize_cite_key(part) for part in ids if part.strip()]
+            if not ids:
+                return ""
+            return "".join(f"[{self._num_for(key)}]" for key in ids)
+
+        def orphan_repl(match: re.Match[str]) -> str:
+            key = _normalize_cite_key(match.group(1) or match.group(2) or "")
+            return f"[{self._num_for(key)}]" if key else ""
+
+        def bracket_repl(match: re.Match[str]) -> str:
+            idx = int(match.group(1))
+            suffix = (match.group(2) or "").lower()
+            key = f"bracket{idx}-{suffix}" if suffix else f"bracket{idx}"
+            return f"[{self._num_for(key, preferred=idx)}]"
+
+        cleaned = _SRC_MARKDOWN_CITE_RE.sub(md_repl, text)
+        cleaned = _SRC_BARE_PUA_CITE_RE.sub(pua_repl, cleaned)
+        cleaned = _SRC_LITERAL_CITE_TAG_RE.sub(tag_repl, cleaned)
+        cleaned = _SRC_MARKDOWN_CITE_TAG_RE.sub(tag_repl, cleaned)
+        cleaned = _SRC_ORPHAN_TURN_CITE_RE.sub(orphan_repl, cleaned)
+        cleaned = _SRC_BRACKET_CITE_RE.sub(bracket_repl, cleaned)
+        cleaned = _SRC_SYDNEY_FOOTNOTE_RE.sub(r"[\1]", cleaned)
+        cleaned = _SRC_CITE_KEY_NOISE_RE.sub("", cleaned)
+        # A footnote restated by the marker right after it was already counted.
+        cleaned = re.sub(
+            r"\[(\d+)\]\[(\d+)\]",
+            lambda m: f"[{m.group(1)}]" if m.group(1) == m.group(2) else m.group(0),
+            cleaned,
+        )
+        # Collapse whitespace left by removed markers (keep newlines).
+        return re.sub(r"[^\S\n]{2,}", " ", cleaned)
 
     def clean(self, text: str) -> str:
         """Replace complete cite patterns with label + ``[n]`` markers."""
@@ -244,65 +365,76 @@ class CitationTracker:
         if not _has_cite_noise(text):
             return text
 
-        def md_repl(match: re.Match[str]) -> str:
-            label = (match.group(1) or "").strip()
-            key = _normalize_cite_key(match.group(2) or "")
-            num = self._num_for(key)
-            return f"{label}[{num}]" if label else f"[{num}]"
-
-        def bare_repl(match: re.Match[str]) -> str:
-            key = _normalize_cite_key(match.group(1) or match.group(0) or "")
-            num = self._num_for(key)
-            return f"[{num}]"
-
-        def loose_repl(match: re.Match[str]) -> str:
-            key = _normalize_cite_key(match.group(1) or match.group(0) or "")
-            num = self._num_for(key)
-            return f"[{num}]"
-
-        def bracket_repl(match: re.Match[str]) -> str:
-            idx = int(match.group(1))
-            suffix = (match.group(2) or "").lower()
-            key = f"bracket{idx}-{suffix}" if suffix else f"bracket{idx}"
-            num = self._num_for(key, preferred=idx)
-            return f"[{num}]"
-
-        cleaned = _SRC_MARKDOWN_CITE_RE.sub(md_repl, text)
-        cleaned = _SRC_BARE_PUA_CITE_RE.sub(bare_repl, cleaned)
-        # If a footnote is immediately followed by the same turn token residual
-        # (common when a prior delta already emitted [n] and a later delta
-        # carries turnNsearchM), drop the residual instead of doubling.
-        cleaned = re.sub(
-            rf"(\[\^?\d+\^?\])\s*[{_SRC_PUA}]?turn\d+(?:search|file|news|image|video|base|knowledge|gpt|cid|doc)\d+[{_SRC_PUA}]?",
-            r"\1",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        cleaned = _SRC_LOOSE_TURN_CITE_RE.sub(loose_repl, cleaned)
-        cleaned = _SRC_BRACKET_CITE_RE.sub(bracket_repl, cleaned)
-        cleaned = _SRC_SYDNEY_FOOTNOTE_RE.sub(r"[\1]", cleaned)
-        cleaned = re.sub(r"[-]+", "", cleaned)
-        cleaned = re.sub(r"[^\S\n]{2,}", " ", cleaned)
-        # Re-hold if replacements left a new incomplete tail.
+        cleaned = self._substitute(text)
+        # Re-hold if the replacements left a NEW incomplete tail behind.
         cleaned, more_hold = self._split_incomplete(cleaned)
         self._hold = more_hold + self._hold
         return cleaned
+    def apply(self, text: str) -> str:
+        """Render a COMPLETE text (a cumulative snapshot) with the SAME map.
+
+        A snapshot restates the whole answer, so it must not interact with the
+        streaming hold: nothing can arrive later to complete a tail of it. Its
+        markers are rewritten with the same key->number table as the deltas,
+        which is what keeps a snapshot and the deltas replaying the same run
+        comparable -- otherwise ``_split_snapshot_lead`` stops matching and the
+        reader is shown the opening twice.
+        """
+        if not text:
+            return ""
+        if not _has_cite_noise(text):
+            return text
+        return self._substitute(text)
+
+
+    def _release(self, held: str) -> str:
+        """Rewrite a held tail that will never complete into delivered text."""
+        # No marker evidence at all means this was never a citation: a plain
+        # "[" whose text has not arrived, part of a tool-call argument, an
+        # unfinished markdown label. Give it back exactly as it came in --
+        # deleting it is what truncated legal content.
+        probe = _SRC_MARKDOWN_CITE_TAG_RE.sub("", held)
+        probe = _SRC_MARKDOWN_CITE_RE.sub("", probe)
+        if not (
+            _SRC_MARKER_EVIDENCE_RE.search(probe)
+            or _SRC_BRACKET_CITE_RE.search(probe)
+            or _SRC_SYDNEY_FOOTNOTE_RE.search(probe)
+        ):
+            return held
+        cleaned = self._substitute(held)
+        # A citation cut off before its target closed: the label is real text.
+        cleaned = _SRC_MARKDOWN_CITE_OPEN_RE.sub(
+            lambda match: (match.group(1) or "").strip(), cleaned
+        )
+        # From the first marker byte on, this is syntax, not text: drop it.
+        start = _marker_start(cleaned)
+        if start is not None:
+            cleaned = cleaned[:start]
+        cleaned = _SRC_CITE_KEY_NOISE_RE.sub("", cleaned)
+        cleaned = re.sub(
+            rf"\s*(?:{_SRC_TURN_ID}|\bturn\d+[A-Za-z0-9_]*)$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s*\bcite$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*<\/?c(?:i(?:t(?:e)?)?)?>?$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*【[^】]*$", "", cleaned)
+        cleaned = re.sub(r"\s*\[\^[^\]]*$", "", cleaned)
+        cleaned = re.sub(r"\s*\[[^\]\n]*$", "", cleaned)
+        return cleaned
 
     def flush(self) -> str:
-        """Force-emit any held incomplete tail (best-effort, never leaks tokens)."""
+        """Release whatever is still held at end of stream.
+
+        A hold that turned out NOT to be a citation is returned VERBATIM.
+        Deleting it is what truncated a legal tool-call argument that merely
+        contained a bracket, and what swallowed the tail of a plain "[".
+        """
         if not self._hold:
             return ""
         held, self._hold = self._hold, ""
-        held = _SRC_MARKDOWN_CITE_RE.sub(lambda m: (m.group(1) or "").strip(), held)
-        held = _SRC_BARE_PUA_CITE_RE.sub("", held)
-        held = _SRC_LOOSE_TURN_CITE_RE.sub("", held)
-        held = _SRC_BRACKET_CITE_RE.sub("", held)
-        held = re.sub(r"[-]+", "", held)
-        held = re.sub(r"turn\d+\w*", "", held, flags=re.I)
-        held = re.sub(r"\bcite\b", "", held, flags=re.I)
-        held = re.sub(r"\[[^\]]*$", "", held)
-        held = re.sub(r"【[^】]*$", "", held)
-        return held
+        return self._release(held)
 
 
 
@@ -653,8 +785,17 @@ def _is_answer_entry(entry: dict) -> bool:
     return str(entry.get("messageType") or "") not in _NON_ANSWER_MESSAGE_TYPES
 
 
-def _message_content(entry: dict) -> str:
-    text = clean_m365_citations(normalize_m365_media_text(str(entry.get("text") or "")))
+def _message_content(entry: dict, tracker: "CitationTracker | None" = None) -> str:
+    """One message entry as deliverable text.
+
+    When a ``tracker`` is passed, citation markers become the same ``[n]``
+    footnotes the delta stream produced for this turn. Cleaning the snapshot
+    with a different rule than the deltas is what broke the dedupe between
+    them: the snapshot dropped its markers, the deltas kept ``[n]``, the two
+    stopped sharing a prefix, and the reader got the opening twice.
+    """
+    text = normalize_m365_media_text(str(entry.get("text") or ""))
+    text = tracker.apply(text) if tracker is not None else clean_m365_citations(text)
     image_urls = _extract_image_urls(entry)
     if image_urls and _is_image_loading_placeholder(text):
         text = ""
