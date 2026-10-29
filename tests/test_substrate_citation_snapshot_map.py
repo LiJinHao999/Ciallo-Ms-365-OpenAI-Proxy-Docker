@@ -181,3 +181,37 @@ def test_reference_map_reaches_the_cited_url(monkeypatch):
     assert len(annotations) == 1
     assert annotations[0]["url"] == "https://fastapi.tiangolo.com"
     assert text[annotations[0]["start_index"]:annotations[0]["end_index"]] == "[4]"
+
+
+def test_distinct_full_references_with_one_label_keep_their_own_urls(monkeypatch):
+    refs = dict([
+        _reference("1-aaaaaa", "turn1search0", "1", "https://a.example", "A"),
+        _reference("1-bbbbbb", "turn1search1", "1", "https://b.example", "B"),
+    ])
+    snapshot = "A【1-aaaaaa】 B【1-bbbbbb】 end"
+    delta = "A<cite>turn1search0</cite> B<cite>turn1search1</cite> end"
+    text, sources = _collect([
+        _snapshot(snapshot, refs), _delta(delta), _complete(snapshot, refs),
+    ], monkeypatch)
+
+    assert text == "A[1] B[2] end"
+    annotations = openai_url_citations_from_sources(text, sources)
+    assert [(a["url"], text[a["start_index"]:a["end_index"]]) for a in annotations] == [
+        ("https://a.example", "[1]"), ("https://b.example", "[2]"),
+    ]
+
+
+def test_plain_snapshot_number_survives_a_suppressed_full_id_rendering(monkeypatch):
+    refs = dict([
+        _reference("1-aaaaaa", "turn1search0", "1", "https://a.example", "A"),
+    ])
+    text, sources = _collect([
+        _snapshot("Claim [1]."),
+        _delta("Claim <cite>turn1search0</cite>."),
+        _complete("Claim [1].", refs),
+    ], monkeypatch)
+
+    assert text == "Claim [1]."
+    assert [(s["footnote"], s["url"]) for s in sources] == [(1, "https://a.example")]
+    annotation, = openai_url_citations_from_sources(text, sources)
+    assert text[annotation["start_index"]:annotation["end_index"]] == "[1]"

@@ -31,6 +31,7 @@ from .substrate_parse import (
     _image_markdown,
     _is_answer_entry,
     _is_image_loading_placeholder,
+    _SourceAttributionIndex,
     _message_content,
     _final_fallback_remainder,
     _split_snapshot_lead,
@@ -750,8 +751,7 @@ class SubstrateCopilotClient:
                 snapshot_lead = ""
                 yielded_images: set[str] = set()
                 yielded_any = False
-                collected_sources: list[dict] = []
-                seen_source_keys: set[str] = set()
+                source_index = _SourceAttributionIndex()
                 cite_tracker = CitationTracker()
                 reasoning = ReasoningSnapshots()
 
@@ -763,17 +763,7 @@ class SubstrateCopilotClient:
                         # takes two numbers, the snapshot and the delta stop
                         # sharing a prefix, and the opening is sent twice.
                         cite_tracker.note_source(source)
-                        key = (
-                            (source.get("url") or "").lower()
-                            or (source.get("ref_key") or "").lower()
-                            or (source.get("ref_id") or "").lower()
-                            or source.get("title")
-                            or ""
-                        )
-                        if not key or key in seen_source_keys:
-                            continue
-                        seen_source_keys.add(key)
-                        collected_sources.append(source)
+                        source_index.add(source)
                 # Non-empty once the completion frame says the turn failed; holds the
                 # upstream's own verdict string so the error names it.
                 turn_failure = ""
@@ -910,13 +900,14 @@ class SubstrateCopilotClient:
                                 yielded_images.add(image_url)
                                 yielded_any = True
                         if t == 3:
-                            # The tracker may still be holding a tail: a delta
-                            # ended inside a marker and the final frame never
-                            # completed it. Release it BEFORE reconciling, or
-                            # the reconciliation counts the hold as text the
-                            # reader does not have yet and re-sends it -- the
-                            # reader saw "A[3]B[4][4]".
+                            # A held delta tail may already have been delivered by
+                            # a cumulative snapshot. Reconcile it through the same
+                            # proven snapshot lead as every other delta.
                             held = cite_tracker.flush()
+                            if held and snapshot_lead:
+                                split = _split_snapshot_lead(snapshot_lead, held)
+                                if split is not None:
+                                    snapshot_lead, held = split
                             if held:
                                 streamed_text += held
                             remaining = _final_fallback_remainder(streamed_text, fallback_text)
@@ -951,7 +942,7 @@ class SubstrateCopilotClient:
                                 yield trailing
                                 streamed_text += trailing
                             aligned = aligned_url_sources_for_stream(
-                                collected_sources, cite_tracker
+                                source_index.values(), cite_tracker, text=streamed_text
                             )
                             if sources_out is not None:
                                 sources_out.clear()

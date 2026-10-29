@@ -219,6 +219,21 @@ _SRC_MARKER_EVIDENCE_RE = re.compile(
     rf"[{_SRC_PUA}]|<cite>\s*{_SRC_TURN_ID_PARTIAL}|\b{_SRC_TURN_ID}\b", re.IGNORECASE
 )
 
+# One lexical pass: a later literal bracket must not reserve a number before
+# an earlier citation merely because both arrived in the same delta.
+_SRC_CITATION_TOKEN_PATTERNS = {
+    "markdown": _SRC_MARKDOWN_CITE_RE,
+    "pua": _SRC_BARE_PUA_CITE_RE,
+    "tag": _SRC_LITERAL_CITE_TAG_RE,
+    "orphan": _SRC_ORPHAN_TURN_CITE_RE,
+    "bracket": _SRC_BRACKET_CITE_RE,
+    "sydney": _SRC_SYDNEY_FOOTNOTE_RE,
+}
+_SRC_CITATION_TOKEN_RE = re.compile(
+    "|".join(f"(?P<{name}>{pattern.pattern})" for name, pattern in _SRC_CITATION_TOKEN_PATTERNS.items()),
+    re.IGNORECASE,
+)
+
 
 
 def clean_m365_citations(text: str, tracker: "CitationTracker | None" = None) -> str:
@@ -335,6 +350,14 @@ class CitationTracker:
         # 【4-6f710b】 carries its own 4; the same source's turn1search4
         # rendering does not, and has to inherit it through the alias.
         self._preferred: dict[str, int] = {}
+        # Display numbers are weak aliases, revocable when another identity
+        # reuses the label. Full ref keys/ids never merge through such a label.
+        self._source_index = _SourceAttributionIndex()
+        self._source_markers: dict[int, str] = {}
+        self._source_labels: dict[int, set[str]] = {}
+        self._label_sources: dict[str, dict[int, str]] = {}
+        self._numeric_only: dict[str, str] = {}
+        self._reserved_numbers: set[int] = set()
 
     def _canonical(self, key: str) -> str:
         """Follow an alias chain to the key that owns the number."""
@@ -373,35 +396,74 @@ class CitationTracker:
             self._aliases[second] = first
 
     def note_source(self, source: dict) -> None:
-        """Register the marker keys ONE source can be cited by as one key.
-
-        Called as upstream reference metadata arrives, so the very frame
-        that carries a snapshot's ``【n-id】`` markers also teaches the
-        tracker which ``turnN…`` id that number belongs to.
-        """
+        """Link full marker identities; bind a numeric label only while unique."""
         if not isinstance(source, dict):
             return
+        record, merged = self._source_index.add(source)
+        source = record
         ref_key = str(source.get("ref_key") or "").strip().lower()
         ref_id = _normalize_cite_key(str(source.get("ref_id") or ""))
-        label = str(source.get("label") or "").strip()
         keys: list[str] = []
-        if ref_key:
+        if ref_key and not ref_key.isdigit():
             keys.append(f"bracket{ref_key}")
-        if label:
-            keys.append(f"bracket{label}")
         if ref_id:
             keys.append(ref_id)
+        if not keys and source.get("url"):
+            keys.append(f"url:{str(source['url']).strip().lower()}")
+        preferred = _source_footnote_number(source)
         if not keys:
             return
-        # The number the body will use for this source, when upstream states
-        # it. A turn id names a source without numbering it, so the id
-        # rendering inherits the label's number through the alias below.
-        preferred = _source_footnote_number(source)
         if preferred:
             for key in keys:
                 self._preferred.setdefault(key, preferred)
         for other in keys[1:]:
             self.alias(keys[0], other)
+        if not preferred:
+            return
+
+        owner = self._source_markers.get(id(record))
+        if owner is not None:
+            self.alias(owner, keys[0])
+        labels = self._source_labels.setdefault(id(record), set())
+        label_key = f"bracket{preferred}"
+        affected = {label_key}
+        for previous in merged:
+            previous_key = self._source_markers.pop(id(previous), None)
+            if previous_key is not None:
+                self.alias(previous_key, keys[0])
+            previous_labels = self._source_labels.pop(id(previous), set())
+            for previous_label in previous_labels:
+                self._label_sources[previous_label].pop(id(previous), None)
+            labels.update(previous_labels)
+            affected.update(previous_labels)
+        labels.add(label_key)
+        owner = self._canonical(keys[0])
+        self._source_markers[id(record)] = owner
+        for affected_label in affected:
+            candidates = self._label_sources.setdefault(affected_label, {})
+            candidates[id(record)] = owner
+            self._bind_numeric_label(affected_label, candidates)
+
+    def _bind_numeric_label(self, label_key: str, candidates: dict[int, str]) -> None:
+        if len(candidates) != 1:
+            previous = self._aliases.pop(label_key, None)
+            if previous is not None:
+                previous = self._canonical(previous)
+                if self._numeric_only.pop(previous, None) == label_key:
+                    # Only the bare label was delivered before its ambiguity
+                    # became known. Keep its number, but remove URL ownership.
+                    self._key_to_num[label_key] = self._key_to_num.pop(previous)
+                    self._order[self._order.index(previous)] = label_key
+            return
+
+        owner = self._canonical(next(iter(candidates.values())))
+        if label_key in self._key_to_num:
+            if owner in self._key_to_num:
+                return  # Both renderings were delivered; neither can be retracted.
+            self._key_to_num[owner] = self._key_to_num.pop(label_key)
+            self._order[self._order.index(label_key)] = owner
+            self._numeric_only[owner] = label_key
+        self._aliases[label_key] = owner
 
     def _num_for(self, key: str, preferred: int | None = None) -> int:
         if key:
@@ -410,9 +472,21 @@ class CitationTracker:
                 preferred = self._preferred.get(normalized)
         else:
             normalized = f"anon{len(self._order)}"
+        numeric_key = key if re.fullmatch(r"bracket\d+", key or "") else None
+        if numeric_key is None:
+            self._numeric_only.pop(normalized, None)
+        elif normalized != key and normalized not in self._key_to_num:
+            self._numeric_only[normalized] = key
         if normalized in self._key_to_num:
             return self._key_to_num[normalized]
-        if preferred is not None and preferred > 0 and preferred not in self._key_to_num.values():
+        if (
+            preferred is not None and preferred > 0
+            and preferred not in self._key_to_num.values()
+            and (
+                preferred not in self._reserved_numbers
+                or self._canonical(f"bracket{preferred}") == normalized
+            )
+        ):
             while len(self._order) < preferred - 1:
                 placeholder = f"pad{len(self._order)}"
                 self._order.append(placeholder)
@@ -421,6 +495,10 @@ class CitationTracker:
                 self._order.append(normalized)
                 self._key_to_num[normalized] = preferred
                 return preferred
+        while len(self._order) + 1 in self._reserved_numbers:
+            placeholder = f"pad{len(self._order)}"
+            self._order.append(placeholder)
+            self._key_to_num[placeholder] = len(self._order)
         self._key_to_num[normalized] = len(self._order) + 1
         self._order.append(normalized)
         return self._key_to_num[normalized]
@@ -500,13 +578,31 @@ class CitationTracker:
             key = f"bracket{idx}-{suffix}" if suffix else f"bracket{idx}"
             return f"[{self._num_for(key, preferred=idx)}]"
 
-        cleaned = _SRC_MARKDOWN_CITE_RE.sub(md_repl, text)
-        cleaned = _SRC_BARE_PUA_CITE_RE.sub(pua_repl, cleaned)
-        cleaned = _SRC_LITERAL_CITE_TAG_RE.sub(tag_repl, cleaned)
-        cleaned = _SRC_MARKDOWN_CITE_TAG_RE.sub(tag_repl, cleaned)
-        cleaned = _SRC_ORPHAN_TURN_CITE_RE.sub(orphan_repl, cleaned)
-        cleaned = _SRC_BRACKET_CITE_RE.sub(bracket_repl, cleaned)
-        cleaned = _SRC_SYDNEY_FOOTNOTE_RE.sub(r"[\1]", cleaned)
+        replacements = {
+            "markdown": md_repl,
+            "pua": pua_repl,
+            "tag": tag_repl,
+            "orphan": orphan_repl,
+            "bracket": bracket_repl,
+        }
+        pieces: list[str] = []
+        cursor = 0
+        for token in _SRC_CITATION_TOKEN_RE.finditer(text):
+            prefix = text[cursor:token.start()]
+            self._reserve_plain_numbers(prefix)
+            pieces.append(prefix)
+            kind = token.lastgroup
+            raw = token.group(0)
+            if kind == "sydney":
+                self._reserve_plain_numbers(raw)
+                pieces.append(_SRC_SYDNEY_FOOTNOTE_RE.sub(r"[\1]", raw))
+            else:
+                pieces.append(_SRC_CITATION_TOKEN_PATTERNS[kind].sub(replacements[kind], raw))
+            cursor = token.end()
+        suffix = text[cursor:]
+        self._reserve_plain_numbers(suffix)
+        pieces.append(suffix)
+        cleaned = _SRC_MARKDOWN_CITE_TAG_RE.sub(tag_repl, "".join(pieces))
         cleaned = _SRC_CITE_KEY_NOISE_RE.sub("", cleaned)
         # A footnote restated by the marker right after it was already counted.
         cleaned = re.sub(
@@ -516,6 +612,14 @@ class CitationTracker:
         )
         # Collapse whitespace left by removed markers (keep newlines).
         return re.sub(r"[^\S\n]{2,}", " ", cleaned)
+
+    def _reserve_plain_numbers(self, text: str) -> None:
+        # Reservation alone grants no source identity. This keeps a later
+        # verified marker away from both plain citations and code indexing.
+        self._reserved_numbers.update(
+            int(match.group(1))
+            for match in re.finditer(r"\[\^?(\d+)\^?\](?!\()", text)
+        )
 
     def clean(self, text: str) -> str:
         """Replace complete cite patterns with label + ``[n]`` markers."""
@@ -530,6 +634,7 @@ class CitationTracker:
         if not text:
             return ""
         if not _has_cite_noise(text):
+            self._reserve_plain_numbers(text)
             return text
 
         cleaned = self._substitute(text)
@@ -550,6 +655,7 @@ class CitationTracker:
         if not text:
             return ""
         if not _has_cite_noise(text):
+            self._reserve_plain_numbers(text)
             return text
         return self._substitute(text)
 
@@ -1289,6 +1395,90 @@ def _normalize_source_attribution(item: object, *, ref_key: str = "") -> dict | 
     }
 
 
+def _merge_source_attribution(existing: dict, incoming: dict) -> bool:
+    """Enrich one identity without replacing conflicting full reference IDs.
+
+    The caller must first establish a shared URL or reference identity.
+    """
+    for field in ("ref_key", "ref_id"):
+        left = str(existing.get(field) or "").strip().lower()
+        right = str(incoming.get(field) or "").strip().lower()
+        if left and right and left != right:
+            return False
+    for field, value in incoming.items():
+        if value and not existing.get(field):
+            existing[field] = value
+    return True
+
+
+class _SourceAttributionIndex:
+    """Coalesce compatible partial records with bounded identity lookups."""
+
+    def __init__(self) -> None:
+        self._by_key: dict[str, dict | None] = {}
+        self._records: dict[int, dict] = {}
+        self._positions: dict[int, int] = {}
+        self._parents: dict[int, dict] = {}
+
+    @staticmethod
+    def _keys(source: dict) -> list[str]:
+        keys = [
+            f"{field}:{str(source[field]).strip().lower()}"
+            for field in ("ref_key", "ref_id") if source.get(field)
+        ]
+        if source.get("url"):
+            keys.append(f"url:{str(source['url']).strip()}")
+        if not keys and source.get("title"):
+            keys.append(f"title:{source['title']}")
+        return keys
+
+    def _canonical(self, source: dict) -> dict:
+        parent = self._parents.get(id(source))
+        if parent is not None:
+            parent = self._canonical(parent)
+            self._parents[id(source)] = parent
+            return parent
+        return source
+
+    def add(self, source: dict) -> tuple[dict, list[dict]]:
+        keys = self._keys(source)
+        record: dict | None = None
+        merged: list[dict] = []
+        visited: set[int] = set()
+        for key in keys:
+            candidate = self._by_key.get(key)
+            if candidate is None:
+                continue
+            candidate = self._canonical(candidate)
+            if id(candidate) in visited:
+                continue
+            visited.add(id(candidate))
+            if record is None:
+                if _merge_source_attribution(candidate, source):
+                    record = candidate
+            elif _merge_source_attribution(record, candidate):
+                if self._positions[id(candidate)] < self._positions[id(record)]:
+                    _merge_source_attribution(candidate, record)
+                    record, candidate = candidate, record
+                self._parents[id(candidate)] = record
+                merged.append(candidate)
+        if record is None:
+            record = dict(source)
+            self._positions[id(record)] = len(self._records)
+            self._records[id(record)] = record
+        for key in keys:
+            if key not in self._by_key:
+                self._by_key[key] = record
+            else:
+                previous = self._by_key[key]
+                if previous is not None and self._canonical(previous) is not record:
+                    self._by_key[key] = None
+        return record, merged
+
+    def values(self) -> list[dict]:
+        return [record for identity, record in self._records.items() if identity not in self._parents]
+
+
 def extract_source_attributions(value: object) -> list[dict]:
     """Collect normalized citations from a SignalR message / entry tree.
 
@@ -1297,10 +1487,10 @@ def extract_source_attributions(value: object) -> list[dict]:
       * current ``references`` dicts keyed by ``1-1e0595``-style ids
       * already-resolved ``[label](https://...)`` links in final bot text
 
-    De-duplicates by URL, then by ref_key / ref_id / title.
+    Repeated URLs enrich missing metadata; conflicting full reference IDs
+    remain separate. URL-less entries use ref_key / ref_id / title instead.
     """
-    found: list[dict] = []
-    seen: set[str] = set()
+    index = _SourceAttributionIndex()
     list_keys = {
         "sourceAttributions",
         "source_attributions",
@@ -1316,30 +1506,7 @@ def extract_source_attributions(value: object) -> list[dict]:
         normalized = _normalize_source_attribution(item, ref_key=ref_key)
         if normalized is None:
             return
-        # Prefer stable identity: url > ref_key > ref_id > title
-        key = (
-            (normalized.get("url") or "").lower()
-            or (normalized.get("ref_key") or "").lower()
-            or (normalized.get("ref_id") or "").lower()
-            or (normalized.get("title") or "")
-        )
-        if not key or key in seen:
-            # If we already have this key but the new entry has a URL and the
-            # old one doesn't, upgrade in place.
-            if key and key in seen and normalized.get("url"):
-                for existing in found:
-                    ek = (
-                        (existing.get("url") or "").lower()
-                        or (existing.get("ref_key") or "").lower()
-                        or (existing.get("ref_id") or "").lower()
-                        or (existing.get("title") or "")
-                    )
-                    if ek == key and not existing.get("url"):
-                        existing.update({k: v for k, v in normalized.items() if v})
-                        break
-            return
-        seen.add(key)
-        found.append(normalized)
+        index.add(normalized)
 
     def add_inline_markdown_links(text: str) -> None:
         if not text or "http" not in text:
@@ -1386,12 +1553,14 @@ def extract_source_attributions(value: object) -> list[dict]:
                 walk(child)
 
     walk(value)
-    return found
+    return index.values()
 
 
 def match_sources_for_tracker(
     sources: list[dict],
     tracker: "CitationTracker | None",
+    *,
+    text: str | None = None,
 ) -> list[dict]:
     """Order/filter sources to match in-body ``[n]`` numbering.
 
@@ -1405,63 +1574,89 @@ def match_sources_for_tracker(
     which is the only thing that survives filtering: a later consumer that
     drops or reorders sources (an internal reference has no URL) must not
     renumber by list position, or the URL lands on the wrong ``[n]``.
+
+    Plain/Sydney numbers need explicit, unique source metadata. With delivered
+    ``text``, every numeric bracket also reserves its number, including ordinary
+    code: an unrelated supplemental URL must never highlight that bracket.
     """
-    usable = [s for s in sources if isinstance(s, dict) and (s.get("title") or s.get("url") or s.get("ref_key"))]
+    index = _SourceAttributionIndex()
+    for source in sources:
+        if isinstance(source, dict) and (source.get("title") or source.get("url") or source.get("ref_key")):
+            index.add(source)
+    usable = index.values()
     if not usable:
         return []
-    if tracker is None or not tracker.keys_in_order:
-        # No body footnotes recorded — keep upstream order, drop URL-less noise.
-        # Numbers fall back to position; nothing in the body refers to them.
-        kept = [s for s in usable if s.get("url") or s.get("title")]
-        return [
-            {**source, "footnote": position}
-            for position, source in enumerate(kept, 1)
-        ]
+    tracked_keys = tracker.keys_in_order if tracker is not None else []
+    allocated = {
+        tracker.number_of(key) for key in tracked_keys
+        if tracker is not None and tracker.number_of(key) is not None
+    }
+    body_numbers = {
+        int(match.group(1)) for match in re.finditer(r"\[\^?(\d+)\^?\]", text or "")
+    }
+    by_key: dict[str, dict | None] = {}
+    by_number: dict[int, dict | None] = {}
 
-    by_ref_key: dict[str, dict] = {}
-    by_ref_id: dict[str, dict] = {}
-    by_label: dict[str, dict] = {}
-    for s in usable:
-        rk = str(s.get("ref_key") or "").lower()
-        rid = str(s.get("ref_id") or "").lower()
-        lab = str(s.get("label") or "").strip()
-        if rk:
-            by_ref_key[rk] = s
-            # Also index without the "bracket" prefix the tracker uses.
-            if rk.startswith("bracket"):
-                by_ref_key[rk[len("bracket"):]] = s
-            else:
-                by_ref_key[f"bracket{rk}"] = s
-        if rid:
-            by_ref_id[rid] = s
-        if lab:
-            by_label[lab] = s
+    for source in usable:
+        keys: list[str] = []
+        ref_key = str(source.get("ref_key") or "").strip().lower()
+        ref_id = str(source.get("ref_id") or "").strip().lower()
+        if ref_key and not ref_key.isdigit():
+            keys.append(ref_key if ref_key.startswith("bracket") else f"bracket{ref_key}")
+        if ref_id:
+            keys.append(ref_id)
+        if source.get("url"):
+            keys.append(f"url:{str(source['url']).strip().lower()}")
+        for key in keys:
+            if key not in by_key:
+                by_key[key] = source
+            elif by_key[key] is not source:
+                by_key[key] = None
+        number = _source_footnote_number(source)
+        if number is not None:
+            if number not in by_number:
+                by_number[number] = source
+            elif by_number[number] is not source:
+                by_number[number] = None
 
     ordered: list[dict] = []
     used: set[int] = set()
-    for key in tracker.keys_in_order:
-        k = (key or "").lower()
-        hit = by_ref_key.get(k) or by_ref_id.get(k)
-        if hit is None and k.startswith("bracket"):
-            # bracket1-1e0595 or bracket1
-            rest = k[len("bracket"):]
-            hit = by_ref_key.get(rest) or by_ref_key.get(k)
-            if hit is None and re.fullmatch(r"\d+", rest or ""):
-                hit = by_label.get(rest)
-        if hit is None and re.fullmatch(r"bracket\d+-[0-9a-f]+", k):
-            # direct ref_key form
-            hit = by_ref_key.get(k) or by_ref_key.get(k.split("bracket", 1)[-1])
+    deferred: list[tuple[dict, int]] = []
+    for key in tracked_keys:
+        hit = by_key.get(key)
+        if hit is None and re.fullmatch(r"bracket\d+", key):
+            hit = by_number.get(int(key[len("bracket"):]))
         if hit is not None and id(hit) not in used:
-            ordered.append({**hit, "footnote": tracker.number_of(k) or 0})
-            used.add(id(hit))
+            number = tracker.number_of(key)
+            if text is None or number in body_numbers:
+                ordered.append({**hit, "footnote": number})
+                used.add(id(hit))
+            else:
+                # A replay may have allocated a different number while the
+                # adopted snapshot supplied the actual delivered marker.
+                deferred.append((hit, number))
 
-    # Append any remaining sources with real URLs that were not cited inline.
-    # They get numbers AFTER every body footnote, so adding one can never
-    # renumber a marker the body already emitted.
-    next_number = max(
-        (source["footnote"] for source in ordered),
-        default=0,
-    )
+    # Raw [n]/[^n^] text is not a tracked identity. Only an unambiguous
+    # source-stated number can link it, never the source's list position.
+    for number, source in by_number.items():
+        if source is None or id(source) in used or number in allocated:
+            continue
+        if number in body_numbers or (text is None and not tracked_keys):
+            ordered.append({**source, "footnote": number})
+            used.add(id(source))
+            allocated.add(number)
+
+    for source, number in deferred:
+        if id(source) not in used:
+            ordered.append({**source, "footnote": number})
+            used.add(id(source))
+
+    # Include unmatched tracked IDs and all raw brackets, not just matched
+    # sources, so supplemental URLs have zero-width EOF annotations.
+    reserved = allocated | body_numbers
+    if text is None and not tracked_keys:
+        reserved.update(by_number)
+    next_number = max(reserved, default=0)
     for s in usable:
         if id(s) not in used and s.get("url"):
             next_number += 1
@@ -1472,13 +1667,15 @@ def match_sources_for_tracker(
 def aligned_url_sources_for_stream(
     sources: list[dict],
     tracker: CitationTracker | None = None,
+    *,
+    text: str | None = None,
 ) -> list[dict]:
     """Return URL-bearing sources ordered to match in-body ``[n]`` markers.
 
     URL-less placeholders are dropped: protocol-native citation fields and the
     Markdown bibliography both need a real link to be useful.
     """
-    aligned = match_sources_for_tracker(sources, tracker)
+    aligned = match_sources_for_tracker(sources, tracker, text=text)
     return [s for s in aligned if isinstance(s, dict) and str(s.get("url") or "").strip()]
 
 

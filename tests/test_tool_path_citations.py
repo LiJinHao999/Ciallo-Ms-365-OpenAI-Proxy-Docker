@@ -15,10 +15,20 @@ is closed, and on the same index as the text it annotates.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import time
+
+import pytest
+import websockets
+from fastapi.testclient import TestClient
+
+from m365_copilot_openai_proxy.app import create_app
+from m365_copilot_openai_proxy.config import Settings
 
 from m365_copilot_openai_proxy.response_helpers import _responses_stream_with_tools
 from m365_copilot_openai_proxy.routes_api_messages import _anthropic_stream_with_tools
+from m365_copilot_openai_proxy.substrate_client import SIGNALR_SEP, SubstrateCopilotClient
 
 ANSWER = "有雷阵雨[1]"
 SOURCES = [{
@@ -223,3 +233,247 @@ def test_messages_declared_tool_with_a_tool_use_block_keeps_text_citations():
     ]
     assert [e["index"] for e in citations] == [text_index]
     assert citations[0]["delta"]["citation"]["url"] == "https://news.weather.com.cn/a"
+
+
+_READ_CALL = '```tool_call\n{"name":"Read","arguments":{"file_path":"/tmp/a.txt"}}\n```'
+_ROUTER_CALL = 'CALL_TOOL: Read({"file_path":"/tmp/a.txt"})'
+_CITED = "Adopted evidence \ue200cite\ue202turn1search0\ue201."
+_DRAFT = "Discarded draft \ue200cite\ue202turn1search0\ue201."
+_ADOPTED_URL = "https://adopted.example/evidence"
+_DISCARDED_URL = "https://discarded.example/evidence"
+_CLASSIFIER_URL = "https://classifier.example/evidence"
+_READ_SCHEMA = {
+    "type": "object",
+    "properties": {"file_path": {"type": "string"}},
+    "required": ["file_path"],
+}
+
+
+class _PlannerSocket:
+    def __init__(self, text, url):
+        item = {"messages": [{"author": "bot", "text": text, "contentOrigin": "DeepLeo"}]}
+        if url is not None:
+            item["references"] = {"1-aaaaaa": {
+                "targetLink": url,
+                "displayData": {
+                    "type": "text/json",
+                    "renderType": "CITATION",
+                    "content": json.dumps({
+                        "metadata": {"referenceId": "turn1search0", "type": "Web"},
+                        "label": "1",
+                        "providerDisplayName": "Evidence",
+                    }),
+                },
+                "isCitedInResponse": True,
+            }}
+        self.frames = iter([
+            {"type": 1, "target": "update", "arguments": [{"writeAtCursor": text}]},
+            {"type": 2, "item": item},
+            {"type": 3},
+        ])
+        self.closed = False
+        self.invocations = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        self.closed = True
+
+    async def send(self, text):
+        frame = json.loads(text.rstrip(SIGNALR_SEP))
+        self.invocations.extend(frame.get("arguments", []))
+
+    async def recv(self):
+        return "{}" + SIGNALR_SEP
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return json.dumps(next(self.frames)) + SIGNALR_SEP
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+def _planner_app(tmp_path, monkeypatch, mode, turns):
+    pending = list(turns)
+    sockets = []
+
+    def connect(url, **_kwargs):
+        assert pending, "the planner spent an unexpected extra upstream turn"
+        stage, text, source_url = pending.pop(0)
+        assert ("gptId=" in url) == (stage == "studio")
+        socket = _PlannerSocket(text, source_url)
+        sockets.append(socket)
+        return socket
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    payload = base64.urlsafe_b64encode(json.dumps({
+        "aud": "https://substrate.office.com/", "tid": "tenant-a", "oid": "object-a",
+        "exp": int(time.time()) + 3600,
+    }).encode()).decode().rstrip("=")
+    token = f"eyJhbGciOiJub25lIn0.{payload}."
+
+    def factory(**kwargs):
+        return SubstrateCopilotClient(
+            kwargs["token"], tone=kwargs.get("tone", "Magic"),
+            studio_agent_id=kwargs.get("studio_agent_id", ""),
+        )
+
+    app = create_app(
+        Settings(TOKEN_DIR=str(tmp_path), API_KEY="", ADMIN_PASSWORD=""),
+        copilot_client_factory=factory,
+    )
+    account = app.state.account_store.add(name="Studio", token=token)
+    app.state.account_store.set_studio_agent_id(account.id, "title.bot.gpt.default")
+    key = app.state.key_store.add(name="Planner citations", account_id=account.id)
+    app.state.key_store.update(key.id, tool_planning_mode=mode)
+    client = TestClient(app)
+    client.headers["Authorization"] = f"Bearer {key.key}"
+    return client, pending, sockets
+
+
+def _planner_request(endpoint, streaming):
+    body = {"model": "m365-copilot", "stream": streaming}
+    if endpoint == "responses":
+        body.update(input="Read /tmp/a.txt", tools=[{
+            "type": "function", "name": "Read", "parameters": _READ_SCHEMA,
+        }])
+    else:
+        body.update(
+            messages=[{"role": "user", "content": "Read /tmp/a.txt"}], max_tokens=256,
+            tools=[{"name": "Read", "description": "Read a file", "input_schema": _READ_SCHEMA}],
+        )
+    return body
+
+
+def _planner_output(response, endpoint, streaming):
+    assert response.status_code == 200, response.text
+    if streaming:
+        events = [json.loads(line[6:]) for line in response.text.splitlines()
+                  if line.startswith("data: ")]
+        assert not any(event["type"] in {"error", "response.failed"} for event in events)
+        if endpoint == "responses":
+            body = next(event["response"] for event in events if event["type"] == "response.completed")
+        else:
+            text = "".join(event["delta"]["text"] for event in events
+                           if event.get("delta", {}).get("type") == "text_delta")
+            tools = [event["content_block"] for event in events
+                     if event["type"] == "content_block_start"
+                     and event["content_block"]["type"] == "tool_use"]
+            citations = [event["delta"]["citation"] for event in events
+                         if event.get("delta", {}).get("type") == "citations_delta"]
+            assert events[-1]["type"] == "message_stop"
+            return text, tools, citations
+    else:
+        body = response.json()
+    if endpoint == "responses":
+        parts = [part for item in body["output"] if item["type"] == "message"
+                 for part in item["content"] if part["type"] == "output_text"]
+        return (
+            "".join(part["text"] for part in parts),
+            [item for item in body["output"] if item["type"] == "function_call"],
+            [citation for part in parts for citation in part.get("annotations", [])],
+        )
+    return (
+        "".join(block["text"] for block in body["content"] if block["type"] == "text"),
+        [block for block in body["content"] if block["type"] == "tool_use"],
+        [citation for block in body["content"] for citation in block.get("citations", [])],
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["messages", "responses"])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(("mode", "turns", "tool_names", "source_urls"), [
+    pytest.param("studio", [
+        ("studio", _DRAFT, _DISCARDED_URL), ("ordinary", _ROUTER_CALL, None),
+    ], ["Read"], [], id="discard-studio-adopt-pure-router-call"),
+    pytest.param("studio", [
+        ("studio", _CITED + "\n\n" + _READ_CALL, _ADOPTED_URL),
+    ], ["Read"], [_ADOPTED_URL], id="keep-studio-tool-answer-sources"),
+    pytest.param("studio", [
+        ("studio", _CITED + "\n\nNO_TOOL_NEEDED", _ADOPTED_URL),
+    ], [], [_ADOPTED_URL], id="keep-studio-explicit-no-tool-answer-sources"),
+    pytest.param("studio", [
+        ("studio", _DRAFT, _DISCARDED_URL),
+        ("ordinary", "NO_TOOL_NEEDED", _CLASSIFIER_URL),
+        ("ordinary", _CITED, _ADOPTED_URL),
+    ], [], [_ADOPTED_URL], id="router-declines-adopt-ordinary-answer"),
+    pytest.param("studio", [
+        ("studio", _DRAFT, _DISCARDED_URL),
+        ("ordinary", "invalid classification", _CLASSIFIER_URL),
+        ("ordinary", _CITED, _ADOPTED_URL),
+    ], [], [_ADOPTED_URL], id="discard-both-planners-adopt-inline"),
+    pytest.param("router", [
+        ("ordinary", "invalid classification", _CLASSIFIER_URL),
+        ("studio", _CITED + "\n\n" + _READ_CALL, _ADOPTED_URL),
+    ], ["Read"], [_ADOPTED_URL], id="reverse-fallback-adopts-studio"),
+    pytest.param("router", [
+        ("ordinary", "invalid classification", _CLASSIFIER_URL),
+        ("studio", _DRAFT, _DISCARDED_URL),
+        ("ordinary", _CITED, _ADOPTED_URL),
+    ], [], [_ADOPTED_URL], id="reverse-fallback-discards-studio-adopts-inline"),
+])
+def test_ordered_planner_protocol_citations_belong_to_adopted_turn(
+    tmp_path, monkeypatch, endpoint, streaming, mode, turns, tool_names, source_urls,
+):
+    client, pending, sockets = _planner_app(tmp_path, monkeypatch, mode, turns)
+    response = client.post("/v1/" + endpoint, json=_planner_request(endpoint, streaming))
+    text, tools, citations = _planner_output(response, endpoint, streaming)
+
+    assert [tool["name"] for tool in tools] == tool_names
+    assert [citation["url"] for citation in citations] == source_urls
+    assert _DISCARDED_URL not in response.text
+    assert _CLASSIFIER_URL not in response.text
+    assert "Discarded draft" not in text
+    if source_urls:
+        assert "Adopted evidence [1]." in text
+    else:
+        assert text.strip() == "", "the two-turn chain must deliver only Read"
+    assert not pending
+    assert sockets and all(socket.closed for socket in sockets)
+
+
+@pytest.mark.parametrize("endpoint", ["messages", "responses"])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_adopted_studio_sources_survive_real_tool_result_continuation(
+    tmp_path, monkeypatch, endpoint, streaming,
+):
+    final_url = "https://final.example/evidence"
+    client, pending, sockets = _planner_app(tmp_path, monkeypatch, "studio", [
+        ("studio", _CITED + "\n\n" + _READ_CALL, _ADOPTED_URL),
+        ("studio", _CITED, final_url),
+    ])
+    first_request = _planner_request(endpoint, False)
+    first = client.post("/v1/" + endpoint, json=first_request)
+    _, calls, citations = _planner_output(first, endpoint, False)
+    assert [call["name"] for call in calls] == ["Read"]
+    assert [citation["url"] for citation in citations] == [_ADOPTED_URL]
+
+    continuation = _planner_request(endpoint, streaming)
+    result_text = "read-result-for-citation-continuation"
+    if endpoint == "responses":
+        continuation["previous_response_id"] = first.json()["id"]
+        continuation["input"] = [{
+            "type": "function_call_output", "call_id": calls[0]["call_id"],
+            "output": result_text,
+        }]
+    else:
+        continuation["messages"] = [
+            *first_request["messages"],
+            {"role": "assistant", "content": calls},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": calls[0]["id"], "content": result_text,
+            }]},
+        ]
+    final = client.post("/v1/" + endpoint, json=continuation)
+    text, calls, citations = _planner_output(final, endpoint, streaming)
+    assert "Adopted evidence [1]." in text
+    assert calls == []
+    assert [citation["url"] for citation in citations] == [final_url]
+    assert _ADOPTED_URL not in final.text
+    assert result_text in json.dumps(sockets[-1].invocations)
+    assert not pending
+    assert len(sockets) == 2 and all(socket.closed for socket in sockets)

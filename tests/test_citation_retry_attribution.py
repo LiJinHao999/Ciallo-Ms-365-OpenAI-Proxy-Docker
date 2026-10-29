@@ -53,15 +53,13 @@ class _ClaimingClient:
         self.retry_text = retry_text
         self.retry_error = retry_error
         self.prompts: list[str] = []
-        self.source_lists: list[object] = []
 
-    def _note(self, prompt, sources_out) -> int:
+    def _note(self, prompt) -> int:
         self.prompts.append(prompt)
-        self.source_lists.append(sources_out)
         return len(self.prompts)
 
     async def chat_stream(self, prompt, additional_context, session=None, images=None, *, sources_out=None):
-        if self._note(prompt, sources_out) == 1:
+        if self._note(prompt) == 1:
             _fill(sources_out, FIRST_SOURCES)
             yield CLAIM
             return
@@ -75,7 +73,7 @@ class _ClaimingChatClient(_ClaimingClient):
     """The non-streaming protocol shape (``chat`` instead of ``chat_stream``)."""
 
     async def chat(self, prompt, additional_context, session=None, images=None, *, sources_out=None):
-        if self._note(prompt, sources_out) == 1:
+        if self._note(prompt) == 1:
             _fill(sources_out, FIRST_SOURCES)
             return CLAIM
         if self.retry_error is not None:
@@ -224,15 +222,6 @@ def test_a_raising_non_stream_retry_keeps_the_kept_reply_citations(tmp_path, end
 
 # --- the retry's text IS adopted ------------------------------------------
 
-def test_the_retry_is_handed_a_list_of_its_own():
-    """The mechanism the fix rests on: the retry must not write into the list
-    already holding the kept reply's sources."""
-    client = _ClaimingClient(retry_text="好的。\n\n" + TOOL_CALL)
-    _events(_responses_stream(client))
-
-    first_list, retry_list = client.source_lists
-    assert first_list is not None and retry_list is not None
-    assert first_list is not retry_list, "the retry wrote into the kept reply's list"
 
 
 def test_adopted_retry_takes_its_sources_with_its_text():

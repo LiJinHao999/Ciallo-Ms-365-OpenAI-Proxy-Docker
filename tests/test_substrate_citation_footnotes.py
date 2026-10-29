@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from m365_copilot_openai_proxy.substrate_client import SIGNALR_SEP, SubstrateCopilotClient
 from m365_copilot_openai_proxy.substrate_parse import (
     anthropic_web_citations_from_sources,
@@ -167,3 +169,90 @@ def test_a_footnote_that_the_body_never_emitted_collapses_to_eof(monkeypatch):
     annotations = openai_url_citations_from_sources(text, sources)
     assert len(annotations) == 1
     assert annotations[0]["start_index"] == annotations[0]["end_index"] == len(text)
+
+
+@pytest.mark.parametrize("marker,minimum", [
+    ("\ue200cite\ue202turn1search9\ue201", 1),
+    ("【9-cccccc】", 9),
+])
+def test_unmatched_body_identity_reserves_its_number(monkeypatch, marker, minimum):
+    raw = f"Claim {marker}."
+    refs = dict([
+        _reference("1-aaaaaa", "turn1search0", "1", "https://other.example", "Other"),
+    ])
+    text, sources = _collect([_delta(raw), _complete(raw, refs)], monkeypatch)
+
+    assert text == f"Claim [{minimum}]."
+    assert len(sources) == 1
+    assert sources[0]["footnote"] > minimum
+    annotation, = openai_url_citations_from_sources(text, sources)
+    assert annotation["start_index"] == annotation["end_index"] == len(text)
+    citation, = anthropic_web_citations_from_sources(text, sources)
+    assert citation["cited_text"] == "Other"
+
+
+@pytest.mark.parametrize("syntax", ["[{n}]", "[^{n}^]"])
+@pytest.mark.parametrize("public_only", [False, True])
+def test_explicit_public_number_survives_reordered_or_sparse_sources(
+    monkeypatch, syntax, public_only,
+):
+    public = _reference("2-bbbbbb", "turn1search1", "2", "https://public.example", "Public")
+    internal = _reference("1-aaaaaa", "turn1file0", "1", "", "Internal")
+    refs = dict([public] if public_only else [public, internal])
+    raw = f"Internal {syntax.format(n=1)}, public {syntax.format(n=2)}."
+    text, sources = _collect([_delta(raw), _complete(raw, refs)], monkeypatch)
+
+    assert text == "Internal [1], public [2]."
+    assert [(s["footnote"], s["url"]) for s in sources] == [(2, "https://public.example")]
+    annotation, = openai_url_citations_from_sources(text, sources)
+    assert text[annotation["start_index"]:annotation["end_index"]] == "[2]"
+    citation, = anthropic_web_citations_from_sources(text, sources)
+    assert citation["encrypted_index"] == "m365_2"
+    assert citation["cited_text"] == "[2]"
+
+
+def test_mixed_unmatched_identity_and_explicit_number_keep_distinct_annotations(monkeypatch):
+    raw = "Unknown \ue200cite\ue202turn1search9\ue201, public [2]."
+    refs = dict([
+        _reference("2-bbbbbb", "turn1search1", "2", "https://public.example", "Public"),
+        _reference("3-cccccc", "turn1search2", "3", "https://other.example", "Other"),
+    ])
+    text, sources = _collect([_delta(raw), _complete(raw, refs)], monkeypatch)
+
+    assert text == "Unknown [1], public [2]."
+    annotations = openai_url_citations_from_sources(text, sources)
+    assert [(a["url"], text[a["start_index"]:a["end_index"]]) for a in annotations] == [
+        ("https://public.example", "[2]"), ("https://other.example", ""),
+    ]
+
+
+@pytest.mark.parametrize("raw", ["value = data[1]", "value = data[1000000000]"])
+@pytest.mark.parametrize("with_source", [False, True])
+def test_ordinary_numeric_brackets_without_identity_are_not_citations(monkeypatch, with_source, raw):
+    final = _complete(raw)
+    if with_source:
+        final["item"]["sourceAttributions"] = [
+            {"providerDisplayName": "Other", "seeMoreUrl": "https://other.example"},
+        ]
+    text, sources = _collect([_delta(raw), final], monkeypatch)
+
+    assert text == raw
+    annotations = openai_url_citations_from_sources(text, sources)
+    assert len(annotations) == int(with_source)
+    assert all(a["start_index"] == a["end_index"] == len(text) for a in annotations)
+
+
+@pytest.mark.parametrize("syntax", ["[1]", "[^1^]", "【1】"])
+def test_conflicting_numeric_labels_cannot_select_a_claim_url(monkeypatch, syntax):
+    raw = f"Ambiguous {syntax}."
+    refs = dict([
+        _reference("1-aaaaaa", "turn1search0", "1", "https://a.example", "A"),
+        _reference("1-bbbbbb", "turn1search1", "1", "https://b.example", "B"),
+    ])
+    text, sources = _collect([_snapshot(raw, refs), _complete(raw, refs)], monkeypatch)
+
+    assert text == "Ambiguous [1]."
+    annotations = openai_url_citations_from_sources(text, sources)
+    assert [a["url"] for a in annotations] == ["https://a.example", "https://b.example"]
+    assert all(s["footnote"] > 1 for s in sources)
+    assert all(a["start_index"] == a["end_index"] == len(text) for a in annotations)

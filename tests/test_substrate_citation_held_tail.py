@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from m365_copilot_openai_proxy.substrate_client import SIGNALR_SEP, SubstrateCopilotClient
 from m365_copilot_openai_proxy.substrate_parse import openai_url_citations_from_sources
 
@@ -137,3 +139,62 @@ def test_sparse_bracket_numbers_anchor_each_span_on_its_own_marker(monkeypatch):
         for a in openai_url_citations_from_sources(text, sources)
     }
     assert spans == {"https://a.example": "[3]", "https://b.example": "[4]"}
+
+
+@pytest.mark.parametrize("snapshot_first", [True, False])
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("value = data[0]", "value = data[0]"),
+        ("Alpha \ue200cite\ue202turn1search0\ue201", "Alpha [1]"),
+        ("Array prefix [1, 2", "Array prefix [1, 2"),
+    ],
+)
+def test_snapshot_delivered_held_tail_is_not_replayed(raw, expected, snapshot_first, monkeypatch):
+    frames = [_snapshot(raw), _delta(raw)] if snapshot_first else [_delta(raw), _snapshot(raw)]
+    text, _sources = _collect([*frames, _complete(raw)], monkeypatch)
+
+    assert text == expected
+
+
+def test_held_tail_beyond_snapshot_still_reaches_the_reader(monkeypatch):
+    text, _sources = _collect([
+        _snapshot("values[0]"),
+        _delta("values[0] + values[0]"),
+        _complete("values[0] + values[0]"),
+    ], monkeypatch)
+
+    assert text == "values[0] + values[0]"
+
+
+def test_late_reference_metadata_keeps_urls_on_their_own_claims(monkeypatch):
+    early = _snapshot("")
+    early["arguments"][0]["sourceAttributions"] = [
+        {"providerDisplayName": "A", "seeMoreUrl": "https://a.example"},
+        {"providerDisplayName": "B", "seeMoreUrl": "https://b.example"},
+    ]
+    raw = "B<cite>turn1search1</cite> A<cite>turn1search0</cite> end"
+    refs = dict([
+        _reference("1-aaaaaa", "turn1search0", "1", "https://a.example", "A"),
+        _reference("2-bbbbbb", "turn1search1", "2", "https://b.example", "B"),
+    ])
+    text, sources = _collect([early, _delta(raw), _complete(raw, refs)], monkeypatch)
+
+    assert text == "B[1] A[2] end"
+    assert {
+        annotation["url"]: text[annotation["start_index"]:annotation["end_index"]]
+        for annotation in openai_url_citations_from_sources(text, sources)
+    } == {"https://b.example": "[1]", "https://a.example": "[2]"}
+
+
+def test_reference_keeps_its_number_when_a_later_frame_supplies_the_url(monkeypatch):
+    early = dict([_reference("1-aaaaaa", "turn1search0", "1", "", "A")])
+    enriched = dict([_reference("1-aaaaaa", "turn1search0", "1", "https://a.example", "A")])
+    raw = "Claim <cite>turn1search0</cite>."
+    text, sources = _collect([_snapshot("", early), _delta(raw), _complete(raw, enriched)], monkeypatch)
+
+    assert text == "Claim [1]."
+    assert [
+        (annotation["url"], text[annotation["start_index"]:annotation["end_index"]])
+        for annotation in openai_url_citations_from_sources(text, sources)
+    ] == [("https://a.example", "[1]")]

@@ -406,6 +406,18 @@ docker compose up -d
 
 > **A/D/E 验收状态**：以下变更已部署，但尚未通过完整六路径真实验收。本地回归、网络故障注入或单个 provider 通过，不等于所有 provider/planner 已就绪；各项实测结果、范围及阻塞见[脱敏验收记录](docs/evidence/upstream-07-ade-2026-10-01.json)。
 
+### 引用来源与脚注
+
+M365 Substrate 的可识别引用标记统一显示为 `[n]`。Responses 的非流式正文附带 `url_citation` annotations，流式发送 `response.output_text.annotation.added`；Messages 的文本块附带 `citations`，流式在对应文本块关闭前发送 `citations_delta`。声明工具、规划回退及工具结果续轮同样保留最终采用答案的来源。Chat Completions 不增加非标准来源字段，也不拼接参考文献列表。
+
+脚注编号不随无 URL 来源过滤而改变；来源列表乱序、编号稀疏或元数据后到时，仍按引用身份与正文编号关联。显示编号相同不代表来源相同；缺失或歧义元数据不会借用其他引用的编号。正文未明确引用的补充 URL 在 Responses 中使用文末零宽区间，不伪造正文定位。快照、delta 和完成帧共享引用映射，普通代码下标和未确认的引用前缀原样保留。
+
+来源存在与否取决于上游实际返回；代理不补造 URL，也不把被丢弃的 Studio/Router 草稿或纠正重试来源附到最终答案。
+
+2026-10-29 修复验证：目标容器的 16 项受控失败场景已全部转绿，另有 3 项复核边界通过；最终本地回归为 **4439 passed、3 skipped**。真实 Messages / Responses 均完成调用方 `Read` 工具闭环，并在工具结果续轮返回结构化引用。个人 Substrate 油猴推送、两次无聊天新 JWE 签发、重启后续期，以及两种流式 API 跨真实 WebSocket `401 → 101` 的工具续轮均通过。
+
+**尚未通过完整验收矩阵。** M365 直连文本通过，但 `Claude_Sonnet` 原生工具请求返回上游 `InternalError`，`Claude_Sonnet_Reasoning` 未调用声明的工具；Studio 没有就绪 Agent，成功的 Router 回退不计作 Studio 通过；旧 Consumer / ChatAI 凭据已过期，现有及更新后的浏览器会话启动均未取得新 ChatAI token。验收没有切换生产账户的协议或兑换复制的生产 RT；临时密钥、私有监听器、凭据和 profile 已清理。完整范围、脱敏回执及回滚备份位置见[引用修复验收记录](docs/evidence/pr11-citations-repair-2026-10-29.json)。
+
 ### 推理摘要与流式边界
 
 代理只输出 M365 上游主动提供、带有 `addToChainOfThought` 或 `contentOrigin=ChainOfThoughtSummary` 标记的摘要。它不是完整内部思维链；没有上游摘要时不会伪造。普通进度消息、正文和工具语法仍分别处理。

@@ -190,21 +190,26 @@ async def routed_or_answered(
     if router_prompt:
         decided, declined = await _router_decision(client, router_prompt)
         if decided:
+            if sources_out is not None:
+                sources_out.clear()
             _notify_router_call(on_router_call)
             return decided
         if fallback_turn is not None and not declined:
             if on_router_fallback is not None:
                 on_router_fallback("classification_error")
             return await fallback_turn()
+    answer_sources: list[dict] = []
     text = await client.chat(
         prompt, additional_context, session, images,
-        **filter_client_method_kwargs(client, "chat", {"sources_out": sources_out}),
+        **filter_client_method_kwargs(client, "chat", {"sources_out": answer_sources}),
     )
     text = text + _marker_suffix(text, declined)
     if fallback_turn is not None and should_fallback is not None and should_fallback(text):
         if on_router_fallback is not None:
             on_router_fallback("no_tool_call")
         return await fallback_turn()
+    if sources_out is not None:
+        sources_out[:] = answer_sources
     return text
 
 
@@ -230,6 +235,8 @@ async def routed_or_streamed(
     if router_prompt:
         decided, declined = await _router_decision(client, router_prompt)
         if decided:
+            if sources_out is not None:
+                sources_out.clear()
             _notify_router_call(on_router_call)
             yield decided
             return
@@ -242,10 +249,11 @@ async def routed_or_streamed(
             return
     text = ""
     buffered: list[str] | None = [] if fallback_turn is not None else None
+    answer_sources: list[dict] = []
     async with closing_stream(client.chat_stream(
         prompt, additional_context, session, images,
         **filter_client_method_kwargs(
-            client, "chat_stream", {"sources_out": sources_out}
+            client, "chat_stream", {"sources_out": answer_sources}
         ),
     )) as owned_stream:
         async for delta in owned_stream:
@@ -266,6 +274,8 @@ async def routed_or_streamed(
             async for chunk in owned_stream:
                 yield chunk
         return
+    if sources_out is not None:
+        sources_out[:] = answer_sources
     if buffered is not None:
         for chunk in buffered:
             yield chunk

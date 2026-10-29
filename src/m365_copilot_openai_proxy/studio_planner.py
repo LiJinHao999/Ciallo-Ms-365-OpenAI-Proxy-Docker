@@ -55,6 +55,8 @@ async def planned_or_answered(
     sources_out: list[dict] | None = None,
 ) -> str:
     chunks: list[str] = []
+    # A rejected or failed draft must not publish sources into its fallback.
+    studio_sources: list[dict] = []
     yielded_any = False
     try:
         async with closing_stream(studio_turn.client.chat_stream(
@@ -63,7 +65,7 @@ async def planned_or_answered(
             studio_turn.session,
             studio_turn.images,
             **filter_client_method_kwargs(
-                studio_turn.client, "chat_stream", {"sources_out": sources_out}
+                studio_turn.client, "chat_stream", {"sources_out": studio_sources}
             ),
         )) as owned_stream:
             async for chunk in owned_stream:
@@ -88,6 +90,8 @@ async def planned_or_answered(
         if on_fallback is not None:
             on_fallback("no_tool_call")
         return await fallback_turn()
+    if sources_out is not None:
+        sources_out[:] = studio_sources
     return text
 
 
@@ -103,6 +107,7 @@ async def planned_or_streamed(
     # protocol response. When a predicate is supplied, buffer here too so a
     # no-call Studio answer can be replaced without duplicating visible text.
     buffered: list[str] | None = [] if should_fallback is not None else None
+    studio_sources: list[dict] = []
     yielded_any = False
     try:
         async with closing_stream(studio_turn.client.chat_stream(
@@ -111,7 +116,7 @@ async def planned_or_streamed(
             studio_turn.session,
             studio_turn.images,
             **filter_client_method_kwargs(
-                studio_turn.client, "chat_stream", {"sources_out": sources_out}
+                studio_turn.client, "chat_stream", {"sources_out": studio_sources}
             ),
         )) as owned_stream:
             async for chunk in owned_stream:
@@ -147,6 +152,9 @@ async def planned_or_streamed(
                 async for chunk in owned_stream:
                     yield chunk
             return
+    if sources_out is not None:
+        sources_out[:] = studio_sources
+    if buffered is not None:
         for chunk in buffered:
             yield chunk
 
